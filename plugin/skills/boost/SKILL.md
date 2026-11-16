@@ -7,12 +7,18 @@ metadata:
 
 ## Route A structured workflow (Required)
 
-Before executing a new workflow_version=1 run, read [the shared workflow contract](../route-a-workflow.md). Use the backend inbox, step, artifact and verification gates throughout the workflow below, including the inline fallback roles. Following the first failed delivery, use at most 3 automatic rework rounds; then needs_decision stops further automatic work. A board PASS or completed message is not independent acceptance. Legacy version0 runs keep their recorded behavior.
+Before executing a new workflow_version=1 or2 run, read [the shared workflow contract](../route-a-workflow.md). Use the backend inbox, step, artifact and verification gates throughout the workflow below, including the inline fallback roles. Following the first failed delivery, use at most 3 automatic rework rounds; then needs_decision stops further automatic work. A board PASS or completed message is not independent acceptance. Legacy version0 runs keep their recorded behavior.
 
 
 # `$boost` — Adaptive Routing & Forced Verification Loop
 
 Execute a focused goal with minimal coordination overhead while guaranteeing zero requirement drift, independent verification, and zero unaddressed caveats. Live state syncs to the `tri-orchestrator` dashboard (`http://127.0.0.1:18790`).
+
+
+## Mode2 execution stages
+
+Execute → Independent challenge → Original-author repair → Final re-verification.
+Persist these stages on the same workflow step. Capture before checks and bind challenge to that candidate artifact_id; a new delivery needs a new independent challenge. Solo: the coordinator fixes. Delegation: the original author child fixes. The same original verifier checks the repaired candidate and the separate integrated delivery. Attempt0 is initial; only1..3 are automatic repairs, then needs_decision. Do not revise identities or task packets to reset that decision.
 
 ## Non-Negotiable Codex Subagent Rules
 
@@ -70,16 +76,16 @@ Include the matching contract verbatim in the child prompt whenever falling back
 
 ### 2. Route Complexity: Solo vs Delegation
 
-Choose the smallest execution shape that handles the scope safely:
+Choose the smallest execution shape that handles the scope safely. First spawn a bootstrap-only independent verifier, register its actual native binding and keep it waiting; this prebound verifier is reused throughout. Register the actual root as Solo owner, or bootstrap the delegated author before saving its step. After workflow_step_save and workflow_step_advance(action="dispatch") admit the step, begin Solo edits or use followup_task on the waiting original author. Bootstrap prompts prohibit implementation before admission.
 
 - **Solo Path** (1–2 tightly coupled files, clear root cause, single domain):
-  - Implement directly in the repo, run post-edit tests, and still run **Step 3** (`verifier` + spot-check) for non-trivial changes before finishing.
+  - Only after that admission, implement in the repo, run post-edit tests, and still run **Step 3** (`verifier` + spot-check) for non-trivial changes before finishing.
 - **Delegation Path** (unclear root cause, broad codebase search, or 2+ independent workstreams):
   - **Root-cause / unknown behavior**: Register `investigator` via `worker_register(run_id=run_id, name="investigator-1", role="investigator", status="waiting", current_task="...")`, then `spawn_agent(agent_type="investigator", fork_turns="none", ...)` with the verbatim problem statement.
   - **Implementation**: Register each coder via `worker_register(run_id=run_id, name="coder-1", role="coder", status="waiting", current_task="...")`.
     - When running 2+ concurrent coders (or isolating risky edits), create an isolated clone/snapshot per writer first:
       `workspace_create(run_id=run_id, worker_name="coder-1", project_root="<abs_repo_path>", copy_env=True, dep_mode="none")`
-    - Dispatch `spawn_agent(agent_type="coder", fork_turns="none", ...)` passing:
+    - Bootstrap `spawn_agent(agent_type="coder", fork_turns="none", ...)` in waiting-only mode; register its returned native binding, save/admit its step, then pass the following actual implementation brief via followup_task:
       1. The **verbatim** user requirements and acceptance criteria (do not paraphrase away constraints or invent unrequested features);
       2. Exact owned files (`file_ownership`) and isolated workspace `mode`, `workspace_id`, `branch_name`, `path` + `assigned_port` (if created), including the Workspace Mode & Dependency Contract;
       3. Instruction to call `worker_heartbeat(run_id=run_id, worker_name="coder-1", status="working")` during long tasks and run real tests after the final edit.
@@ -90,8 +96,7 @@ Choose the smallest execution shape that handles the scope safely:
 Never accept a worker's self-report or your own Solo edit without independent checks:
 
 1. If workspaces were used, inspect `workspace_status(workspace_id)` and `workspace_diff(workspace_id)` to verify the mode-specific requirements above and zero out-of-scope edits; snapshot changes are expected to be dirty before merge.
-2. Register `verifier` via `worker_register(run_id=run_id, name="verifier-1", role="verifier", status="waiting", current_task="Verify boost deliverables")` and dispatch:
-   - `spawn_agent(agent_type="verifier", fork_turns="none", ...)` (omit `model`).
+2. Resume the same prebound `verifier-1` via `followup_task`; do not spawn a new verifier or change the step binding at this stage.
    - Pass verbatim acceptance criteria (`task_packet_get`), workspace mode(s) and path(s) or changed files, the Workspace Mode & Dependency Contract, and commands to verify.
 3. **Coordinator Spot-Check**: Independently inspect the real `git diff` (or `workspace_diff`) and verify observed post-edit test output (`exit code == 0`, no skipped assertions).
 4. Record verification evidence on the board:

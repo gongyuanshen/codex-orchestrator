@@ -36,7 +36,7 @@ def test_incompatible_live_daemon_is_not_restarted(tmp_path, monkeypatch, fault)
             body = {"status": "ok", "pid": os.getpid(), "port": self.server.server_port,
                     "data_dir": str(tmp_path), "software_version": __version__,
                     "schema_version": SCHEMA_VERSION,
-                    "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1"]}
+                    "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"]}
             if fault == "old":
                 for field in ("software_version", "schema_version", "capabilities"):
                     del body[field]
@@ -80,7 +80,7 @@ def test_real_http_fault_is_preserved_without_rpc_replay(tmp_path):
             raw = json.dumps({"status": "ok", "pid": os.getpid(), "port": self.server.server_port,
                               "data_dir": str(tmp_path), "software_version": __version__,
                               "schema_version": SCHEMA_VERSION,
-                              "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1"]}).encode()
+                              "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"]}).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()

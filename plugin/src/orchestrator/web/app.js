@@ -1896,9 +1896,9 @@
 
   function renderWorkflowSummary() {
     const version = state.run.workflow_version;
-    const versionLabel = version === 0 ? '旧流程，未启用结构化门禁' : version === 1 ? '结构化门禁 · v1' : '流程版本未记录';
+    const versionLabel = version === 0 ? '旧流程，未启用结构化门禁' : [1, 2].includes(version) ? `结构化门禁 · v${version}` : '流程版本未记录';
     const heading = `<div class="overview-section-heading"><h2>流程与验收</h2><span class="pill-badge tint-muted">${versionLabel}</span></div>`;
-    if (version !== 1) return `<section class="overview-section workflow-overview">${heading}</section>`;
+    if (![1, 2].includes(version)) return `<section class="overview-section workflow-overview">${heading}</section>`;
     if (state.workflow === null) return `<section class="overview-section workflow-overview">${heading}<p class="workflow-warning" role="status">结构化流程数据未加载，请同步后查看门禁状态。</p></section>`;
     const { steps, verifications, blockers } = state.workflow;
     // Keep urgent/current steps ahead of completed history without hiding any step.

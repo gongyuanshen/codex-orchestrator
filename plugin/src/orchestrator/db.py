@@ -303,7 +303,11 @@ class Database:
         self._closed = False
 
         if init_schema:
-            self.migrate()
+            try:
+                self.migrate()
+            except BaseException:
+                self.close()
+                raise
 
     @classmethod
     def from_settings(cls, settings: Settings | None = None) -> Database:

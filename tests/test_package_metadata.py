@@ -8,6 +8,10 @@ from orchestrator.config import Settings
 from orchestrator.mcp_shim import create_mcp_server
 
 
+def test_mode_enhancement_release_identity():
+    assert __version__ == '0.3.0'
+
+
 def test_package_and_mcp_release_versions_match(tmp_path):
     root = Path(__file__).parents[1]
     plugin = root / 'plugin'

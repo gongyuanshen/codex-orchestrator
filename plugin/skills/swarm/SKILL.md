@@ -7,12 +7,19 @@ metadata:
 
 ## Route A structured workflow (Required)
 
-Before executing a new workflow_version=1 run, read [the shared workflow contract](../route-a-workflow.md). Use the backend inbox, step, artifact and verification gates throughout the workflow below, including the inline fallback roles. Following the first failed delivery, use at most 3 automatic rework rounds; then needs_decision stops further automatic work. A board PASS or completed message is not independent acceptance. Legacy version0 runs keep their recorded behavior.
+Before executing a new workflow_version=1 or2 run, read [the shared workflow contract](../route-a-workflow.md). Use the backend inbox, step, artifact and verification gates throughout the workflow below, including the inline fallback roles. Following the first failed delivery, use at most 3 automatic rework rounds; then needs_decision stops further automatic work. A board PASS or completed message is not independent acceptance. Legacy version0 runs keep their recorded behavior.
 
 
 # `$swarm` — `#seq` Message Board & Concurrent Isolation Swarm
 
 Coordinate multiple parallel workers across isolated `.swarm-workspaces` clones using the SQLite WAL `#seq` message board, channel routing, anti-context-explosion short pointers, and watchdog stall recovery.
+
+
+## Mode2 linked execution and bounded receive
+
+Every task/rework/review/result uses inbox_send(..., step_id=step["id"]) with the correct bound owner/verifier recipient and current attempt. Admit with workflow_step_advance before native implementation dispatch; record the exact inbox id and native forwarding evidence. Author receipt, execution accept/submit, independent candidate review, rework and integrated acceptance stay on that same step. Cancel or reconcile stale delivery rather than silently forwarding it to another attempt or agent.
+
+Make one inbox_wait per worker turn (default20000ms, maximum25000ms), then return control on timeout. The root checks real list_agents/wait_agent state before followup_task for an ended/idle original child. A heartbeat timeout is not evidence of death. Honor pending controls and stopped/killed status before any wakeup. Keep overview-first UI and full logs on the existing folded board.
 
 ## Non-Negotiable Codex Subagent Rules
 
@@ -66,14 +73,14 @@ Include the matching contract verbatim in the child prompt whenever falling back
 
 ### 2. Provision Isolated Workspaces & Register Workers
 
-For each worker node (e.g., `backend-1`, `ui-1`, `verify-1`):
+First spawn a bootstrap-only verifier, register its actual native binding and keep it waiting. This prebound verifier remains the same for rework and integration. For each author node (e.g., `backend-1`, `ui-1`):
 
 1. For concurrent writers (`swarm_worker`), provision an isolated workspace first:
    - `workspace_create(run_id=run_id, worker_name="backend-1", project_root="<abs_repo_path>", copy_env=True, dep_mode="none")`
    - Record the returned `mode`, `workspace_id`, `path` (`.swarm-workspaces/<run_short>-<worker>`), `branch_name`, and `assigned_port` (`18800..18999`).
 2. Register the worker in SQLite so the Web dashboard and Watchdog track it:
    - `worker_register(run_id=run_id, name="backend-1", role="swarm_worker", status="waiting", workspace_id=ws["id"], current_task="<slice>", stall_threshold_sec=300)`
-3. Dispatch `spawn_agent(agent_type="swarm_worker", fork_turns="none", ...)` (omit `model`). Each brief MUST specify:
+3. Bootstrap `spawn_agent(agent_type="swarm_worker", fork_turns="none", ...)` (omit `model`) with a waiting-only prompt that prohibits implementation. Register the exact returned binding, workflow_step_save the task, then workflow_step_advance(action="dispatch") before inbox_send for that step. Only after admission use followup_task to deliver the actual implementation brief. Each brief MUST specify:
    - `run_id`, `worker_name`, `workspace_id`, returned `mode`, isolated `path`, `branch_name` (None for snapshot), `assigned_port`, and target channel (`#backend`, `#ui`, etc.);
    - Verbatim slice requirements, `task_packet_get(run_id=run_id)` reference, and strict owned files;
    - Heartbeat obligation (`worker_heartbeat`), the Workspace Mode & Dependency Contract, and **Anti-Context-Explosion** return rule below.
@@ -102,14 +109,12 @@ Track your coordinator read pointer `last_seq = 0` (or rely on `reader_name="coo
 2. **Stall & Silent-Exit Recovery**:
    - Whenever `stalled_workers` is non-empty, a watchdog `alert` arrives, or a child exits without posting `#seq`:
      1. Inspect its isolated workspace via `workspace_status(workspace_id)` (dirty state, commits ahead) and `workspace_diff(workspace_id)` + latest board posts (`board_read`).
-     2. Wake/nudge the SAME worker thread via `followup_task` (V2) or `send_input` (V1) instructing it to call `worker_heartbeat` and finish or post its `#seq` state.
-     3. If the thread is dead or stays unresponsive, mark it `worker_status_update(run_id=run_id, worker_name=..., status="stopped")` (or `"killed"` once terminal—note both preserve `.swarm-workspaces` files safely on disk!) and spawn a replacement worker anchored to the preserved workspace or a fresh clone.
+     2. Obtain an actual native observation using `list_agents` / `wait_agent`; heartbeat expiry alone is not a dead-agent verdict. Check pending controls and stopped/killed status before scheduling.
+     3. Only for an observed idle/ended original worker without user stop, wake the SAME thread via `followup_task` (V2) or `send_input` (V1) and record that actual dispatch. A running worker receives a native message, not a second execution. If unavailable, retain its workspace/checkpoint as needs-decision; do not replace its identity or retry budget automatically.
 
 ### 5. Cross-Verification, Sequential Merge & Cleanup
 
-1. When workers post `#verify` handoffs (`已完成：...，详见 #<seq> (@verifier)`), register/wake `verifier`:
-   - `worker_register(run_id=run_id, name="verify-1", role="verifier", status="waiting", current_task="Audit #<seq> and workspace")`
-   - `spawn_agent(agent_type="verifier", fork_turns="none", ...)` (omit `model`), passing `run_id`, `workspace_id`, returned workspace `mode`, the Workspace Mode & Dependency Contract, `task_packet_get` reference, and relevant `#seq` IDs (read via `board_read`).
+1. When workers post `#verify` handoffs (`已完成：...，详见 #<seq> (@verifier)`), resume the same prebound `verify-1` via `followup_task`, passing `run_id`, `step_id`, `workspace_id`, returned workspace `mode`, the Workspace Mode & Dependency Contract, `task_packet_get` reference, and relevant `#seq` IDs (read via `board_read`). Do not replace its original native binding.
 2. On `VERDICT: FAIL`, route the `#verify` defect `#seq` back to the owning `swarm_worker` thread via `followup_task` / `send_input` until `verifier` posts `VERDICT: PASS`.
 3. Merge verified workspaces sequentially in dependency order:
    - `workspace_merge_preview(workspace_id)` -> confirm `has_conflicts == false`

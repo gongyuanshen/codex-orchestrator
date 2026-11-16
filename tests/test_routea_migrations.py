@@ -1,4 +1,5 @@
 """Route A migration must preserve old runs without inventing acceptance."""
+from contextlib import closing
 import sqlite3
 
 import pytest
@@ -9,18 +10,18 @@ from orchestrator.db import Database, SCHEMA_VERSION
 
 def test_future_schema_is_rejected_before_ddl(tmp_path):
     path = tmp_path / 'future.db'
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at REAL)')
         conn.execute('INSERT INTO schema_migrations VALUES(999,0)')
     with pytest.raises(ValueError, match='newer'):
         Database(path)
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         assert conn.execute("select name from sqlite_master where type='table' order by name").fetchall() == [('schema_migrations',)]
 
 
 def test_migration_is_idempotent_and_existing_runs_remain_legacy(tmp_path):
     path = tmp_path / 'legacy.db'
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         conn.execute('CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at REAL)')
         conn.execute('INSERT INTO schema_migrations VALUES(3,0)')
         conn.execute('CREATE TABLE projects(id TEXT PRIMARY KEY,root_path TEXT UNIQUE,name TEXT,is_git INTEGER,created_at REAL)')
