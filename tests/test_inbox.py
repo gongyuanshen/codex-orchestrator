@@ -18,6 +18,7 @@ def environment(tmp_path):
     db = Database(settings=settings)
     board = BoardService(db)
     run = db.create_run(project_root=tmp_path, mode="swarm", title="Inbox tests")
+    db.connect().execute("UPDATE runs SET workflow_version=1 WHERE id=?", (run["id"],))
     board.worker_register(run["id"], "writer", "coder", agent_id="native-coder")
     board.worker_register(run["id"], "reviewer", "verifier", agent_id="native-verifier")
     yield db, board, run["id"]
@@ -94,6 +95,7 @@ def test_key_scope_is_run_and_sender(environment, tmp_path):
     db, board, run_id = environment
     store = make_store(db, board)
     other_run = db.create_run(project_root=tmp_path, mode="swarm", title="Other")
+    db.connect().execute("UPDATE runs SET workflow_version=1 WHERE id=?", (other_run["id"],))
     board.worker_register(other_run["id"], "writer", "coder", agent_id="native-coder")
     messages = [store.send(**p)["message"] for p in [
         payload(run_id), payload(run_id, sender="verifier"), payload(other_run["id"]),
@@ -183,6 +185,7 @@ def test_send_requires_existing_active_run_and_registered_recipient(environment,
     db, board, run_id = environment
     store = make_store(db, board)
     other_run = db.create_run(project_root=tmp_path, mode="swarm", title="Other")
+    db.connect().execute("UPDATE runs SET workflow_version=1 WHERE id=?", (other_run["id"],))
     board.worker_register(other_run["id"], "other-only", "coder", agent_id="native-coder")
     with pytest.raises(NotFoundError):
         store.send(**payload("missing-run"))
@@ -207,6 +210,7 @@ def test_pending_is_recipient_and_run_scoped(environment, tmp_path):
     db, board, run_id = environment
     store = make_store(db, board)
     other_run = db.create_run(project_root=tmp_path, mode="swarm", title="Other")
+    db.connect().execute("UPDATE runs SET workflow_version=1 WHERE id=?", (other_run["id"],))
     board.worker_register(other_run["id"], "writer", "coder", agent_id="native-coder")
     mine = store.send(**payload(run_id))["message"]
     store.send(**payload(run_id, key="review-1", recipient="reviewer"))

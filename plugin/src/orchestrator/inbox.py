@@ -14,7 +14,15 @@ from orchestrator.db import Database, NotFoundError
 KINDS = frozenset({"task", "rework", "review", "result", "notice"})
 ACK_STATUSES = frozenset({"accepted", "completed", "failed", "cancelled"})
 _MESSAGE_FIELDS = ("id", "board_seq", "run_id", "sender", "recipient", "key", "kind",
-                   "summary", "body_md", "status", "receipts_json", "recipient_agent_id", "step_id")
+                   "summary", "body_md", "status", "receipts_json", "recipient_agent_id", "step_id",
+                   "step_packet_version", "step_attempt", "step_contract_revision")
+_STEP_FIELDS = ("run_id", "owner", "verifier", "owner_agent_id", "verifier_agent_id",
+                "packet_version", "attempt", "contract_revision", "state")
+_STEP_SELECT = ",".join(f"s.{name} AS ctx_{name}" for name in _STEP_FIELDS) + """,
+    o.agent_id AS ctx_current_owner_agent_id,v.agent_id AS ctx_current_verifier_agent_id,
+    (SELECT MAX(p.version) FROM task_packets p WHERE p.run_id=s.run_id) AS ctx_current_packet_version"""
+_STEP_JOINS = """LEFT JOIN workers o ON o.run_id=s.run_id AND o.name=s.owner
+    LEFT JOIN workers v ON v.run_id=s.run_id AND v.name=s.verifier"""
 
 class InboxConflictError(ValueError):
     """A durable message, binding or receipt conflicts with persisted state."""
@@ -69,20 +77,27 @@ class InboxStore:
             worker = self._require_recipient(run_id, recipient)
             if run["workflow_version"] and not worker["agent_id"]:
                 raise InboxConflictError("Recipient requires a native agent binding before delivery")
-            if step_id is not None:
-                step = conn.execute("SELECT run_id FROM workflow_steps WHERE id=?", (step_id,)).fetchone()
+            context = {field: None for field in
+                       ("step_packet_version", "step_attempt", "step_contract_revision")}
+            step = self._step_context(conn, step_id) if step_id is not None else None
+            if step is not None and step["ctx_run_id"] != run_id:
+                raise InboxConflictError("Inbox step must belong to the same run")
+            if self._linked_execution(run, content):
                 if step is None:
-                    raise NotFoundError(f"Workflow step not found: {step_id}")
-                if step["run_id"] != run_id:
-                    raise InboxConflictError("Inbox step must belong to the same run")
+                    raise InboxConflictError("Swarm execution requires a same-run workflow step_id")
+                context = {"step_" + name: step["ctx_" + name] for name in
+                           ("packet_version", "attempt", "contract_revision")}
+                self._require_step_delivery(content | context, step, stage=True)
             # The nested board savepoint commits only with this outer transaction.
             pointer = self.board.board_post(run_id=run_id, sender=sender, summary=summary,
                 body_md=body_md, channel="inbox", mentions=[recipient], msg_type="handoff")
             mid = "msg_" + uuid.uuid4().hex
             conn.execute("""INSERT INTO inbox_messages
-                (id,board_seq,run_id,sender,recipient,key,kind,summary,body_md,recipient_agent_id,step_id)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (mid,pointer["seq"],run_id,sender,recipient,key,kind,summary,body_md,worker["agent_id"],step_id))
+                (id,board_seq,run_id,sender,recipient,key,kind,summary,body_md,recipient_agent_id,step_id,
+                 step_packet_version,step_attempt,step_contract_revision)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (mid,pointer["seq"],run_id,sender,recipient,key,kind,summary,body_md,worker["agent_id"],step_id,
+                 context["step_packet_version"],context["step_attempt"],context["step_contract_revision"]))
             return {"message": self.get(mid), "duplicate": False}
 
     def get(self, message_id: str) -> dict[str, Any]:
@@ -107,11 +122,14 @@ class InboxStore:
                         raise InboxConflictError("Receipt already exists with different evidence")
                     # Historical acknowledgements cannot execute work or revert terminal state.
                     return message
-            self._require_active_run(message["run_id"])
+            run = self._require_active_run(message["run_id"])
             worker = self._require_recipient(message["run_id"], recipient)
             if status != "cancelled":
                 self._require_binding(message, worker["agent_id"])
             if status in {"accepted", "completed"}:
+                if self._linked_execution(run, message):
+                    step = self._step_context(conn, message["step_id"])
+                    self._require_step_delivery(message, step, stage=status == "accepted")
                 if worker["status"] in {"stopped", "killed"}:
                     raise InboxConflictError("Recipient is paused; execution acknowledgement is blocked")
                 if conn.execute("SELECT 1 FROM worker_controls WHERE worker_id=? AND status='pending'",
@@ -126,6 +144,42 @@ class InboxStore:
             conn.execute("UPDATE inbox_messages SET status=?,receipts_json=? WHERE id=?",
                          (status,json.dumps(message["receipts"],ensure_ascii=False),message_id))
             return self.get(message_id)
+
+    @staticmethod
+    def _linked_execution(run: Any, message: dict[str, Any]) -> bool:
+        return run["workflow_version"] == 2 and run["mode"] == "swarm" and message["kind"] != "notice"
+
+    @staticmethod
+    def _step_context(conn: Any, step_id: str | None) -> Any:
+        row = conn.execute(f"SELECT {_STEP_SELECT} FROM workflow_steps s {_STEP_JOINS} WHERE s.id=?",
+                           (step_id,)).fetchone()
+        if row is None:
+            raise NotFoundError(f"Workflow step not found: {step_id}")
+        return row
+
+    @staticmethod
+    def _require_step_delivery(message: dict[str, Any], step: Any, *, stage: bool) -> None:
+        if step["ctx_run_id"] != message["run_id"]:
+            raise InboxConflictError("Inbox step must belong to the same run")
+        role = {"task": "owner", "rework": "owner", "review": "verifier"}.get(message["kind"])
+        recipients = {step["ctx_" + role]} if role else {step["ctx_owner"], step["ctx_verifier"]}
+        if message["recipient"] not in recipients:
+            raise InboxConflictError("Inbox recipient does not match the workflow step role")
+        if (not step["ctx_owner_agent_id"] or not step["ctx_verifier_agent_id"]
+                or step["ctx_owner_agent_id"] == step["ctx_verifier_agent_id"]
+                or any(step["ctx_" + name + "_agent_id"] != step["ctx_current_" + name + "_agent_id"]
+                       for name in ("owner", "verifier"))):
+            raise InboxConflictError("Workflow step owner/verifier native binding changed; reconcile or cancel delivery")
+        if (step["ctx_packet_version"] != step["ctx_current_packet_version"]
+                or any(message["step_" + name] != step["ctx_" + name]
+                       for name in ("packet_version", "attempt", "contract_revision"))):
+            raise InboxConflictError("Inbox delivery context is stale; reconcile or cancel the original message")
+        if stage:
+            state, kind = step["ctx_state"], message["kind"]
+            if ((kind == "task" and state != "dispatched")
+                    or (kind == "rework" and (state != "implementing" or step["ctx_attempt"] < 1))
+                    or (kind == "review" and state not in {"candidate_review", "integrated_review"})):
+                raise InboxConflictError(f"Inbox {kind} dispatch is incompatible with workflow stage {state}")
 
     @staticmethod
     def _require_binding(message: dict[str, Any], current_agent_id: str | None) -> None:
@@ -150,12 +204,14 @@ class InboxStore:
         _validate_text(run_id=run_id, recipient=recipient)
         # One SQLite statement observes binding, controls, state and messages together.
         with self.db.read_connection() as conn:
-            rows = conn.execute("""SELECT r.status AS run_status,r.workflow_version AS workflow_version,w.id AS worker_id,
-                w.status AS worker_status,w.agent_id AS current_agent_id,
+            rows = conn.execute(f"""SELECT r.status AS run_status,r.workflow_version AS workflow_version,r.mode AS mode,
+                w.id AS worker_id,w.status AS worker_status,w.agent_id AS current_agent_id,{_STEP_SELECT},
                 EXISTS(SELECT 1 FROM worker_controls c WHERE c.worker_id=w.id AND c.status='pending') AS controlled,
                 m.* FROM runs r LEFT JOIN workers w ON w.run_id=r.id AND w.name=?
                 LEFT JOIN inbox_messages m ON m.run_id=r.id AND m.recipient=w.name
                     AND m.status IN ('pending','accepted')
+                LEFT JOIN workflow_steps s ON s.id=m.step_id
+                {_STEP_JOINS}
                 WHERE r.id=? ORDER BY m.board_seq""", (recipient,run_id)).fetchall()
         if not rows:
             raise NotFoundError(f"Run not found: {run_id}")
@@ -166,8 +222,7 @@ class InboxStore:
     def pending(self, run_id: str, recipient: str) -> list[dict[str, Any]]:
         rows = self._rows(run_id,recipient)
         messages = [_message(row) for row in rows if row["id"] is not None]
-        for message in messages:
-            self._require_binding(message, rows[0]["current_agent_id"])
+        self._require_deliveries(rows)
         return messages
 
     def poll(self, run_id: str, recipient: str) -> dict[str, Any]:
@@ -182,9 +237,17 @@ class InboxStore:
         if state["workflow_version"] and not state["current_agent_id"]:
             raise InboxConflictError("Recipient requires a native agent binding before delivery")
         messages = [_message(row) for row in rows if row["id"] is not None]
-        for message in messages:
-            self._require_binding(message,state["current_agent_id"])
+        self._require_deliveries(rows)
         return {"status":"messages" if messages else "timeout", "messages":messages}
+
+    def _require_deliveries(self, rows: list[Any]) -> None:
+        for row in rows:
+            if row["id"] is None:
+                continue
+            message = _message(row)
+            self._require_binding(message, row["current_agent_id"])
+            if self._linked_execution(row, message):
+                self._require_step_delivery(message, row, stage=message["status"] == "pending")
 
 
 def _snapshot(state: Any, run_id: str, recipient: str) -> dict[str, Any]:
@@ -262,8 +325,8 @@ INBOX_TOOL_DEFINITIONS = [{'name': 'inbox_send',
                                  'summary': {'type': 'string'},
                                  'body_md': {'type': 'string'},
                                  'step_id': {'type': 'string',
-                                             'description': 'Optional workflow step in the same '
-                                                            'run.'}},
+                                             'description': 'Same-run step; required for workflow2 '
+                                                            'Swarm task/rework/review/result.'}},
                   'required': ['run_id',
                                'sender',
                                'recipient',
