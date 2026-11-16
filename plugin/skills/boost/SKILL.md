@@ -112,13 +112,11 @@ Never accept a worker's self-report or your own Solo edit without independent ch
 
 ### 5. Merge, Cleanup & Close
 
-1. For each isolated workspace created in this run:
-   - Run `workspace_merge_preview(workspace_id)` -> confirm `has_conflicts == false`.
-   - Run `workspace_merge(workspace_id, strategy="merge")` -> confirm `merged == true` (if conflict occurs, resolve cleanly before continuing).
-   - Run final verification tests on the merged main repository.
-   - Clean up ONLY successfully merged workspaces unchanged since that merge (mode-specific checks above) with `workspace_cleanup(workspace_id)`.
-2. Mark active workers finished (`worker_status_update(run_id=run_id, worker_name=..., status="stopped")`) and close the run:
-   - `run_update(run_id=run_id, status="completed")`
+1. For each isolated workspace, require its current independent candidate PASS, then workspace_merge_preview(workspace_id) and workspace_merge(workspace_id, strategy="merge") in order. Preserve all original author workspaces; conflicts and later failures still return to those authors.
+2. After all merges (or Solo edits), artifact_capture(step_id=step["id"], scope="integrated") before the same original verifier runs the actual final main-directory tests and records each step's integrated verification_record. Call workflow_step_advance(action="complete") only for a current integrated PASS.
+3. If a later source change invalidates an earlier approved scope, reopen it with action="reverify" and re-run its integrated gate. A FAIL uses the same original author/verifier, retained workspace and existing attempt counter; never clean its repair surface or reset the three-round budget.
+4. Only after all final/reopened integrated gates pass, workspace_cleanup each successfully merged, unchanged workspace. Solo has no invented workspace or merge.
+5. Mark finished worker records stopped and run_update(status="completed") only after every required step is done and business inbox/control work is disposed.
 
 
 ### Large MCP results (explicit file delivery)
