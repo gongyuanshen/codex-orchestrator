@@ -43,6 +43,8 @@ def test_async_wait_does_not_serialize_send_and_conflicts_are_409(tmp_path):
                     return response.json()["result"]
 
                 run = await rpc("run_create", mode="swarm", title="formal inbox", project_root=str(tmp_path))
+                # Foundation transport fixture; workflow2 business gates have their own full-stack test.
+                app.state.db.connect().execute("UPDATE runs SET workflow_version=1 WHERE id=?", (run["id"],))
                 await rpc("worker_register", run_id=run["id"], name="worker", role="coder", agent_id="/root/formal-worker")
                 waiting = asyncio.create_task(rpc("inbox_wait", run_id=run["id"], recipient="worker", timeout_ms=25000))
                 try:

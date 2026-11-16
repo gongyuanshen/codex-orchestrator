@@ -80,6 +80,8 @@ def test_formal_mcp_inflight_loss_preserves_error_and_reconciles_without_replay(
                     assert {"inbox_wait", "inbox_send", "verification_record"} <= {tool.name for tool in tools.tools}
                     run = await call("run_create", mode="swarm", title="Formal MCP in-flight loss",
                                      project_root=str(project), is_git=False)
+                    # Service-loss evidence concerns foundation delivery, not structured work acceptance.
+                    app.state.db.connect().execute("UPDATE runs SET workflow_version=1 WHERE id=?", (run["id"],))
                     for name in ("writer", "watcher"):
                         await call("worker_register", run_id=run["id"], name=name, role="coder",
                                    agent_id=f"/root/formal-loss-{name}")

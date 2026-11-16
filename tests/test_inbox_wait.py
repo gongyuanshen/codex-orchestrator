@@ -9,7 +9,7 @@ import json
 import sqlite3
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 import httpx
@@ -30,6 +30,8 @@ async def running_app(tmp_path):
     app = create_app(Settings(port=19891, data_dir=tmp_path / "data"), start_watchdog=False, manage_pid_file=False)
     async with app.router.lifespan_context(app):
         run = app.state.db.create_run(mode="swarm", title="Inbox checks", project_root=tmp_path)
+        # These transport fixtures intentionally exercise the stored foundation contract.
+        app.state.db.connect().execute("UPDATE runs SET workflow_version=1 WHERE id=?", (run["id"],))
         app.state.db.upsert_worker(run["id"], "writer", role="coder", agent_id="native-writer")
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -260,7 +262,7 @@ def test_signal_observer_sees_committed_message_and_receipt(tmp_path, monkeypatc
             observed = []
             def check_committed(event, data, *, run_id=None):
                 message = data["message"]
-                with sqlite3.connect(app.state.settings.db_path) as db:
+                with closing(sqlite3.connect(app.state.settings.db_path)) as db, db:
                     durable = db.execute("SELECT status, board_seq FROM inbox_messages WHERE id=?", (message["id"],)).fetchone()
                     assert durable == (message["status"], message["board_seq"])
                     assert db.execute("SELECT seq FROM board_messages WHERE seq=?", (message["board_seq"],)).fetchone()
