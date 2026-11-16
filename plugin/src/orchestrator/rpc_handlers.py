@@ -479,6 +479,7 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                     "begin_integrated_review", "complete", "handoff", "ack_handoff", "reconcile", "observe", "reverify"]},
                 "expected_revision": {"type": "integer", "minimum": 0},
                 "evidence": {"type": "string"}, "agent_id": {"type": "string"},
+                "artifact_id": {"type": "string"}, "recipient_agent_id": {"type": "string"},
                 "observation": {
                     "type": "object",
                     "properties": {
