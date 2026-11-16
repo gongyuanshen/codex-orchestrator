@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tri-orchestrator"
+version = "0.2.0"
+description = "Multi-agent orchestrator daemon, SQLite WAL message board, isolated workspace manager, and stdio MCP shim for Codex"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0.0",
+    "starlette>=0.40.0",
+    "uvicorn>=0.32.0",
+    "httpx>=0.27.0",
+]
+
+[project.scripts]
+tri-orchestrator-mcp = "orchestrator.mcp_shim:main"
+tri-orchestrator-daemon = "orchestrator.daemon:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orchestrator"]

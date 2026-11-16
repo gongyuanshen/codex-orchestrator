@@ -1,0 +1,20 @@
+{
+  "name": "tri-orchestrator",
+  "interface": {
+    "displayName": "三重编排器"
+  },
+  "plugins": [
+    {
+      "name": "tri-orchestrator",
+      "source": {
+        "source": "local",
+        "path": "./plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

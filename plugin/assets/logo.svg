@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="20" y1="16" x2="236" y2="240" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0B1F24"/>
+      <stop offset="100%" stop-color="#0F766E"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="72" y1="56" x2="184" y2="200" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#5EEAD4"/>
+      <stop offset="100%" stop-color="#14B8A6"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <rect x="10" y="10" width="236" height="236" rx="48" stroke="#2DD4BF" stroke-opacity="0.22" stroke-width="2"/>
+  <path d="M128 66 L74 176 L182 176 Z" stroke="#2DD4BF" stroke-opacity="0.35" stroke-width="4" stroke-linejoin="round"/>
+  <path d="M128 66 L128 134 M74 176 L128 134 M182 176 L128 134" stroke="url(#accent)" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="128" cy="66" r="20" fill="#134E4A" stroke="#5EEAD4" stroke-width="6"/>
+  <circle cx="74" cy="176" r="20" fill="#134E4A" stroke="#5EEAD4" stroke-width="6"/>
+  <circle cx="182" cy="176" r="20" fill="#134E4A" stroke="#5EEAD4" stroke-width="6"/>
+  <polygon points="128,114 148,134 128,154 108,134" fill="#F59E0B" stroke="#FEF3C7" stroke-width="3"/>
+</svg>

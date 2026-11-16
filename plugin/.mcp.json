@@ -1,0 +1,35 @@
+{
+  "mcpServers": {
+    "tri_orchestrator": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--quiet",
+        "--project",
+        ".",
+        "python",
+        "-m",
+        "orchestrator.mcp_shim"
+      ],
+      "cwd": ".",
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "env_vars": [
+        "LOCALAPPDATA",
+        "USERPROFILE",
+        "HOME",
+        "PATH",
+        "TRI_ORCH_HOST",
+        "TRI_ORCH_PORT",
+        "TRI_ORCH_DATA_DIR",
+        "TRI_ORCH_STALL_SEC",
+        "TRI_ORCH_WATCHDOG_INTERVAL_SEC",
+        "TRI_ORCH_PORT_RANGE"
+      ],
+      "startup_timeout_sec": 60,
+      "tool_timeout_sec": 300
+    }
+  }
+}

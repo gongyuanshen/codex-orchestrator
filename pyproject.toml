@@ -1,0 +1,19 @@
+[project]
+name = "codex-orchestrator-dev"
+version = "0.1.0"
+description = "Development and test runner for the tri-orchestrator Codex plugin"
+requires-python = ">=3.12"
+dependencies = [
+    "tri-orchestrator",
+    "pytest>=8.0.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+tri-orchestrator = { path = "plugin", editable = true }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["plugin/src"]
