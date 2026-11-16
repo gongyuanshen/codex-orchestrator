@@ -244,6 +244,7 @@ def apply(backup_dir: Path) -> dict:
             code = "import sys; sys.path.insert(0,sys.argv[1]); from orchestrator.db import Database; d=Database(sys.argv[2]); d.close()"
             result = subprocess.run([sys.executable, "-B", "-c", code, str(target / "src"), str(data / "state.db")],
                                     capture_output=True, text=True, encoding="utf-8", timeout=60,
+                                    env=dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8"),
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             write_json(backup / "migration.json", {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr})
             if result.returncode:
@@ -296,6 +297,8 @@ def verify(backup_dir: Path) -> dict:
     with opener.open(f"http://127.0.0.1:{manifest['port']}/api/health", timeout=5) as response:
         health = json.load(response)
     required = {"durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1"}
+    if manifest["supported_schema"] == 5:
+        required.add("workflow_modes_v2")
     if (health.get("status") != "ok" or health.get("ok") is not True
             or type(health.get("pid")) is not int or not process_alive(health["pid"])
             or health.get("software_version") != manifest["source_identity"]["version"]

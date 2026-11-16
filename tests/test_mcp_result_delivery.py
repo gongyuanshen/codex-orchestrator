@@ -31,7 +31,7 @@ def shim_session(tmp_path, result, *, fail_delivery=False, error=False, protocol
             body = {"status": "ok", "pid": os.getpid(),
                     "port": self.server.server_port, "data_dir": str(data),
                     "software_version": __version__, "schema_version": SCHEMA_VERSION,
-                    "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1"]}
+                    "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"]}
             self.reply(200, body)
 
         def do_POST(self):
@@ -123,10 +123,15 @@ def shim_session(tmp_path, result, *, fail_delivery=False, error=False, protocol
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
-        reader.join(timeout=5)
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
+        try:
+            reader.join(timeout=5)
+            assert not reader.is_alive(), "stdio reader did not exit after shim termination"
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                stream.close()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 @pytest.mark.parametrize("protocol", ["2025-03-26", "2026-07-28"])

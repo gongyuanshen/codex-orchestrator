@@ -37,7 +37,7 @@ logger = logging.getLogger("orchestrator.mcp_shim")
 
 # Codex's modern stdio transport closes on an 8 MiB line. Leave room for the RPC envelope.
 INLINE_RESULT_BYTES = 1024 * 1024 - 1024
-REQUIRED_CAPABILITIES = frozenset({"durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1"})
+REQUIRED_CAPABILITIES = frozenset({"durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"})
 
 
 def configure_shim_logging(settings: Settings) -> None:

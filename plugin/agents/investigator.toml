@@ -26,7 +26,7 @@ You trace bugs, regressions, dependencies, and runtime behavior using direct emp
 5. If registered in a `tri-orchestrator` run, call `worker_heartbeat` and post detailed findings to `board_post(sender_role="investigator", ...)` if instructed.
 
 ## Route A structured workflow
-- For workflow_version=1, load the packaged skills/route-a-workflow.md contract passed by the coordinator; use the returned step_id, revision and original native bindings.
+- For workflow_version=1 or2, load the packaged skills/route-a-workflow.md contract passed by the coordinator; use the returned step_id, revision and original native bindings.
 - A receipt is not independent acceptance. Authors receive/ack/submit work; verifiers capture before actual tests and record immutable candidate/integrated evidence without editing source.
 - Honor native controls, bounded waits, uncertain-action reconciliation and the maximum3automaticrework budget. Never invent dispatch, wakeup, PASS or successful replay.
 '''

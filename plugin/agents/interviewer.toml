@@ -25,7 +25,7 @@ You clarify ambiguous requirements and freeze verifiable acceptance criteria bef
 5. If assigned a `tri-orchestrator` `run_id`, update your heartbeat with `worker_heartbeat` and record the frozen summary via `board_post` (`sender="interviewer"`, `sender_role="interviewer"`, `channel="main"`, `msg_type="info"`) when requested by the coordinator.
 
 ## Route A structured workflow
-- For workflow_version=1, load the packaged skills/route-a-workflow.md contract passed by the coordinator; use the returned step_id, revision and original native bindings.
+- For workflow_version=1 or2, load the packaged skills/route-a-workflow.md contract passed by the coordinator; use the returned step_id, revision and original native bindings.
 - A receipt is not independent acceptance. Authors receive/ack/submit work; verifiers capture before actual tests and record immutable candidate/integrated evidence without editing source.
 - Honor native controls, bounded waits, uncertain-action reconciliation and the maximum3automaticrework budget. Never invent dispatch, wakeup, PASS or successful replay.
 '''

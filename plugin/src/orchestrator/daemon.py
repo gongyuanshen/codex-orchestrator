@@ -470,7 +470,7 @@ def create_app(
                 "sse_subscribers": state.event_bus.subscriber_count(),
                 "software_version": __version__,
                 "schema_version": SCHEMA_VERSION,
-                "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1"],
+                "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"],
             }
         )
 

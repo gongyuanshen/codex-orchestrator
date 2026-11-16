@@ -218,7 +218,18 @@ def test_five_concurrent_shims_spawn_single_daemon_pure_stdout(tmp_path: Path) -
                     pass
 
 
-def test_stale_pid_recovery_and_idempotent_reuse(tmp_path: Path) -> None:
+def test_stale_pid_recovery_and_idempotent_reuse(tmp_path: Path, monkeypatch) -> None:
+    import orchestrator.mcp_shim as shim
+    launchers = []
+    real_spawn = shim._spawn_detached_daemon
+
+    def retain_real_launcher(settings):
+        process = real_spawn(settings)
+        launchers.append(process)
+        return process
+
+    # This test owns daemon teardown; retain and reap its real launcher as well.
+    monkeypatch.setattr(shim, "_spawn_detached_daemon", retain_real_launcher)
     port = _free_port()
     data_dir = tmp_path / "stale_data"
     settings = Settings(
@@ -253,6 +264,8 @@ def test_stale_pid_recovery_and_idempotent_reuse(tmp_path: Path) -> None:
     finally:
         if spawned_pid:
             _terminate_pid(spawned_pid)
+        for process in launchers:
+            process.wait(timeout=5)
 
 
 def test_live_pid_without_health_never_spawns(tmp_path, monkeypatch):

@@ -7,12 +7,19 @@ metadata:
 
 ## Route A structured workflow (Required)
 
-Before executing a new workflow_version=1 run, read [the shared workflow contract](../route-a-workflow.md). Use the backend inbox, step, artifact and verification gates throughout the workflow below, including the inline fallback roles. Following the first failed delivery, use at most 3 automatic rework rounds; then needs_decision stops further automatic work. A board PASS or completed message is not independent acceptance. Legacy version0 runs keep their recorded behavior.
+Before executing a new workflow_version=1 or2 run, read [the shared workflow contract](../route-a-workflow.md). Use the backend inbox, step, artifact and verification gates throughout the workflow below, including the inline fallback roles. Following the first failed delivery, use at most 3 automatic rework rounds; then needs_decision stops further automatic work. A board PASS or completed message is not independent acceptance. Legacy version0 runs keep their recorded behavior.
 
 
 # `$teamwork` — Structured Multi-Agent Engineering Pipeline
 
 Run a disciplined end-to-end delivery flow backed by `tri-orchestrator` SQLite Task Packets, isolated `.swarm-workspaces` clones, and a two-stage verification gate.
+
+
+## Mode2 milestones and coordinator handoff
+
+Use one kind="milestone" work step per milestone with explicit criteria/dependencies. Every milestone retains candidate and integrated verification, exact artifacts and unresolved checkpoint items; use the milestone's existing attempt counter, never a nested retry loop. Only dependency-admitted milestones may start implementation; future milestones remain planned. Confirm predecessor integrated PASS and intended recipient handoff before the next milestone's native dispatch.
+
+After integrated PASS, send the plan/checkpoint with action="handoff" and recipient_agent_id set to the intended recipient's actual native binding. That recipient reads it and issues action="ack_handoff" with evidence. A sent message is not confirmed handoff. The new project coordinator receives planning/checkpoints only: the root keeps native dispatch, waits, interruptions and child ownership.
 
 ## Non-Negotiable Codex Subagent Rules
 
@@ -84,13 +91,15 @@ Include the matching contract verbatim in the child prompt whenever falling back
 
 ### Step 3: Isolated Workspaces & Parallel Implementation (`coder`)
 
+Before any writer implements, spawn a bootstrap-only verifier, register its exact native binding and keep it waiting. Reuse this prebound verifier for candidate, rework and integrated checks.
+
 1. For every parallel writer (`coder-1`, `coder-2`, ...) in `file_ownership`:
    - Create an isolated clone/snapshot:
      `workspace_create(run_id=run_id, worker_name="coder-1", project_root="<abs_repo_path>", copy_env=True, dep_mode="none")`
      (For dependency writes needing isolation, choose `dep_mode="copy"` or `dep_mode="fresh_venv_uv"` according to the Workspace Mode & Dependency Contract; `link_ro_cache` is shared writable storage.)
    - Register the worker linked to its workspace:
      `worker_register(run_id=run_id, name="coder-1", role="coder", status="waiting", workspace_id=ws["id"], current_task="<slice summary>")`
-2. Dispatch all independent `coder` subagents in parallel in one turn (`spawn_agent(agent_type="coder", fork_turns="none", ...)` — omit `model`). Each coder prompt MUST include:
+2. Bootstrap independent `coder` subagents in parallel in waiting-only mode (`spawn_agent(agent_type="coder", fork_turns="none", ...)` — omit `model`); their initial prompt forbids implementation. Register actual bindings, save milestone steps/dependencies, and call workflow_step_advance(action="dispatch") only for currently admitted milestones. Then deliver actual implementation briefs via followup_task to those original children only. Each brief MUST include:
    - `run_id`, `worker_name`, `workspace_id`, returned `mode`, isolated `path`, `branch_name` (None for snapshot), and `assigned_port`;
    - Verbatim task requirements, locked interfaces, and acceptance criteria from `task_packet_get`;
    - Its exclusive owned file list and explicit prohibition against editing unowned files or touching the main repo outside `path`;
@@ -100,7 +109,7 @@ Include the matching contract verbatim in the child prompt whenever falling back
 ### Step 4: Two-Stage Independent Verification (`verifier`)
 
 1. After coders finish, check `workspace_status(workspace_id)` and `workspace_diff(workspace_id)` for each workspace to verify the mode-specific requirements above and zero ownership violations; a snapshot diff is not an uncommitted Git failure.
-2. Register `verifier` via `worker_register(run_id=run_id, name="verifier", role="verifier", status="waiting", current_task="Stage 1 Spec + Stage 2 Quality & Tests")` and dispatch `spawn_agent(agent_type="verifier", fork_turns="none", ...)` (omit `model`).
+2. Resume the same prebound `verifier` via `followup_task` with Stage1 specification and Stage2 quality/tests; do not replace its binding or create a fresh verifier.
 3. Pass each workspace mode and the Workspace Mode & Dependency Contract to `verifier`, which MUST execute both stages without editing any code:
    - **Stage 1 — Spec Compliance**: Verify every acceptance criterion in `task_packet_get` (`MET` / `GAP`), Missing / Extra / Misunderstood scope, and file ownership adherence.
    - **Stage 2 — Code Quality & Real Tests**: Inspect diffs for defects, concurrency/Windows issues, error handling, and test rigor, then run real test/lint/build commands in each workspace.
@@ -115,14 +124,15 @@ Include the matching contract verbatim in the child prompt whenever falling back
 
 ### Step 6: Safe Sequential Merge, Final Verification & Cleanup
 
-Follow the planner's dependency/merge order one workspace at a time:
+For each admitted milestone, repeat implementation, candidate verification and integration before admitting its dependents:
 
-1. Run `workspace_merge_preview(workspace_id)` -> verify `has_conflicts == false`.
-   - If conflicts exist, do NOT force merge; resolve via the owning coder in its workspace and re-verify first.
-2. Run `workspace_merge(workspace_id, strategy="merge")` -> confirm `merged == true` (`status == "merged"`).
-3. After all workspaces are merged into the main repository, run the full verification suite on the main repository (and have `verifier` or coordinator confirm all acceptance criteria pass together).
-4. Clean up ONLY successfully merged workspaces unchanged since that merge (mode-specific checks above) with `workspace_cleanup(workspace_id)` (never bypass the unmerged/dirty guard).
-5. Update worker states (`worker_status_update(..., status="stopped")`) and mark the run done (`run_update(run_id=run_id, status="completed")`).
+1. Require the current candidate artifact's independent PASS, then workspace_merge_preview(workspace_id) and workspace_merge(workspace_id, strategy="merge") in the planner's sequential order. Conflicts go to the original author and same verifier; never force merge.
+2. artifact_capture(step_id=step["id"], scope="integrated") before running the actual main-directory tests for this milestone. Record verification_record with every assigned criterion and retained evidence, then workflow_step_advance(action="complete"). Candidate PASS never substitutes for this integrated PASS.
+3. Send the milestone's plan/checkpoint using action="handoff" and its intended recipient_agent_id. The receiving coordinator reads it and calls action="ack_handoff" with actual receipt evidence. Root still owns the existing native children.
+4. Only then admit the next dependent milestone through workflow_step_advance(action="dispatch"). Its author also rechecks admission at accept; future milestones must not implement early. Keep each milestone's existing attempt counter and unresolved evidence.
+5. Retain every milestone's original author workspace until all milestones and final integrated re-verification pass; a later failure must still return to its original author.
+
+After all milestones, run the full main-directory integration suite. If later merges changed a prior approved scope, reopen that step with action="reverify" and record a fresh integrated gate before closure. Only after those final gates pass, workspace_cleanup each currently integrated-verified, successfully merged workspace. Finally stop finished worker records and run_update(status="completed") only after all steps, controls and business inbox work are disposed.
 
 
 ### Large MCP results (explicit file delivery)

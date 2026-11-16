@@ -65,7 +65,7 @@ def test_prepare_stage_and_consistent_backup(fixture):
 
 @pytest.mark.parametrize("mode", ["boost", "teamwork", "swarm"])
 def test_prepare_rejects_active_task_in_any_mode(fixture, mode):
-    with sqlite3.connect(fixture[2] / "state.db") as db:
+    with closing(sqlite3.connect(fixture[2] / "state.db")) as db, db:
         db.execute("INSERT INTO runs VALUES('active',?,'active')", (mode,))
     with pytest.raises(upgrade.UpgradeError, match="active"):
         prepare(fixture)
@@ -73,7 +73,7 @@ def test_prepare_rejects_active_task_in_any_mode(fixture, mode):
 
 
 def test_future_schema_rejected_before_backup(fixture):
-    with sqlite3.connect(fixture[2] / "state.db") as db:
+    with closing(sqlite3.connect(fixture[2] / "state.db")) as db, db:
         db.execute("INSERT INTO schema_migrations VALUES(99,0)")
     with pytest.raises(upgrade.UpgradeError, match="newer"):
         prepare(fixture)
@@ -93,7 +93,7 @@ def test_apply_migrates_from_staged_package_and_rollback(fixture):
 
 def test_apply_rejects_new_writes_since_prepare(fixture):
     prepare(fixture)
-    with sqlite3.connect(fixture[2] / "state.db") as db:
+    with closing(sqlite3.connect(fixture[2] / "state.db")) as db, db:
         db.execute("INSERT INTO receipts VALUES('new')")
     with pytest.raises(upgrade.UpgradeError, match="changed"):
         upgrade.apply(fixture[3])
@@ -103,11 +103,11 @@ def test_apply_rejects_new_writes_since_prepare(fixture):
 def test_rollback_rejects_new_production_writes(fixture):
     prepare(fixture)
     upgrade.apply(fixture[3])
-    with sqlite3.connect(fixture[2] / "state.db") as db:
+    with closing(sqlite3.connect(fixture[2] / "state.db")) as db, db:
         db.execute("INSERT INTO receipts VALUES('retain')")
     with pytest.raises(upgrade.UpgradeError, match="new writes"):
         upgrade.rollback(fixture[3])
-    with sqlite3.connect(fixture[2] / "state.db") as db:
+    with closing(sqlite3.connect(fixture[2] / "state.db")) as db, db:
         assert db.execute("SELECT id FROM receipts").fetchone()[0] == "retain"
 
 
@@ -186,7 +186,7 @@ def test_changed_installed_package_rejected(fixture):
 
 
 def test_migration_cannot_erase_preexisting_receipts(fixture):
-    with sqlite3.connect(fixture[2] / "state.db") as db:
+    with closing(sqlite3.connect(fixture[2] / "state.db")) as db, db:
         db.execute("INSERT INTO receipts VALUES('preserve')")
     module = fixture[0] / "src" / "orchestrator" / "db.py"
     code = module.read_text(encoding="utf-8")
