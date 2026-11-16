@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>三重编排器 — 多代理编排控制台</title>
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem('tri-orch-theme');
+        document.documentElement.setAttribute('data-theme', saved === 'dark' ? 'dark' : 'light');
+      } catch (e) {
+        document.documentElement.setAttribute('data-theme', 'light');
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main id="modeChooser" class="mode-chooser">
+    <h1>三重编排器</h1>
+    <p class="mode-chooser-intro">选择正在使用的工作模式。每个入口只显示对应模式的任务。</p>
+    <p id="modeChooserStatus" class="context-status" role="status" aria-live="polite"></p>
+    <nav class="mode-choices" aria-label="选择工作模式">
+      <a href="/boost" data-mode-link="boost" class="mode-choice">
+        <h2>Boost <span>专注执行</span></h2>
+        <p>围绕一个目标推进，按需委派，完成后独立验收。</p>
+        <span class="mode-choice-action">查看任务</span>
+      </a>
+      <a href="/teamwork" data-mode-link="teamwork" class="mode-choice">
+        <h2>Teamwork <span>分工协作</span></h2>
+        <p>明确需求和文件分工，再开发、验收与合并。</p>
+        <span class="mode-choice-action">查看任务</span>
+      </a>
+      <a href="/swarm" data-mode-link="swarm" class="mode-choice">
+        <h2>Swarm <span>并行协作</span></h2>
+        <p>多名执行者并行推进，通过消息板持续协调。</p>
+        <span class="mode-choice-action">查看任务</span>
+      </a>
+    </nav>
+    <p class="mode-chooser-note">这里只查看和协调已有任务；进入页面不会启动任务。</p>
+  </main>
+  <div id="dashboardShell" class="app-shell hidden">
+    <div class="mode-bar">
+      <nav class="mode-nav" aria-label="工作模式">
+        <a href="/boost" data-mode-link="boost">Boost <span>专注</span></a>
+        <a href="/teamwork" data-mode-link="teamwork">Teamwork <span>协作</span></a>
+        <a href="/swarm" data-mode-link="swarm">Swarm <span>并行</span></a>
+      </nav>
+      <p id="modeDescription" class="mode-description"></p>
+    </div>
+    <!-- Single-line Restrained 48px Topbar -->
+    <header class="topbar" role="banner">
+      <div class="topbar-left">
+        <div class="brand" title="三重编排器本地控制台">
+          <svg class="brand-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="5" r="2.2"></circle>
+            <circle cx="5.5" cy="17.5" r="2.2"></circle>
+            <circle cx="18.5" cy="17.5" r="2.2"></circle>
+            <path d="M10.8 6.9 6.7 15.6M13.2 6.9l4.1 8.7M7.8 17.5h8.4"></path>
+          </svg>
+          <span class="brand-title">三重编排器</span>
+        </div>
+
+        <span class="topbar-sep" aria-hidden="true">/</span>
+
+        <label class="context-label" for="projectSelect">项目</label>
+        <select id="projectSelect" class="topbar-select" aria-label="选择项目">
+          <option value="">加载项目中...</option>
+        </select>
+
+        <label class="context-label" for="runSelect">任务</label>
+        <select id="runSelect" class="topbar-select topbar-select-run" aria-label="选择运行任务">
+          <option value="">暂无运行任务</option>
+        </select>
+
+        <div id="runMetaPill" class="run-pill" title="当前编排模式与任务状态">
+          <span id="modeBadge" class="run-pill-mode badge-mode-none">—</span>
+          <span class="run-pill-dot" aria-hidden="true">·</span>
+          <span id="runStatusBadge" class="run-pill-status">—</span>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <div id="healthBadge" class="live-pill" title="守护进程健康状态与实时端口">
+          <span class="status-dot dot-pending"></span>
+          <span class="status-text">检测中</span>
+        </div>
+
+        <button id="toggleInspectorBtn" class="topbar-btn" type="button" aria-expanded="false" aria-controls="inspectorDrawer" title="打开或收起右侧工作区检查器">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+            <path d="M15 3v18"></path>
+          </svg>
+          <span>工作区检查</span>
+        </button>
+
+        <button id="themeToggleBtn" class="topbar-icon-btn" type="button" aria-label="切换浅色与深色主题" title="切换深色主题">
+          <svg id="themeIconSun" class="hidden" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4"></circle>
+            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+          </svg>
+          <svg id="themeIconMoon" viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+          </svg>
+        </button>
+
+        <button id="refreshSnapshotBtn" class="topbar-btn topbar-btn-ghost" type="button" title="立即同步项目、任务与快照数据">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36"></path>
+            <polyline points="21 3 21 9 15 9"></polyline>
+          </svg>
+          <span class="hide-sm">立即同步</span>
+        </button>
+
+        <div class="export-dropdown" id="exportDropdown">
+          <button id="exportMenuBtn" class="topbar-btn topbar-btn-ghost" type="button" disabled aria-haspopup="menu" aria-expanded="false" title="导出运行复盘报告 (.md / .json)">
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            <span class="hide-sm">导出报告</span>
+          </button>
+          <div id="exportMenu" class="export-menu hidden" role="menu" aria-label="选择导出格式">
+            <button id="exportMdBtn" class="export-menu-item" type="button" role="menuitem" disabled>
+              <span class="export-fmt">Markdown</span>
+              <span class="export-ext mono">.md</span>
+            </button>
+            <button id="exportJsonBtn" class="export-menu-item" type="button" role="menuitem" disabled>
+              <span class="export-fmt">JSON 数据</span>
+              <span class="export-ext mono">.json</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Workspace Body -->
+    <div class="workspace-shell">
+      <main class="main-pane" id="mainPane">
+        <!-- Run Header & Clean Underline Tabs -->
+        <div class="run-header">
+          <div class="run-header-top">
+            <div class="run-title-wrap">
+              <h1 id="runTitleHeading" class="run-title">未选择运行任务</h1>
+              <p id="projectPathSubtitle" class="run-subtitle mono">请在上方选择项目与运行任务</p>
+            </div>
+            <div id="sseBadge" class="sse-indicator" title="实时事件流 (SSE /api/events)">
+              <span class="status-dot dot-muted"></span>
+              <span class="status-text">SSE 空闲</span>
+            </div>
+          </div>
+
+          <p id="contextStatus" class="context-status hidden" role="status" aria-live="polite"></p>
+          <nav class="tab-bar" role="tablist" aria-label="主视图页签">
+            <button type="button" id="tabBtnOverview" class="tab-item active" data-tab="overview" role="tab" aria-selected="true" aria-controls="tab-overview">概况</button>
+            <button type="button" id="tabBtnBoard" class="tab-item" data-tab="board" role="tab" aria-selected="false" aria-controls="tab-board">
+              <span>日志</span>
+              <span id="tabBoardCount" class="tab-badge tabular">0</span>
+            </button>
+            <button type="button" id="tabBtnMembers" class="tab-item" data-tab="members" role="tab" aria-selected="false" aria-controls="tab-members">
+              <span>成员</span>
+              <span id="tabMembersCount" class="tab-badge tabular">0</span>
+            </button>
+            <button type="button" id="tabBtnGraph" class="tab-item" data-tab="graph" role="tab" aria-selected="false" aria-controls="tab-graph">
+              <span>协作图</span>
+            </button>
+          </nav>
+        </div>
+
+        <section id="tab-overview" class="tab-panel" role="tabpanel" aria-labelledby="tabBtnOverview">
+          <div id="overviewContent" class="overview-scroll"><div class="empty-state">正在加载任务概况…</div></div>
+        </section>
+
+        <!-- Logs -->
+        <section id="tab-board" class="tab-panel hidden" role="tabpanel" aria-labelledby="tabBtnBoard">
+          <div class="filter-strip">
+            <div class="channel-pills" id="channelTabs" role="tablist" aria-label="频道筛选">
+              <button type="button" class="ch-pill active" data-channel="all" role="tab" aria-selected="true">全部 0</button>
+              <button type="button" class="ch-pill" data-channel="main" role="tab" aria-selected="false">主频道 0</button>
+              <button type="button" class="ch-pill" data-channel="human" role="tab" aria-selected="false">人工 0</button>
+            </div>
+
+            <div class="filter-controls">
+              <span id="boardStatsSubtitle" class="filter-count-hint tabular hidden"></span>
+
+              <label class="sr-only" for="mentionFilterSelect">按 @提及 筛选</label>
+              <select id="mentionFilterSelect" class="control-input control-sm" aria-label="按 @提及 筛选">
+                <option value="">@提及：全部</option>
+              </select>
+
+              <div class="search-wrap">
+                <svg class="search-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <circle cx="11" cy="11" r="7"></circle>
+                  <path d="m20 20-3.5-3.5"></path>
+                </svg>
+                <label class="sr-only" for="boardSearchInput">搜索消息</label>
+                <input id="boardSearchInput" class="control-input control-sm search-input" type="search" placeholder="搜索 #seq、成员或正文..." autocomplete="off">
+              </div>
+
+              <button id="jumpLatestBtn" class="btn btn-xs btn-accent hidden" type="button">
+                跳至最新
+              </button>
+
+              <label class="toggle-inline" title="收到新消息时自动滚动到底部">
+                <input type="checkbox" id="autoScrollToggle" checked>
+                <span>自动滚动</span>
+              </label>
+            </div>
+          </div>
+
+          <div id="boardFeed" class="board-feed" role="log" aria-live="polite" aria-relevant="additions">
+            <div class="empty-state empty-board">暂无消息，等待运行任务产生协作动态...</div>
+          </div>
+
+
+        </section>
+
+        <!-- TAB 2: 成员 -->
+        <section id="tab-members" class="tab-panel hidden" role="tabpanel" aria-labelledby="tabBtnMembers">
+          <div class="members-scroll">
+            <div id="taskPacketSection" class="tp-section">
+              <div class="tp-header">
+                <div class="tp-title-row">
+                  <h2 id="taskPacketHeading" class="section-title">任务包</h2>
+                  <div id="taskPacketMeta" class="tp-meta"></div>
+                </div>
+                <span id="taskPacketCriteriaCount" class="muted-caption tabular"></span>
+              </div>
+              <div id="taskPacketBody" class="tp-body">
+                <div class="empty-state">请选择运行任务以查看冻结的核心目标、文件所有权矩阵与验收标准。</div>
+              </div>
+            </div>
+
+            <div class="members-groups-wrap">
+              <div class="members-group-header">
+                <div class="members-group-title">
+                  <h2 class="section-title">成员与心跳</h2>
+                  <div id="workersSummaryMeta" class="tp-meta"></div>
+                </div>
+                <span class="muted-caption">点击任意成员行在右侧打开工作区检查器</span>
+              </div>
+              <div id="workersList" class="workers-groups" role="list">
+                <div class="empty-state">当前运行任务尚未注册成员。</div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- TAB 3: 协作图 -->
+        <section id="tab-graph" class="tab-panel hidden" role="tabpanel" aria-labelledby="tabBtnGraph">
+          <div class="graph-toolbar">
+            <div class="graph-replay-controls">
+              <button id="graphPlayBtn" class="graph-play-btn" type="button" title="回放协作流" aria-label="回放协作流">
+                <svg id="graphPlayIcon" viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true">
+                  <polygon points="6 4 20 12 6 20 6 4"></polygon>
+                </svg>
+                <svg id="graphPauseIcon" class="hidden" viewBox="0 0 24 24" width="13" height="13" fill="currentColor" aria-hidden="true">
+                  <rect x="6" y="4" width="4" height="16"></rect>
+                  <rect x="14" y="4" width="4" height="16"></rect>
+                </svg>
+              </button>
+              <label class="sr-only" for="graphSlider">协作时间轴</label>
+              <input id="graphSlider" class="graph-slider" type="range" min="0" max="0" value="0">
+              <span id="graphReadout" class="graph-readout mono tabular">0 / 0 条消息</span>
+            </div>
+
+            <div class="graph-options">
+              <label class="toggle-inline" title="隐藏已终止且当前无消息交互的成员节点">
+                <input type="checkbox" id="graphHideInactiveToggle">
+                <span>隐藏未活跃</span>
+              </label>
+              <label class="toggle-inline" title="展开 @all 广播消息到所有成员的虚线连线">
+                <input type="checkbox" id="graphExpandAllToggle" checked>
+                <span>展开 @all</span>
+              </label>
+              <div class="graph-legend" aria-hidden="true">
+                <span class="legend-item"><span class="legend-line legend-solid"></span>@提及数</span>
+                <span class="legend-item"><span class="legend-line legend-dashed"></span>@all 广播</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="graph-stage-wrap">
+            <div id="graphCanvasHost" class="graph-canvas-host">
+              <div class="empty-state">暂无协作消息，收到 #seq 消息或注册成员后将实时生成拓扑图。</div>
+            </div>
+            <div id="graphDetailBar" class="graph-detail-bar hidden"></div>
+          </div>
+        </section>
+
+          <details class="composer-dock"><summary>发送人工消息 <span class="muted-caption">向所选任务补充指令</span></summary>
+            <form id="humanMessageForm" class="composer-shell" autocomplete="off">
+              <label class="sr-only" for="humanMessageInput">人工干预消息内容</label>
+              <textarea id="humanMessageInput" class="composer-textarea" rows="2" placeholder="输入人工干预指令或调度消息（支持 Markdown，Ctrl+Enter 发送）..."></textarea>
+
+              <div class="composer-footer">
+                <div class="composer-controls">
+                  <div class="composer-field">
+                    <label class="sr-only" for="humanChannelSelect">目标频道</label>
+                    <select id="humanChannelSelect" class="control-input control-sm" aria-label="目标频道">
+                      <option value="human">频道：人工</option>
+                      <option value="main">频道：主频道</option>
+                      <option value="__custom__">+ 自定义频道...</option>
+                    </select>
+                    <input id="humanChannelCustom" class="control-input control-sm hidden" type="text" placeholder="自定义频道名" aria-label="自定义频道名称">
+                  </div>
+
+                  <div class="composer-field">
+                    <label class="sr-only" for="humanMentionSelect">提醒成员</label>
+                    <select id="humanMentionSelect" class="control-input control-sm" aria-label="提醒成员">
+                      <option value="">@提醒：可选</option>
+                    </select>
+                    <input id="humanMentionCustom" class="control-input control-sm composer-tag-input" type="text" placeholder="自定义 @标签" aria-label="自定义 @提醒标签">
+                  </div>
+                </div>
+
+                <button id="humanSendBtn" class="composer-send-btn" type="submit" disabled title="发送人工消息 (Ctrl+Enter)" aria-label="发送人工消息">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M12 19V5"></path>
+                    <polyline points="5 12 12 5 19 12"></polyline>
+                  </svg>
+                </button>
+              </div>
+            </form>
+          </details>
+      </main>
+
+      <!-- Slide-Over Right Workspace Inspector -->
+      <div id="drawerBackdrop" class="drawer-backdrop hidden" aria-hidden="true"></div>
+      <aside id="inspectorDrawer" class="inspector-drawer hidden" aria-label="工作区检查器与安全操作">
+        <div class="drawer-header">
+          <div class="drawer-title-wrap">
+            <div class="drawer-title" id="inspectorTitle">工作区检查器</div>
+            <div class="drawer-subtitle mono" id="inspectorSubtitle">请选择成员以检查工作区</div>
+          </div>
+          <div class="drawer-header-actions">
+            <button id="refreshDiffBtn" class="btn btn-ghost btn-xs hidden" type="button" title="重新加载工作区状态与代码差异">
+              刷新 Diff
+            </button>
+            <button id="closeDrawerBtn" class="btn btn-secondary btn-xs" type="button">收起</button>
+          </div>
+        </div>
+
+        <div class="drawer-scroll" id="inspectorBody">
+          <div class="empty-state">
+            在“成员”页签点击任意成员行，即可在右侧检查其隔离工作区、变更文件状态、代码差异与安全操作。
+          </div>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <!-- Toast Notifications -->
+  <div id="toastContainer" class="toast-container" aria-live="assertive" aria-atomic="true"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
