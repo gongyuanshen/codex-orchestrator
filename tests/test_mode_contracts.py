@@ -50,3 +50,13 @@ def test_teamwork_integrates_and_confirms_each_milestone_before_next():
     assert 'action="ack_handoff"' in merge
     assert "Only then admit the next dependent milestone" in merge
     assert merge.index("After all milestones") < merge.index("workspace_cleanup")
+
+
+def test_boost_retains_original_workspaces_until_all_integrated_gates():
+    text = (ROOT / "skills/boost/SKILL.md").read_text(encoding="utf-8")
+    merge = text.split("### 5. Merge, Cleanup & Close", 1)[1].split("### Large MCP", 1)[0]
+    assert "After all" in merge
+    assert merge.index("After all") < merge.index("workspace_cleanup")
+    assert 'scope="integrated"' in merge
+    assert 'action="reverify"' in merge
+    assert "original author workspaces" in merge
