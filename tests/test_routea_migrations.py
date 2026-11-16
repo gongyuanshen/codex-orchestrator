@@ -30,8 +30,8 @@ def test_migration_is_idempotent_and_existing_runs_remain_legacy(tmp_path):
     db = Database(path, settings=Settings(data_dir=tmp_path))
     assert db.get_run('old')['workflow_version'] == 0
     new = db.create_run(mode='boost', title='New', project_id='proj')
-    assert new['workflow_version'] == 1
-    assert db.migrate() == SCHEMA_VERSION == 4
+    assert new['workflow_version'] == 2
+    assert db.migrate() == SCHEMA_VERSION == 5
     assert db.get_run('old')['created_at'] == 1
     with db.read_connection() as conn:
         assert conn.execute('select count(*) from verification_records').fetchone()[0] == 0

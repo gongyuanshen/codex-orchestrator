@@ -18,6 +18,7 @@ def flow(tmp_path):
     evidence.write_text('1 passed', encoding='utf-8')
     db = Database(settings=Settings(data_dir=tmp_path / 'state'))
     run = db.create_run(mode='boost', title='Strict flow', project_root=project)
+    db.connect().execute('UPDATE runs SET workflow_version=1 WHERE id=?', (run['id'],))
     db.save_task_packet(run['id'], title='Frozen', goal='Actual feature',
                         file_ownership={'author': ['source.txt']},
                         acceptance_criteria=['exact output'])
@@ -244,6 +245,7 @@ def test_teamwork_milestone_handoff_and_dependency_confirmation(tmp_path):
     evidence.write_text('actual evidence', encoding='utf-8')
     db = Database(settings=Settings(data_dir=tmp_path / 'state'))
     run = db.create_run(mode='teamwork', title='Milestones', project_root=project)
+    db.connect().execute('UPDATE runs SET workflow_version=1 WHERE id=?', (run['id'],))
     db.save_task_packet(run['id'], title='Frozen', goal='Both stages', file_ownership={'author':['source.txt']}, acceptance_criteria=['exact output'])
     db.upsert_worker(run['id'], 'author', role='coder', agent_id='/root/author')
     db.upsert_worker(run['id'], 'verifier', role='verifier', agent_id='/root/verifier')

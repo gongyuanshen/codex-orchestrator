@@ -55,7 +55,9 @@ CREATE TABLE IF NOT EXISTS inbox_messages (
  summary TEXT NOT NULL, body_md TEXT NOT NULL,
  status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','accepted','completed','failed','cancelled')),
  receipts_json TEXT NOT NULL DEFAULT '[]', recipient_agent_id TEXT,
- step_id TEXT REFERENCES workflow_steps(id), UNIQUE(run_id,sender,key),
+ step_id TEXT REFERENCES workflow_steps(id),
+ step_packet_version INTEGER, step_attempt INTEGER, step_contract_revision INTEGER,
+ UNIQUE(run_id,sender,key),
  FOREIGN KEY(run_id,recipient) REFERENCES workers(run_id,name)
 );
 CREATE INDEX IF NOT EXISTS idx_workflow_run ON workflow_steps(run_id);
@@ -95,8 +97,10 @@ class WorkflowService:
         run = self.db.get_run(run_id)
         if run is None:
             raise NotFoundError(f'Run not found: {run_id}')
-        if run['workflow_version'] != 1:
+        if run['workflow_version'] == 0:
             raise WorkflowConflictError('Legacy run has no structured workflow; create a new continuation run')
+        if run['workflow_version'] not in {1, 2}:
+            raise WorkflowConflictError('Unsupported workflow version')
         if active and run['status'] != 'active':
             raise WorkflowConflictError('Workflow run is not active')
         return run
@@ -233,6 +237,11 @@ class WorkflowService:
                 raise ValueError('Cannot move or rename an existing workflow step')
             if old and old['revision'] != expected_revision:
                 raise WorkflowConflictError('Workflow revision conflict')
+            if old and run['workflow_version'] == 2 and 'original_bindings' in old['checkpoint']:
+                requested = {'owner': owner, 'verifier': verifier,
+                             'owner_agent_id': author['agent_id'], 'verifier_agent_id': gate['agent_id']}
+                if requested != old['checkpoint']['original_bindings']:
+                    raise WorkflowConflictError('Executed work must retain its original author and verifier bindings')
             if old and old['state'] in {'integrating', 'reconciliation_required', 'needs_decision', 'rework'}:
                 raise WorkflowConflictError('Resolve the current operation or rework before revising its contract')
             sid = step_id or _id('step')
@@ -284,7 +293,8 @@ class WorkflowService:
 
     def step_advance(self, step_id: str, action: str, expected_revision: int,
                      evidence: str | None = None, agent_id: str | None = None,
-                     observation: dict | None = None) -> dict:
+                     observation: dict | None = None, artifact_id: str | None = None,
+                     recipient_agent_id: str | None = None) -> dict:
         if action not in STEP_ACTIONS or type(expected_revision) is not int:
             raise ValueError('Invalid workflow action or expected_revision')
         if action in {'handoff', 'ack_handoff'} and any(
@@ -311,13 +321,17 @@ class WorkflowService:
                     raise ValueError('Invalid native observation timestamp')
                 checkpoint['native_observation'] = observation
                 return self._set(step, state, checkpoint)
-            if action == 'dispatch' and state == 'planned':
+            if action == 'dispatch' or (run['workflow_version'] == 2 and action in {'accept', 'start_rework'}):
                 for dependency in step['dependencies']:
                     parent = self.get_step(dependency)
                     if parent['state'] != 'done':
                         raise WorkflowConflictError('A dependency is not complete')
                     self._valid_verification(parent, 'integrated')
-                return self._set(step, 'dispatched')
+            if action == 'dispatch' and state == 'planned':
+                if run['workflow_version'] == 2:
+                    checkpoint.setdefault('original_bindings', {key: step[key] for key in
+                        ('owner', 'verifier', 'owner_agent_id', 'verifier_agent_id')})
+                return self._set(step, 'dispatched', checkpoint)
             if action == 'accept' and state == 'dispatched':
                 return self._set(step, 'implementing')
             if action == 'submit' and state == 'implementing':
@@ -326,7 +340,19 @@ class WorkflowService:
             if action == 'challenge' and state == 'candidate_review':
                 if agent_id != step['verifier_agent_id'] or not isinstance(evidence, str) or not evidence.strip():
                     raise WorkflowConflictError('Independent verifier challenge evidence and binding required')
-                checkpoint['challenge'] = {'agent_id': agent_id, 'evidence': evidence, 'attempt': step['attempt']}
+                challenge = {'agent_id': agent_id, 'evidence': evidence, 'attempt': step['attempt']}
+                if run['workflow_version'] == 2:
+                    if not isinstance(artifact_id, str) or not artifact_id.strip():
+                        raise WorkflowConflictError('Challenge requires an exact candidate artifact_id')
+                    artifact = self._artifact(artifact_id)
+                    if (artifact['step_id'] != step_id or artifact['scope'] != 'candidate'
+                            or any(artifact[key] != step[key] for key in
+                                   ('packet_version', 'attempt', 'contract_revision'))
+                            or not self._artifact_current(artifact)):
+                        raise WorkflowConflictError('Challenge artifact is not the current candidate delivery')
+                    challenge.update({key: step[key] for key in ('packet_version', 'contract_revision')})
+                    challenge['artifact_id'] = artifact_id
+                checkpoint['challenge'] = challenge
                 return self._set(step, state, checkpoint)
             if action == 'start_rework' and state == 'rework' and step['attempt'] < MAX_REWORKS:
                 checkpoint.pop('challenge', None)
@@ -342,13 +368,25 @@ class WorkflowService:
                 # A later intentional merge can stale an earlier milestone's content gate.
                 return self._set(step, 'integrated_review')
             if action == 'handoff' and state == 'handoff':
+                if run['workflow_version'] == 2:
+                    if (not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip()
+                            or recipient_agent_id == agent_id):
+                        raise WorkflowConflictError('Handoff requires a distinct intended recipient_agent_id')
+                    self._valid_verification(step, 'integrated')
                 checkpoint['handoff'] = {'sender_agent_id': agent_id, 'evidence': evidence,
                                           'packet_version': step['packet_version']}
+                if run['workflow_version'] == 2:
+                    checkpoint['handoff'].update({'recipient_agent_id': recipient_agent_id,
+                        'attempt': step['attempt'], 'contract_revision': step['contract_revision']})
                 return self._set(step, state, checkpoint)
             if action == 'ack_handoff' and state == 'handoff':
                 handoff = checkpoint.get('handoff')
                 if not handoff or agent_id == handoff['sender_agent_id']:
                     raise WorkflowConflictError('Handoff requires confirmation by a different actual coordinator')
+                if run['workflow_version'] == 2 and (
+                        agent_id != handoff['recipient_agent_id'] or any(
+                            handoff[key] != step[key] for key in ('packet_version', 'attempt', 'contract_revision'))):
+                    raise WorkflowConflictError('Handoff ACK does not match the intended recipient/current delivery')
                 self._valid_verification(step, 'integrated')
                 checkpoint['handoff']['recipient_agent_id'] = agent_id
                 checkpoint['handoff']['receipt'] = evidence
@@ -435,8 +473,15 @@ class WorkflowService:
             required_state = 'candidate_review' if artifact['scope'] == 'candidate' else 'integrated_review'
             if step['state'] != required_state:
                 raise WorkflowConflictError(f'Verification is not allowed from {step["state"]}')
-            if run['mode'] == 'boost' and artifact['scope'] == 'candidate' and not step['checkpoint'].get('challenge'):
-                raise WorkflowConflictError('Independent challenge must be recorded before Boost candidate acceptance')
+            if run['mode'] == 'boost' and artifact['scope'] == 'candidate':
+                challenge = step['checkpoint'].get('challenge')
+                if not challenge:
+                    raise WorkflowConflictError('Independent challenge must be recorded before Boost candidate acceptance')
+                if run['workflow_version'] == 2 and (
+                        challenge['agent_id'] != step['verifier_agent_id']
+                        or challenge['artifact_id'] != artifact_id
+                        or any(challenge[key] != step[key] for key in ('packet_version', 'attempt', 'contract_revision'))):
+                    raise WorkflowConflictError('Independent challenge does not bind this exact candidate delivery')
             if not isinstance(criteria_results, list) or any(not isinstance(x, dict) or set(x) != {'criterion', 'status'} or x['status'] not in {'PASS', 'FAIL', 'NOT_RUN'} for x in criteria_results):
                 raise ValueError('Invalid criteria results')
             if len(criteria_results) != len(step['criteria']) or {x['criterion'] for x in criteria_results} != set(step['criteria']):
@@ -497,6 +542,7 @@ class WorkflowService:
         run = self.db.get_run(ws['run_id'])
         if run['workflow_version'] == 0:
             return None
+        self._run(ws['run_id'], active=False)
         with self.db.read_connection() as conn:
             rows = conn.execute('SELECT * FROM workflow_steps WHERE workspace_id=?', (workspace_id,)).fetchall()
         if len(rows) != 1:

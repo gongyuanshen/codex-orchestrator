@@ -1665,7 +1665,9 @@ class WorkspaceManager:
                 )
 
             run = self.db.get_run(ws["run_id"])
-            if run is not None and run["workflow_version"] == 1:
+            if run is None:
+                raise NotFoundError(f"Run not found: {ws['run_id']}")
+            if run["workflow_version"] != 0:
                 from orchestrator.workflow import WorkflowService
                 WorkflowService(self.db).require_integrated(workspace_id)
 
