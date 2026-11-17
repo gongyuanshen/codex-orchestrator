@@ -64,22 +64,24 @@ HARNESS = r"""
 const fs=require('fs'), vm=require('vm'), assert=require('assert');
 const source=fs.readFileSync(process.argv[1],'utf8');
 function node() {
- const classes=new Set(), attributes={};
+ const classes=new Set(), attributes={}, events={};
  return {innerHTML:'',textContent:'',value:'',style:{},dataset:{},disabled:false,scrollTop:0,scrollHeight:0,clientHeight:100,
  classList:{add:(x)=>classes.add(x),remove:(x)=>classes.delete(x),contains:(x)=>classes.has(x),toggle:(x,v)=>v?classes.add(x):classes.delete(x)},
- setAttribute(k,v){attributes[k]=v},removeAttribute(k){delete attributes[k]},getAttribute(k){return attributes[k]??null},addEventListener(){},querySelectorAll(){return []},querySelector(q){return q==='.toast-close'?node():null},
+ setAttribute(k,v){attributes[k]=v},removeAttribute(k){delete attributes[k]},getAttribute(k){return attributes[k]??null},
+ addEventListener(type,listener){(events[type]??=[]).push(listener)},dispatchEvent(event){for(const listener of events[event.type]||[])listener(event)},
+ querySelectorAll(){return []},querySelector(q){return q==='.toast-close'?node():null},
  appendChild(){},getBoundingClientRect(){return {width:1000,height:600}},focus(){},contains(){return false}};
 }
-const nodes=new Map(), requests=[], streams=[];
+const nodes=new Map(), requests=[], streams=[], intervals=new Map();let nextInterval=0;
 const links=['boost','teamwork','swarm'].flatMap(mode=>['chooser','nav'].map(kind=>{const link=node();link.dataset.modeLink=mode;nodes.set(kind+'-'+mode,link);return link}));
 const document={getElementById:(id)=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id)},querySelectorAll:(selector)=>selector==='[data-mode-link]'?links:[],createElement:node,addEventListener(){},documentElement:node()};
 class EventSource {static CONNECTING=0;constructor(url){this.url=url;this.events={};streams.push(this)}addEventListener(n,f){this.events[n]=f}close(){this.closed=true}}
-const ctx={document,URLSearchParams,EventSource,console,Map,Set,Date,encodeURIComponent,setImmediate,requestAnimationFrame:(f)=>f(),setTimeout:()=>0,clearTimeout(){},setInterval:()=>0,clearInterval(){},CSS:{escape:String},
+const ctx={document,URLSearchParams,EventSource,console,Map,Set,Date,encodeURIComponent,setImmediate,requestAnimationFrame:(f)=>f(),setTimeout:()=>0,clearTimeout(){},setInterval:(f)=>{intervals.set(++nextInterval,f);return nextInterval},clearInterval:(id)=>intervals.delete(id),CSS:{escape:String},
  window:{location:{search:process.argv[3]||'',pathname:process.argv[2]||'/swarm',replace(url){this.redirected=url}},history:{replaceState(_a,_b,url){ctx.window.location.pathname=url.split('?')[0];ctx.window.location.search=url.includes('?')?'?'+url.split('?')[1]:''}},addEventListener(){},innerWidth:1200},
  fetch:(url)=>new Promise((resolve,reject)=>requests.push({url,resolve:(data)=>resolve({ok:true,headers:{get:()=> 'application/json'},json:async()=>data}),reject}))};
 vm.createContext(ctx);
 vm.runInContext(source.replace('  init();','  globalThis.runTest = (code) => eval(code);'),ctx);
-ctx.assert=assert;ctx.requests=requests;ctx.streams=streams;ctx.nodes=nodes;
+ctx.assert=assert;ctx.requests=requests;ctx.streams=streams;ctx.nodes=nodes;ctx.intervals=intervals;
 async function run(code){await ctx.runTest(code)}
 """
 
@@ -485,3 +487,184 @@ def test_bootstrap_error_replaces_loading_selectors_with_recoverable_controls():
       assert.ok(el.runSelect.innerHTML.includes('未加载'));
       assert.equal(state.selectedProjectId,null);
     })()''', path='/boost', search='?run_id=r')
+
+
+@pytest.mark.parametrize('older_result', ['success', 'failure'])
+@pytest.mark.parametrize('newer_result', ['success', 'failure'])
+def test_diff_latest_request_owns_success_and_error(older_result, newer_result):
+    run_dashboard(r'''(async()=>{
+      const params=new URLSearchParams(window.location.search);
+      state.workers=[{id:'w',name:'w',workspace_id:'ws'}];state.selectedWorkerId='w';state.workspaces=[{id:'ws'}];
+      const older=loadWorkspaceDiff('ws'), newer=loadWorkspaceDiff('ws');
+      if(params.get('newer')==='failure')requests[1].reject(Error('new inspection denied'));
+      else requests[1].resolve({dirty_count:2,files:[{path:'new-a.py'},{path:'new-b.py'}]});
+      await newer;
+      if(params.get('older')==='failure')requests[0].reject(Error('old inspection denied'));
+      else requests[0].resolve({dirty_count:0,files:[]});
+      await older;
+      if(params.get('newer')==='failure'){
+        assert.equal(state.diffByWorkspace.has('ws'),false,'stale success must not replace newer error');
+        assert.equal(state.diffErrors.get('ws'),'new inspection denied');
+        assert.ok(el.inspectorBody.innerHTML.includes('new inspection denied'));
+      }else{
+        assert.equal(state.diffByWorkspace.get('ws')?.dirty_count,2,'stale response must not replace newer diff');
+        assert.equal(state.diffErrors.has('ws'),false);
+        assert.ok(el.inspectorBody.innerHTML.includes('new-a.py'));
+      }
+      assert.ok(!el.inspectorBody.innerHTML.includes('old inspection denied'));
+      assert.ok(!el.inspectorBody.innerHTML.includes('工作树干净'));
+    })()''', search=f'?older={older_result}&newer={newer_result}')
+
+
+@pytest.mark.parametrize('first_result', ['success', 'failure'])
+def test_diff_completion_does_not_clear_other_workspace_loading(first_result):
+    run_dashboard(r'''(async()=>{
+      state.workers=[{id:'a',name:'a',workspace_id:'A'},{id:'b',name:'b',workspace_id:'B'}];
+      state.workspaces=[{id:'A'},{id:'B'}];state.selectedWorkerId='a';
+      const a=loadWorkspaceDiff('A');state.selectedWorkerId='b';const b=loadWorkspaceDiff('B');
+      assert.ok(el.inspectorBody.innerHTML.includes('正在加载工作区文件状态'));
+      if(window.location.search.includes('failure'))requests[0].reject(Error('A denied'));
+      else requests[0].resolve({dirty_count:0,files:[]});
+      await a;
+      assert.ok(el.inspectorBody.innerHTML.includes('正在加载工作区文件状态'),'A completion must not clear pending B');
+      assert.ok(!el.inspectorBody.innerHTML.includes('A denied'));
+      requests[1].resolve({dirty_count:1,files:[{path:'B.py'}]});await b;
+      assert.ok(el.inspectorBody.innerHTML.includes('B.py'));
+      assert.ok(!el.inspectorBody.innerHTML.includes('正在加载工作区文件状态'));
+    })()''', search='?first='+first_result)
+
+
+@pytest.mark.parametrize('old_result', ['success', 'failure'])
+def test_diff_stale_completion_preserves_newer_pending_inspection(old_result):
+    run_dashboard(r'''(async()=>{
+      state.workers=[{id:'w',name:'w',workspace_id:'ws'}];state.workspaces=[{id:'ws'}];state.selectedWorkerId='w';
+      const older=loadWorkspaceDiff('ws'), newer=loadWorkspaceDiff('ws');
+      if(window.location.search.includes('failure'))requests[0].reject(Error('stale failure'));
+      else requests[0].resolve({dirty_count:0,files:[]});
+      await older;
+      assert.equal(state.diffByWorkspace.has('ws'),false,'stale completion must not populate the current inspection');
+      assert.equal(state.diffErrors.has('ws'),false);
+      assert.ok(el.inspectorBody.innerHTML.includes('正在加载工作区文件状态'));
+      requests[1].resolve({dirty_count:1,files:[{path:'latest.py'}]});await newer;
+      assert.ok(el.inspectorBody.innerHTML.includes('latest.py'));
+      assert.ok(!el.inspectorBody.innerHTML.includes('正在加载工作区文件状态'));
+    })()''', search='?old='+old_result)
+
+
+@pytest.mark.parametrize('renderer', ['renderWorkers', 'renderInspector'])
+def test_diff_render_exception_is_not_discarded_as_a_stale_request(renderer):
+    run_dashboard(r'''(async()=>{
+      const renderer=new URLSearchParams(window.location.search).get('renderer');
+      if(renderer==='renderWorkers')renderWorkers=()=>{throw Error('worker rendering failed')};
+      else renderInspector=()=>{throw Error('inspector rendering failed')};
+      const loading=loadWorkspaceDiff('ws',{silent:true});
+      requests[0].resolve({dirty_count:1,files:[{path:'valid.py'}]});
+      await assert.rejects(loading,/rendering failed/);
+      assert.equal(state.diffByWorkspace.get('ws').dirty_count,1);
+      assert.equal(state.diffErrors.has('ws'),false,'a renderer failure is not an inspection failure');
+    })()''', search='?renderer='+renderer)
+
+
+def test_diff_loading_survives_switch_back_to_an_earlier_pending_workspace():
+    run_dashboard(r'''(async()=>{
+      state.workers=[{id:'a',name:'a',workspace_id:'A'},{id:'b',name:'b',workspace_id:'B'}];
+      state.workspaces=[{id:'A'},{id:'B'}];state.selectedWorkerId='a';const a=loadWorkspaceDiff('A');
+      state.selectedWorkerId='b';const b=loadWorkspaceDiff('B');state.selectedWorkerId='a';renderInspector();
+      assert.ok(el.inspectorBody.innerHTML.includes('正在加载工作区文件状态'),'returning to A must still show its pending load');
+      requests[1].resolve({dirty_count:0,files:[]});await b;
+      assert.ok(el.inspectorBody.innerHTML.includes('正在加载工作区文件状态'));
+      requests[0].resolve({dirty_count:1,files:[{path:'A.py'}]});await a;
+      assert.ok(el.inspectorBody.innerHTML.includes('A.py'));
+    })()''')
+
+
+@pytest.mark.parametrize('old_result', ['success', 'failure'])
+def test_diff_context_reset_rejects_old_result_and_preserves_new_loading(old_result):
+    run_dashboard(r'''(async()=>{
+      const old=loadWorkspaceDiff('ws');clearRunState();
+      state.workers=[{id:'w',name:'w',workspace_id:'ws'}];state.workspaces=[{id:'ws'}];state.selectedWorkerId='w';
+      renderInspector();assert.ok(!el.inspectorBody.innerHTML.includes('正在加载工作区文件状态'));
+      const current=loadWorkspaceDiff('ws');
+      if(window.location.search.includes('failure'))requests[0].reject(Error('old context failed'));
+      else requests[0].resolve({dirty_count:0,files:[]});
+      await old;
+      assert.equal(state.diffByWorkspace.has('ws'),false);assert.equal(state.diffErrors.has('ws'),false);
+      assert.ok(el.inspectorBody.innerHTML.includes('正在加载工作区文件状态'));
+      requests[1].resolve({dirty_count:1,files:[{path:'current.py'}]});await current;
+      assert.ok(el.inspectorBody.innerHTML.includes('current.py'));
+    })()''', search='?old='+old_result)
+
+
+@pytest.mark.parametrize('auto_scroll', ['true', 'false'])
+def test_leaving_graph_for_board_always_stops_replay(auto_scroll):
+    run_dashboard(r'''(()=>{
+      state.messages=[{seq:1,sender:'coder'},{seq:2,sender:'coder'}];state.activeTab='graph';
+      state.autoScroll=window.location.search.includes('true');el.boardFeed.scrollHeight=200;
+      startGraphReplay();assert.equal(state.graphPlaying,true);assert.equal(intervals.size,1);
+      const step=state.graphStep;switchTab('board');
+      assert.equal(state.graphPlaying,false,'leaving graph must stop replay even when board auto-scrolls');
+      assert.equal(state.graphPlayTimer,null);assert.equal(intervals.size,0);assert.equal(state.graphStep,step);
+      assert.equal(el.graphPlayIcon.classList.contains('hidden'),false);
+      assert.equal(el.graphPauseIcon.classList.contains('hidden'),true);
+      assert.equal(el.boardFeed.scrollTop,state.autoScroll?200:0);
+    })()''', search='?auto_scroll='+auto_scroll)
+
+
+def test_graph_play_button_accessible_name_tracks_replay_state():
+    run_dashboard(r'''(()=>{
+      state.messages=[{seq:1,sender:'coder'},{seq:2,sender:'coder'}];
+      startGraphReplay();
+      assert.equal(el.graphPlayBtn.getAttribute('aria-label'),'暂停回放');
+      assert.equal(el.graphPlayBtn.title,'暂停回放');
+      stopGraphReplay();
+      assert.equal(el.graphPlayBtn.getAttribute('aria-label'),'回放协作流');
+      assert.equal(el.graphPlayBtn.title,'回放协作流');
+    })()''')
+
+
+def test_graph_nodes_render_as_named_focusable_toggle_buttons():
+    run_dashboard(r'''(()=>{
+      state.workers=[{id:'w',name:'long-member-name',role:'coder',status:'working'}];renderGraph();
+      const svg=el.graphCanvasHost.innerHTML.match(/<svg\b[^>]*>/)[0];
+      const renderedNode=el.graphCanvasHost.innerHTML.match(/<g class="graph-node"[^>]*>/)[0];
+      assert.ok(svg.includes('role="group"'),'interactive descendants must not be hidden by image semantics');
+      assert.ok(renderedNode.includes('tabindex="0"'),'graph member must be keyboard focusable');
+      assert.ok(renderedNode.includes('role="button"'));
+      assert.ok(renderedNode.includes('aria-label="@long-member-name 开发实现 · 执行中"'));
+      assert.ok(renderedNode.includes('aria-pressed="false"'));
+      state.graphSelectedNode='long-member-name';renderGraph();
+      assert.ok(el.graphCanvasHost.innerHTML.match(/<g class="graph-node"[^>]*>/)[0].includes('aria-pressed="true"'));
+    })()''')
+
+
+def test_graph_keyboard_and_mouse_share_toggle_without_page_space_scroll():
+    run_dashboard(r'''(()=>{
+      state.workers=[{id:'w',name:'coder',role:'coder',status:'working'}];renderGraph();bindEvents();
+      const attrs={'data-node-id':'coder','data-default-stroke':'var(--primary)'}, rectAttrs={};
+      const graphNode={style:{},getAttribute:k=>attrs[k]??null,setAttribute:(k,v)=>attrs[k]=v,
+        closest:selector=>selector==='.graph-node'?graphNode:null,
+        querySelector:selector=>selector==='rect'?{setAttribute:(k,v)=>rectAttrs[k]=v}:null};
+      const svg={querySelectorAll:selector=>selector==='.graph-node'?[graphNode]:[]};
+      el.graphCanvasHost.querySelector=selector=>selector==='.graph-svg'?svg:null;
+      function activate(key){
+        let prevented=false,stopped=false;
+        el.graphCanvasHost.dispatchEvent({type:'keydown',key,target:graphNode,
+          preventDefault(){prevented=true},stopPropagation(){stopped=true}});
+        return {prevented,stopped};
+      }
+      assert.equal(activate('ArrowRight').prevented,false);assert.equal(state.graphSelectedNode,null);
+      assert.equal(activate('Enter').prevented,true,'Enter must activate the focused graph member');
+      assert.equal(state.graphSelectedNode,'coder');assert.equal(attrs['aria-pressed'],'true');
+      assert.equal(rectAttrs.fill,'var(--bg-subtle)');
+      const space=activate(' ');assert.equal(space.prevented,true,'Space must not scroll the page');assert.equal(space.stopped,true);
+      assert.equal(state.graphSelectedNode,null);assert.equal(attrs['aria-pressed'],'false');
+      el.graphCanvasHost.dispatchEvent({type:'mouseover',target:graphNode});
+      assert.equal(state.graphHoverNode,'coder');assert.equal(attrs['aria-pressed'],'false','hover is not selection');
+      el.graphCanvasHost.dispatchEvent({type:'click',target:graphNode});
+      assert.equal(state.graphSelectedNode,'coder');assert.equal(attrs['aria-pressed'],'true');
+      activate('Enter');assert.equal(state.graphSelectedNode,null);assert.equal(attrs['aria-pressed'],'false');
+      el.graphCanvasHost.dispatchEvent({type:'mouseleave'});assert.equal(state.graphHoverNode,null);
+      el.graphCanvasHost.dispatchEvent({type:'click',target:graphNode});
+      el.graphCanvasHost.dispatchEvent({type:'click',target:{closest:()=>null}});
+      assert.equal(state.graphSelectedNode,null);assert.equal(attrs['aria-pressed'],'false');
+    })()''')

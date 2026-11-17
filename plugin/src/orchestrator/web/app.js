@@ -115,7 +115,7 @@
 
     selectedWorkerId: null,
     diffByWorkspace: new Map(),
-    diffLoadingWorkspace: null,
+    diffRequests: new Map(),
     mergePreviewByWorkspace: new Map(),
     inspectorBannerByWorkspace: new Map(),
     diffWrap: false,
@@ -959,7 +959,7 @@
     state.loadError = '';
     state.sending = false;
     state.actionBusy = false;
-    state.diffLoadingWorkspace = null;
+    state.diffRequests.clear();
     state.diffByWorkspace.clear();
     state.diffErrors.clear();
     state.mergePreviewByWorkspace.clear();
@@ -1390,12 +1390,11 @@
       panel.classList.toggle('hidden', key !== tabName);
     }
 
+    if (tabName !== 'graph') stopGraphReplay();
     if (tabName === 'board' && state.autoScroll) {
       scrollFeedToBottom();
     } else if (tabName === 'graph') {
       renderGraph();
-    } else {
-      stopGraphReplay();
     }
   }
 
@@ -2106,6 +2105,7 @@
     el.graphPlayIcon.classList.remove('hidden');
     el.graphPauseIcon.classList.add('hidden');
     el.graphPlayBtn.title = '回放协作流';
+    el.graphPlayBtn.setAttribute('aria-label', '回放协作流');
   }
 
   function startGraphReplay() {
@@ -2117,6 +2117,7 @@
     el.graphPlayIcon.classList.add('hidden');
     el.graphPauseIcon.classList.remove('hidden');
     el.graphPlayBtn.title = '暂停回放';
+    el.graphPlayBtn.setAttribute('aria-label', '暂停回放');
 
     if (state.graphStep === null || state.graphStep >= total) {
       state.graphStep = 1;
@@ -2519,7 +2520,7 @@
         const subText = node.worker ? `${labelRole(node.role)} · ${labelWorkerStatus(node.status)}` : labelRole(node.role);
 
         return `
-          <g class="graph-node" data-node-id="${escapeHtml(node.id)}" data-default-stroke="${escapeHtml(strokeColor)}" style="opacity:${dimmed ? '0.28' : '1'}">
+          <g class="graph-node" data-node-id="${escapeHtml(node.id)}" data-default-stroke="${escapeHtml(strokeColor)}" tabindex="0" role="button" aria-label="${escapeHtml(`${displayTitle} ${subText}`)}" aria-pressed="${state.graphSelectedNode === node.id ? 'true' : 'false'}" style="opacity:${dimmed ? '0.28' : '1'}">
             <rect
               x="${x}"
               y="${y}"
@@ -2538,7 +2539,7 @@
       .join('');
 
     el.graphCanvasHost.innerHTML = `
-      <svg class="graph-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="成员消息协作拓扑图">
+      <svg class="graph-svg" viewBox="0 0 ${width} ${height}" role="group" aria-label="成员消息协作拓扑图">
         <defs>
           <marker id="graphArrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
             <path d="M 0 1 L 10 5 L 0 9 z" fill="var(--text-muted)"></path>
@@ -2597,6 +2598,7 @@
 
     for (const nodeEl of svg.querySelectorAll('.graph-node')) {
       const nodeId = nodeEl.getAttribute('data-node-id');
+      nodeEl.setAttribute('aria-pressed', state.graphSelectedNode === nodeId ? 'true' : 'false');
       const defaultStroke = nodeEl.getAttribute('data-default-stroke') || 'var(--border-strong)';
       const isSelected = activeFocus === nodeId;
       const dimmed = Boolean(activeFocus && !connectedToFocus.has(nodeId));
@@ -2617,28 +2619,31 @@
   async function loadWorkspaceDiff(workspaceId, opts = {}) {
     if (!workspaceId) return;
     const version = state.contextVersion;
+    const request = {};
+    state.diffRequests.set(workspaceId, request);
     state.diffErrors.delete(workspaceId);
-    state.diffLoadingWorkspace = workspaceId;
     if (!opts.silent) {
       renderInspector();
     }
+    let payload;
     try {
-      const payload = await apiRequest(`/api/workspaces/${encodeURIComponent(workspaceId)}/diff`);
-      if (version !== state.contextVersion) return;
-      state.diffByWorkspace.set(workspaceId, payload);
-      state.diffLoadingWorkspace = null;
-      renderWorkers();
-      renderInspector();
+      payload = await apiRequest(`/api/workspaces/${encodeURIComponent(workspaceId)}/diff`);
     } catch (err) {
-      if (version !== state.contextVersion) return;
+      if (version !== state.contextVersion || state.diffRequests.get(workspaceId) !== request) return;
       state.diffByWorkspace.delete(workspaceId);
       state.diffErrors.set(workspaceId, err.message);
-      state.diffLoadingWorkspace = null;
+      state.diffRequests.delete(workspaceId);
       if (!opts.silent) {
         showToast('加载工作区差异失败', err.message, 'error');
       }
       renderInspector();
+      return;
     }
+    if (version !== state.contextVersion || state.diffRequests.get(workspaceId) !== request) return;
+    state.diffByWorkspace.set(workspaceId, payload);
+    state.diffRequests.delete(workspaceId);
+    renderWorkers();
+    renderInspector();
   }
 
   function summarizeDiffLines(diffText) {
@@ -2799,7 +2804,7 @@
     el.refreshDiffBtn.classList.remove('hidden');
 
     const diffPayload = state.diffByWorkspace.get(ws.id);
-    const isLoadingDiff = state.diffLoadingWorkspace === ws.id;
+    const isLoadingDiff = state.diffRequests.has(ws.id);
     const statusFiles = extractStatusFiles(diffPayload || ws);
     const diffText = extractDiffText(diffPayload);
     const diffStats = summarizeDiffLines(diffText);
@@ -3400,7 +3405,7 @@
       renderGraph();
     });
 
-    el.graphCanvasHost.addEventListener('click', (evt) => {
+    const selectGraphNode = (evt) => {
       const nodeEl = evt.target.closest('.graph-node');
       if (!nodeEl) {
         if (state.graphSelectedNode !== null) {
@@ -3412,6 +3417,14 @@
       const nodeId = nodeEl.getAttribute('data-node-id');
       state.graphSelectedNode = state.graphSelectedNode === nodeId ? null : nodeId;
       applyGraphHighlightInPlace();
+    };
+    el.graphCanvasHost.addEventListener('click', selectGraphNode);
+    el.graphCanvasHost.addEventListener('keydown', (evt) => {
+      if ((evt.key === 'Enter' || evt.key === ' ') && evt.target.closest('.graph-node')) {
+        evt.preventDefault();
+        evt.stopPropagation();
+        selectGraphNode(evt);
+      }
     });
 
     el.graphCanvasHost.addEventListener('mouseover', (evt) => {
