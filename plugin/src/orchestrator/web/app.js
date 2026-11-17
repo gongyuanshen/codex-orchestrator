@@ -85,6 +85,7 @@
     theme: 'light',
     activeTab: 'overview',
     inspectorOpen: false,
+    inspectorReturnFocus: null,
 
     contextVersion: 0,
     snapshotVersion: 0,
@@ -211,6 +212,7 @@
 
     drawerBackdrop: document.getElementById('drawerBackdrop'),
     inspectorDrawer: document.getElementById('inspectorDrawer'),
+    inspectorBackground: Array.from(document.querySelectorAll('.mode-bar, .topbar, .main-pane')),
     inspectorTitle: document.getElementById('inspectorTitle'),
     inspectorSubtitle: document.getElementById('inspectorSubtitle'),
     refreshDiffBtn: document.getElementById('refreshDiffBtn'),
@@ -754,23 +756,26 @@
     if (state.healthOk === true) {
       const prefix = state.sseState === 'connected' ? '实时' : '在线';
       const dotClass = state.sseState === 'error' ? 'dot-pending' : 'dot-ok';
-      el.healthBadge.innerHTML = `
+      const content = `
         <span class="status-dot ${dotClass}"></span>
         <span class="status-text tabular">${escapeHtml(`${prefix}${portPart}`)}</span>
       `;
+      if (el.healthBadge.innerHTML !== content) el.healthBadge.innerHTML = content;
       const pidInfo = state.healthPid ? ` · PID ${state.healthPid}` : '';
       el.healthBadge.title = `守护进程运行中${portPart}${pidInfo} · ${sseLabel}`;
     } else if (state.healthOk === false) {
-      el.healthBadge.innerHTML = `
+      const content = `
         <span class="status-dot dot-error"></span>
         <span class="status-text">守护进程离线</span>
       `;
+      if (el.healthBadge.innerHTML !== content) el.healthBadge.innerHTML = content;
       el.healthBadge.title = '无法连接守护进程 (/api/health)';
     } else {
-      el.healthBadge.innerHTML = `
+      const content = `
         <span class="status-dot dot-pending"></span>
         <span class="status-text">检测中</span>
       `;
+      if (el.healthBadge.innerHTML !== content) el.healthBadge.innerHTML = content;
       el.healthBadge.title = '正在检测守护进程状态...';
     }
   }
@@ -793,10 +798,11 @@
     };
     const dotClass = dotMap[mode] || 'dot-muted';
     el.sseBadge.className = `sse-indicator ${clsMap[mode] || ''}`.trim();
-    el.sseBadge.innerHTML = `
+    const content = `
       <span class="status-dot ${dotClass}"></span>
       <span class="status-text">${escapeHtml(label)}</span>
     `;
+    if (el.sseBadge.innerHTML !== content) el.sseBadge.innerHTML = content;
     renderHealthPill();
   }
 
@@ -1385,6 +1391,7 @@
       const isActive = btn.getAttribute('data-tab') === tabName;
       btn.classList.toggle('active', isActive);
       btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+      btn.setAttribute('tabindex', isActive ? '0' : '-1');
     }
     for (const [key, panel] of Object.entries(el.tabPanels)) {
       panel.classList.toggle('hidden', key !== tabName);
@@ -1396,14 +1403,42 @@
     } else if (tabName === 'graph') {
       renderGraph();
     }
+    el.tabButtons.find((btn) => btn.getAttribute('data-tab') === tabName)?.focus();
+  }
+
+  function syncInspectorMode() {
+    const modal = state.inspectorOpen && window.innerWidth <= 1080;
+    for (const background of el.inspectorBackground) background.inert = modal;
+    if (modal) {
+      el.inspectorDrawer.setAttribute('role', 'dialog');
+      el.inspectorDrawer.setAttribute('aria-modal', 'true');
+      if (!el.inspectorDrawer.contains(document.activeElement)) el.inspectorTitle.focus();
+    } else {
+      el.inspectorDrawer.setAttribute('role', 'complementary');
+      el.inspectorDrawer.removeAttribute('aria-modal');
+    }
+    el.drawerBackdrop.classList.toggle('hidden', !modal);
   }
 
   function setInspectorOpen(open) {
+    const wasOpen = state.inspectorOpen;
+    if (open && !wasOpen) {
+      const trigger = document.activeElement;
+      state.inspectorReturnFocus = { trigger, workerId: trigger?.closest('[data-worker-id]')?.getAttribute('data-worker-id') };
+    }
     state.inspectorOpen = Boolean(open);
     el.inspectorDrawer.classList.toggle('hidden', !state.inspectorOpen);
-    el.drawerBackdrop.classList.toggle('hidden', !state.inspectorOpen);
     el.toggleInspectorBtn.classList.toggle('active', state.inspectorOpen);
     el.toggleInspectorBtn.setAttribute('aria-expanded', state.inspectorOpen ? 'true' : 'false');
+    syncInspectorMode();
+    if (open && !wasOpen) el.inspectorTitle.focus();
+    if (!open && wasOpen) {
+      const { trigger, workerId } = state.inspectorReturnFocus;
+      let target = trigger?.isConnected ? trigger : workerId ? el.workersList.querySelector(`[data-worker-id="${CSS.escape(workerId)}"]`) : null;
+      if (!target || target.closest('.hidden')) target = el.toggleInspectorBtn;
+      target.focus();
+      state.inspectorReturnFocus = null;
+    }
   }
 
   // ---------- 页签 2：任务包、文件所有权矩阵与成员列表 ----------
@@ -1587,11 +1622,11 @@
     const role = String(w.role || 'unknown').toLowerCase();
 
     return `
+      <div class="member-list-item" role="listitem">
       <button
         type="button"
         class="member-row ${isSelected ? 'selected' : ''} ${stalled ? 'stalled' : ''}"
         data-worker-id="${escapeHtml(w.id)}"
-        role="listitem"
       >
         <div class="member-row-left">
           ${renderRoleBadge(role, true)}
@@ -1624,10 +1659,13 @@
           <span class="member-open-cue">检查 →</span>
         </div>
       </button>
+      </div>
     `;
   }
 
   function renderWorkers() {
+    const focusedWorker = el.workersList.contains(document.activeElement)
+      ? document.activeElement.closest('.member-row')?.getAttribute('data-worker-id') : null;
     const workers = state.workers;
     const stalledCount = workers.filter(isWorkerStalled).length;
     el.workersSummaryMeta.innerHTML = `
@@ -1637,6 +1675,7 @@
 
     if (workers.length === 0) {
       el.workersList.innerHTML = '<div class="empty-state">当前运行任务尚未注册成员。</div>';
+      if (focusedWorker) el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'members').focus();
       return;
     }
 
@@ -1659,7 +1698,7 @@
     blocks.push(`
       <div class="member-group-block">
         <div class="member-group-label tabular">登记为执行中 / 待命 · ${activeWorkers.length}</div>
-        <div class="member-list-card">
+        <div class="member-list-card" ${activeWorkers.length > 0 ? 'role="list"' : ''}>
           ${
             activeWorkers.length > 0
               ? activeWorkers.map(renderMemberRow).join('')
@@ -1673,7 +1712,7 @@
       blocks.push(`
         <div class="member-group-block">
           <div class="member-group-label tabular">登记为暂停 / 终止 · ${retiredWorkers.length}</div>
-          <div class="member-list-card is-retired">
+          <div class="member-list-card is-retired" role="list">
             ${retiredWorkers.map(renderMemberRow).join('')}
           </div>
         </div>
@@ -1681,8 +1720,13 @@
     }
 
     const unknownWorkers = workers.filter((w) => !['waiting', 'working', 'stopped', 'killed'].includes(w.status));
-    if (unknownWorkers.length) blocks.push(`<div class="member-group-block"><div class="member-group-label">其他 / 未记录状态</div>${unknownWorkers.map(renderMemberRow).join('')}</div>`);
+    if (unknownWorkers.length) blocks.push(`<div class="member-group-block"><div class="member-group-label">其他 / 未记录状态</div><div class="member-list-card" role="list">${unknownWorkers.map(renderMemberRow).join('')}</div></div>`);
     el.workersList.innerHTML = blocks.join('');
+    if (focusedWorker) {
+      const row = el.workersList.querySelector(`[data-worker-id="${CSS.escape(focusedWorker)}"]`);
+      if (row) row.focus();
+      else el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'members').focus();
+    }
   }
 
   function tickHeartbeats() {
@@ -1713,6 +1757,7 @@
   }
 
   function renderChannelTabsOnly() {
+    const focusedChannel = el.channelTabs.contains(document.activeElement) ? document.activeElement.getAttribute('data-channel') : null;
     const ordered = getOrderedChannels();
     if (!ordered.includes(state.activeChannel)) {
       state.activeChannel = 'all';
@@ -1741,8 +1786,7 @@
             type="button"
             class="ch-pill ${active ? 'active' : ''} ${isCustom ? 'mono' : ''}"
             data-channel="${escapeHtml(ch)}"
-            role="tab"
-            aria-selected="${active ? 'true' : 'false'}"
+            aria-pressed="${active ? 'true' : 'false'}"
           >
             <span>${escapeHtml(displayName)}</span>
             <span class="ch-pill-count tabular">${count}</span>
@@ -1750,6 +1794,10 @@
         `;
       })
       .join('');
+    if (focusedChannel) {
+      const channel = ordered.includes(focusedChannel) ? focusedChannel : state.activeChannel;
+      el.channelTabs.querySelector(`[data-channel="${CSS.escape(channel)}"]`).focus();
+    }
   }
 
   function renderChannelControls() {
@@ -1950,8 +1998,14 @@
   }
 
   function renderOverview() {
+    const focused = el.overviewContent.contains(document.activeElement) ? document.activeElement : null;
+    const focusKey = ['id', 'data-action', 'data-view', 'data-open-seq', 'data-worker-id'].find((key) => focused?.getAttribute(key) != null);
+    const detail = focused?.tagName === 'SUMMARY' ? focused.closest('[data-overview-detail]') : null;
+    const focusSelector = focusKey ? `[${focusKey}="${CSS.escape(focused.getAttribute(focusKey))}"]`
+      : detail ? `[data-overview-detail="${CSS.escape(detail.getAttribute('data-overview-detail'))}"] > summary` : null;
     if (state.loadState !== 'ready') {
       el.overviewContent.innerHTML = `<div class="empty-state">${state.loadState === 'loading' ? '正在加载任务概况…' : state.loadState === 'error' ? '任务数据未加载，请查看上方错误并重试。' : `当前项目暂无 ${escapeHtml(MODE_NAMES[PAGE_MODE])} 任务，可切换项目或点击「立即同步」。`}</div>`;
+      if (focused) el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'overview').focus();
       return;
     }
     const run = state.run;
@@ -1987,6 +2041,15 @@
         <div class="overview-updates">${recent.length ? recent.map((msg) => `<button type="button" class="overview-update" data-open-seq="${escapeHtml(msg.seq)}"><span>${escapeHtml(messageSummary(msg))}</span><small>${escapeHtml(labelRole(inferSenderRole(msg)))} · @${escapeHtml(msg.sender)} · #${escapeHtml(msg.seq)} · ${escapeHtml(formatLocalTime(msg.created_at))}</small></button>`).join('') : '<p class="muted-caption">尚无协作动态。</p>'}</div>
       </section>
       </div>`;
+    if (focused) {
+      const target = focusSelector ? el.overviewContent.querySelector(focusSelector) : null;
+      let closedDetails = target?.closest('details:not([open])');
+      while (closedDetails && closedDetails.querySelector(':scope > summary') === target) {
+        closedDetails = closedDetails.parentElement.closest('details:not([open])');
+      }
+      if (target && !closedDetails && target.getClientRects().length > 0) target.focus();
+      else el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'overview').focus();
+    }
   }
 
 
@@ -2087,10 +2150,15 @@
       row = el.boardFeed.querySelector(`[data-seq="${CSS.escape(targetSeq)}"]`);
     }
     if (row) {
-      row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      row.setAttribute('tabindex', '-1');
+      row.focus({ preventScroll: true });
+      row.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth', block: 'center' });
       row.classList.remove('msg-highlight');
-      void row.offsetWidth;
-      row.classList.add('msg-highlight');
+      if (!reducedMotion) {
+        void row.offsetWidth;
+        row.classList.add('msg-highlight');
+      }
     }
   }
 
@@ -2391,6 +2459,10 @@
   }
 
   function renderGraphDetail(model, stepLimit) {
+    const focused = el.graphDetailBar.contains(document.activeElement) ? document.activeElement : null;
+    const action = focused?.getAttribute('data-graph-action');
+    const targetKey = focused?.getAttribute('data-node-id') !== null ? 'data-node-id' : 'data-worker-id';
+    const focusSelector = action ? `[data-graph-action="${CSS.escape(action)}"][${targetKey}="${CSS.escape(focused.getAttribute(targetKey))}"]` : null;
     const focusId = state.graphHoverNode || state.graphSelectedNode;
     if (focusId) {
       const node = model.nodes.find((n) => n.id === focusId);
@@ -2414,6 +2486,11 @@
             }
           </div>
         `;
+        if (focused) {
+          const target = focusSelector ? el.graphDetailBar.querySelector(focusSelector) : null;
+          if (target) target.focus();
+          else el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'graph').focus();
+        }
         return;
       }
     }
@@ -2440,9 +2517,12 @@
       el.graphDetailBar.classList.add('hidden');
       el.graphDetailBar.innerHTML = '';
     }
+    if (focused) el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'graph').focus();
   }
 
   function renderGraph() {
+    const focusedNode = el.graphCanvasHost.contains(document.activeElement) ? document.activeElement.closest('.graph-node') : null;
+    const focusedId = focusedNode?.getAttribute('data-node-id');
     const total = state.messages.length;
     const stepLimit = total === 0
       ? 0
@@ -2459,7 +2539,9 @@
     if (model.nodes.length === 0) {
       el.graphCanvasHost.innerHTML =
         '<div class="empty-state">暂无协作消息，收到 #seq 消息或注册成员后将实时生成拓扑图。</div>';
+      const detailHadFocus = el.graphDetailBar.contains(document.activeElement);
       el.graphDetailBar.classList.add('hidden');
+      if (focusedNode || detailHadFocus) el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'graph').focus();
       return;
     }
 
@@ -2488,8 +2570,8 @@
         const dash = edge.isBroadcast ? 'stroke-dasharray="5 4"' : '';
 
         return `
-          <g class="graph-edge" data-from="${escapeHtml(edge.from)}" data-to="${escapeHtml(edge.to)}" data-broadcast="${edge.isBroadcast ? '1' : '0'}" data-latest="${isLatest ? '1' : '0'}" style="opacity:${opacity}">
-            <path d="${geom.d}" stroke="${strokeColor}" stroke-width="${strokeWidth}" ${dash} fill="none" marker-end="${markerId}"></path>
+          <g class="graph-edge" data-from="${escapeHtml(edge.from)}" data-to="${escapeHtml(edge.to)}" data-broadcast="${edge.isBroadcast ? '1' : '0'}" data-latest="${isLatest ? '1' : '0'}">
+            <path d="${geom.d}" stroke="${strokeColor}" stroke-width="${strokeWidth}" ${dash} fill="none" marker-end="${markerId}" style="opacity:${opacity}"></path>
             <rect class="graph-edge-label-bg" x="${Number(geom.lx) - Math.max(10, (String(edge.count).length * 7 + 10) / 2)}" y="${Number(geom.ly) - 9}" width="${Math.max(20, String(edge.count).length * 7 + 10)}" height="17" rx="8"></rect>
             <text x="${geom.lx}" y="${Number(geom.ly) + 3.5}" text-anchor="middle" font-size="10.5" font-weight="600" class="mono" fill="${isConnectedToFocus ? 'var(--link)' : 'var(--text-secondary)'}">${edge.count}</text>
           </g>
@@ -2520,8 +2602,9 @@
         const subText = node.worker ? `${labelRole(node.role)} · ${labelWorkerStatus(node.status)}` : labelRole(node.role);
 
         return `
-          <g class="graph-node" data-node-id="${escapeHtml(node.id)}" data-default-stroke="${escapeHtml(strokeColor)}" tabindex="0" role="button" aria-label="${escapeHtml(`${displayTitle} ${subText}`)}" aria-pressed="${state.graphSelectedNode === node.id ? 'true' : 'false'}" style="opacity:${dimmed ? '0.28' : '1'}">
+          <g class="graph-node" data-node-id="${escapeHtml(node.id)}" data-default-stroke="${escapeHtml(strokeColor)}" tabindex="0" role="button" aria-label="${escapeHtml(`${displayTitle} ${subText}`)}" aria-pressed="${state.graphSelectedNode === node.id ? 'true' : 'false'}">
             <rect
+              style="opacity:${dimmed ? '0.28' : '1'}"
               x="${x}"
               y="${y}"
               width="${box.w}"
@@ -2554,6 +2637,11 @@
     `;
 
     renderGraphDetail(model, stepLimit);
+    if (focusedNode) {
+      const target = el.graphCanvasHost.querySelector(`.graph-node[data-node-id="${CSS.escape(focusedId)}"]`);
+      if (target) target.focus();
+      else el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'graph').focus();
+    }
   }
 
   function applyGraphHighlightInPlace() {
@@ -2583,10 +2671,10 @@
       const isConnected = Boolean(activeFocus && (from === activeFocus || to === activeFocus));
       const dimmed = Boolean(activeFocus && !isConnected);
 
-      edgeEl.style.opacity = dimmed ? '0.16' : (isConnected || isLatest ? '0.95' : (isBroadcast ? '0.48' : '0.68'));
       const pathEl = edgeEl.querySelector('path');
       const textEl = edgeEl.querySelector('text');
       if (pathEl) {
+        pathEl.style.opacity = dimmed ? '0.16' : (isConnected || isLatest ? '0.95' : (isBroadcast ? '0.48' : '0.68'));
         const active = isConnected || isLatest;
         pathEl.setAttribute('stroke', active ? 'var(--primary)' : 'var(--text-muted)');
         pathEl.setAttribute('marker-end', active ? 'url(#graphArrowActive)' : 'url(#graphArrow)');
@@ -2602,9 +2690,9 @@
       const defaultStroke = nodeEl.getAttribute('data-default-stroke') || 'var(--border-strong)';
       const isSelected = activeFocus === nodeId;
       const dimmed = Boolean(activeFocus && !connectedToFocus.has(nodeId));
-      nodeEl.style.opacity = dimmed ? '0.28' : '1';
       const rectEl = nodeEl.querySelector('rect');
       if (rectEl) {
+        rectEl.style.opacity = dimmed ? '0.28' : '1';
         rectEl.setAttribute('fill', isSelected ? 'var(--bg-subtle)' : 'var(--bg-card)');
         rectEl.setAttribute('stroke', isSelected ? 'var(--primary)' : defaultStroke);
         rectEl.setAttribute('stroke-width', isSelected ? '2.2' : '1.5');
@@ -2745,7 +2833,18 @@
       ${requests.map((item) => `<div class="actions-note">${escapeHtml(item.requested_status === 'stopped' ? '请求暂停' : '请求结束任务')} · ${escapeHtml(labels[item.status])}<div>${escapeHtml(item.result || '')}</div></div>`).join('')}</div>`;
   }
 
+  function restoreInspectorFocus(selector) {
+    if (!selector) return;
+    const target = el.inspectorDrawer.querySelector(selector);
+    if (target && !target.disabled && !target.closest('.hidden')) target.focus();
+    else el.inspectorTitle.focus();
+  }
+
   function renderInspector() {
+    const focused = el.inspectorDrawer.contains(document.activeElement) ? document.activeElement : null;
+    const focusedId = focused?.getAttribute('id');
+    const focusedAction = focused?.getAttribute('data-action');
+    const focusedSelector = focusedId ? `#${CSS.escape(focusedId)}` : focusedAction ? `[data-action="${CSS.escape(focusedAction)}"]` : null;
     const worker = state.workers.find((w) => String(w.id) === String(state.selectedWorkerId));
     if (!worker) {
       el.inspectorTitle.textContent = '工作区检查器';
@@ -2753,6 +2852,7 @@
       el.refreshDiffBtn.classList.add('hidden');
       el.inspectorBody.innerHTML =
         '<div class="empty-state">在“成员”页签点击任意成员行，即可在右侧检查其隔离工作区、变更文件状态、代码差异与安全操作。</div>';
+      restoreInspectorFocus(focusedSelector);
       return;
     }
 
@@ -2796,6 +2896,7 @@
           <div class="actions-note">该成员未绑定隔离工作区；控制请求须等待协调者执行并回执。</div>
         </div>
       `;
+      restoreInspectorFocus(focusedSelector);
       return;
     }
 
@@ -2949,6 +3050,7 @@
         </div>
       </div>
     `;
+    restoreInspectorFocus(focusedSelector);
   }
 
   function renderAll() {
@@ -2966,9 +3068,17 @@
 
   // ---------- 交互处理 ----------
 
-  function closeExportMenu() {
+  function openExportMenu(last = false) {
+    el.exportMenu.classList.remove('hidden');
+    el.exportMenuBtn.setAttribute('aria-expanded', 'true');
+    const items = Array.from(el.exportMenu.querySelectorAll('[role="menuitem"]:not(:disabled)'));
+    items[last ? items.length - 1 : 0].focus();
+  }
+
+  function closeExportMenu(returnFocus = false) {
     el.exportMenu.classList.add('hidden');
     el.exportMenuBtn.setAttribute('aria-expanded', 'false');
+    if (returnFocus) el.exportMenuBtn.focus();
   }
 
   async function handleHumanSubmit(evt) {
@@ -3034,7 +3144,7 @@
 
   async function handleExport(format) {
     if (!state.selectedRunId) return;
-    closeExportMenu();
+    closeExportMenu(true);
     const url = `/api/runs/${encodeURIComponent(state.selectedRunId)}/export?format=${encodeURIComponent(format)}`;
     try {
       const res = await fetch(url);
@@ -3189,6 +3299,7 @@
     setInspectorOpen(true);
     renderWorkers();
     renderInspector();
+    el.inspectorTitle.focus();
 
     const worker = state.workers.find((w) => String(w.id) === String(workerId));
     const ws = getWorkerWorkspace(worker);
@@ -3251,6 +3362,13 @@
         const tab = btn.getAttribute('data-tab');
         if (tab) switchTab(tab);
       });
+      btn.addEventListener('keydown', (evt) => {
+        const index = el.tabButtons.indexOf(btn);
+        const next = { ArrowRight: (index + 1) % el.tabButtons.length, ArrowLeft: (index + el.tabButtons.length - 1) % el.tabButtons.length, Home: 0, End: el.tabButtons.length - 1 }[evt.key];
+        if (next === undefined) return;
+        evt.preventDefault();
+        switchTab(el.tabButtons[next].getAttribute('data-tab'));
+      });
     });
 
     el.projectSelect.addEventListener('change', async () => {
@@ -3274,9 +3392,25 @@
 
     el.exportMenuBtn.addEventListener('click', (evt) => {
       evt.stopPropagation();
-      const willOpen = el.exportMenu.classList.contains('hidden');
-      el.exportMenu.classList.toggle('hidden', !willOpen);
-      el.exportMenuBtn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
+      if (el.exportMenu.classList.contains('hidden')) openExportMenu();
+      else closeExportMenu(true);
+    });
+    el.exportMenuBtn.addEventListener('keydown', (evt) => {
+      if (!['Enter', ' ', 'ArrowDown', 'ArrowUp'].includes(evt.key)) return;
+      evt.preventDefault();
+      openExportMenu(evt.key === 'ArrowUp');
+    });
+    el.exportMenu.addEventListener('keydown', (evt) => {
+      if (evt.key === 'Tab') {
+        closeExportMenu(true);
+        return;
+      }
+      const items = Array.from(el.exportMenu.querySelectorAll('[role="menuitem"]:not(:disabled)'));
+      const index = items.indexOf(document.activeElement);
+      const next = { ArrowDown: (index + 1) % items.length, ArrowUp: (index + items.length - 1) % items.length, Home: 0, End: items.length - 1 }[evt.key];
+      if (next === undefined) return;
+      evt.preventDefault();
+      items[next].focus();
     });
 
     el.exportMdBtn.addEventListener('click', () => handleExport('md'));
@@ -3290,12 +3424,22 @@
 
     document.addEventListener('keydown', (evt) => {
       if (evt.key === 'Escape') {
-        closeExportMenu();
-        if (state.inspectorOpen && window.innerWidth <= 1080) {
+        if (!el.exportMenu.classList.contains('hidden')) {
+          evt.preventDefault();
+          closeExportMenu(true);
+        } else if (state.inspectorOpen) {
+          evt.preventDefault();
           setInspectorOpen(false);
         }
+      } else if (evt.key === 'Tab' && state.inspectorOpen && window.innerWidth <= 1080) {
+        const items = Array.from(el.inspectorDrawer.querySelectorAll('button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'))
+          .filter((item) => !item.closest('.hidden') && item.getClientRects().length > 0);
+        const index = items.indexOf(document.activeElement);
+        evt.preventDefault();
+        items[index < 0 ? (evt.shiftKey ? items.length - 1 : 0) : (index + (evt.shiftKey ? -1 : 1) + items.length) % items.length].focus();
       }
     });
+    window.addEventListener('resize', syncInspectorMode);
 
     el.workersList.addEventListener('click', async (evt) => {
       const row = evt.target.closest('.member-row');

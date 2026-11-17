@@ -41,7 +41,7 @@
   --violet: #6d28d9;
   --violet-tint: rgba(124, 58, 237, 0.10);
 
-  --cyan: #0e7490;
+  --cyan: #0c6b85;
   --cyan-tint: rgba(14, 116, 144, 0.10);
 
   --muted-tint: rgba(71, 85, 105, 0.09);
@@ -927,7 +927,6 @@ textarea:focus-visible,
 
 .ch-pill-count {
   font-size: 11px;
-  opacity: 0.78;
 }
 
 .filter-controls {
@@ -1500,10 +1499,6 @@ pre.code-block .code-lang {
   overflow: hidden;
 }
 
-.member-list-card.is-retired {
-  opacity: 0.86;
-}
-
 .member-row {
   width: 100%;
   border: none;
@@ -1522,7 +1517,7 @@ pre.code-block .code-lang {
   transition: background-color 140ms ease;
 }
 
-.member-row:last-child {
+.member-list-item:last-child > .member-row {
   border-bottom: none;
 }
 
@@ -2319,4 +2314,12 @@ textarea, input { caret-color: var(--link); }
   .workflow-step > .muted-caption { grid-column: 1 / -1; }
   .overview-member-state { min-width: 0; max-width: 160px; }
   .workflow-overview .overview-section-heading { align-items: start; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
 }
