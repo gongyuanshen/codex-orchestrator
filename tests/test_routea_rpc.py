@@ -92,6 +92,7 @@ def test_workflow_tools_preserve_gates_and_emit_after_commit(tmp_path):
 
                 run = await rpc("run_create", mode="swarm", title="formal gates", project_root=str(project))
                 rid = run["id"]
+                app.state.db.connect().execute("UPDATE runs SET workflow_version=2 WHERE id=?", (rid,))
                 await rpc("task_packet_save", run_id=rid, title="content", goal="Verify actual file content",
                           acceptance_criteria=["content matches"], file_ownership={"writer": ["code.txt"]})
                 await rpc("worker_register", run_id=rid, name="writer", role="coder", agent_id="/root/writer")

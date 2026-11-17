@@ -82,6 +82,9 @@ class InboxStore:
             step = self._step_context(conn, step_id) if step_id is not None else None
             if step is not None and step["ctx_run_id"] != run_id:
                 raise InboxConflictError("Inbox step must belong to the same run")
+            if step is not None:
+                context = {'step_' + name: step['ctx_' + name] for name in
+                           ('packet_version', 'attempt', 'contract_revision')}
             if self._linked_execution(run, content):
                 if step is None:
                     raise InboxConflictError("Swarm execution requires a same-run workflow step_id")
@@ -147,7 +150,7 @@ class InboxStore:
 
     @staticmethod
     def _linked_execution(run: Any, message: dict[str, Any]) -> bool:
-        return run["workflow_version"] == 2 and run["mode"] == "swarm" and message["kind"] != "notice"
+        return run["workflow_version"] in {2, 3, 4} and run["mode"] == "swarm" and message["kind"] != "notice"
 
     @staticmethod
     def _step_context(conn: Any, step_id: str | None) -> Any:

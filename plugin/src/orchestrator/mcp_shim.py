@@ -37,7 +37,7 @@ logger = logging.getLogger("orchestrator.mcp_shim")
 
 # Codex's modern stdio transport closes on an 8 MiB line. Leave room for the RPC envelope.
 INLINE_RESULT_BYTES = 1024 * 1024 - 1024
-REQUIRED_CAPABILITIES = frozenset({"durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"})
+REQUIRED_CAPABILITIES = frozenset({"durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2", "native_actions_v1", "verification_receipts_v1", "plan_admission_v1", "compact_handoff_v1", "recipient_groups_v1", "progress_classification_v1", "workflow_reviews_v1"})
 
 
 def configure_shim_logging(settings: Settings) -> None:
@@ -222,7 +222,7 @@ def _resolve_daemon_executable() -> str:
     return str(exe)
 
 
-def _spawn_detached_daemon(settings: Settings) -> subprocess.Popen[bytes]:
+def _spawn_detached_daemon(settings: Settings):
     """Spawn python -m orchestrator.daemon completely detached from stdio pipes."""
     settings.ensure_data_dir()
     cmd = [
@@ -243,50 +243,15 @@ def _spawn_detached_daemon(settings: Settings) -> subprocess.Popen[bytes]:
     env["TRI_ORCH_STALL_SEC"] = str(settings.stall_sec)
     env["TRI_ORCH_WATCHDOG_INTERVAL_SEC"] = str(settings.watchdog_interval_sec)
 
-    base_flags = 0
-    startupinfo = None
     if os.name == "nt":
-        # Never combine DETACHED_PROCESS with CREATE_NO_WINDOW; Win32 ignores CREATE_NO_WINDOW
-        # and Windows 11 Default Terminal pops a visible WindowsTerminal window for child stubs.
-        base_flags = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)) | int(
-            getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        )
-        startupinfo = subprocess.STARTUPINFO()
-        startupinfo.dwFlags |= int(getattr(subprocess, "STARTF_USESHOWWINDOW", 0))
-        startupinfo.wShowWindow = int(getattr(subprocess, "SW_HIDE", 0))
+        from orchestrator.windows_daemon import spawn_daemon
 
-    breakaway_flag = int(getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000))
-    flag_candidates = (
-        [base_flags | breakaway_flag, base_flags]
-        if os.name == "nt" and breakaway_flag
-        else [base_flags]
-    )
+        # A shared service must not inherit the SDK's KILL_ON_JOB_CLOSE job.
+        return spawn_daemon(cmd, env)
 
-    log_fh = settings.daemon_log_path.open("ab")
-    try:
-        last_exc: OSError | None = None
-        proc: subprocess.Popen[bytes] | None = None
-        for flags in flag_candidates:
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    stdin=subprocess.DEVNULL,
-                    stdout=log_fh,
-                    stderr=log_fh,
-                    env=env,
-                    close_fds=True,
-                    creationflags=flags,
-                    startupinfo=startupinfo,
-                )
-                break
-            except OSError as exc:
-                last_exc = exc
-        if proc is None:
-            assert last_exc is not None
-            raise last_exc
-    finally:
-        log_fh.close()
-    return proc
+    with settings.daemon_log_path.open("ab") as log_fh:
+        return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_fh,
+                                stderr=log_fh, env=env, close_fds=True)
 
 
 def ensure_daemon_running(
@@ -297,10 +262,7 @@ def ensure_daemon_running(
 ) -> dict[str, Any]:
     """Ensure singleton daemon is reachable; acquire daemon.lock and spawn detached if needed."""
     cfg = settings or get_settings()
-    health = fetch_health(cfg)
-    if health is not None:
-        return {"spawned": False, "pid": health.get("pid"), "url": cfg.base_url}
-
+    # Offline health probes bind exclusively; serialize them with startup too.
     with _acquire_daemon_lock(cfg.lock_path, timeout_sec=lock_timeout_sec):
         health = fetch_health(cfg)
         if health is not None:

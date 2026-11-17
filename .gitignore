@@ -34,3 +34,14 @@ Thumbs.db
 !/docs/verification/*/report.md
 !/docs/verification/*/audit.md
 !/docs/verification/route-a-20261116/approved-plan.md
+
+# Reproducible native-gap cases and reviewed summaries; raw evidence stays local
+!/docs/verification/native-gap-next/m0/
+/docs/verification/native-gap-next/m0/*
+!/docs/verification/native-gap-next/m0/cases.json
+!/docs/verification/native-gap-next/m0/run_baseline.py
+!/docs/verification/native-gap-next/m0/README.md
+!/docs/verification/native-gap-next/*-report.md
+!/docs/verification/native-gap-next/*-review.md
+!/docs/verification/native-gap-next/m1-interface.md
+!/docs/verification/native-gap-next/m2-interface.md

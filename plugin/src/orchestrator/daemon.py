@@ -382,6 +382,7 @@ def create_app(
         workspace_mgr = WorkspaceManager(database, cfg)
         event_bus = EventBus()
         dispatcher = RpcDispatcher(database, board, workspace_mgr, event_bus)
+        dispatcher.native_actions.recover()
         watchdog = StallWatchdog(database, board, event_bus)
         shutdown_event = asyncio.Event()
 
@@ -470,7 +471,7 @@ def create_app(
                 "sse_subscribers": state.event_bus.subscriber_count(),
                 "software_version": __version__,
                 "schema_version": SCHEMA_VERSION,
-                "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"],
+                "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2", "native_actions_v1", "verification_receipts_v1", "plan_admission_v1", "compact_handoff_v1", "recipient_groups_v1", "progress_classification_v1", "workflow_reviews_v1"],
             }
         )
 
@@ -575,6 +576,10 @@ def create_app(
             "control_requests": status_summary["control_requests"],
             "workflow": status_summary["workflow"],
             "inbox": status_summary["inbox"],
+            "native_actions": status_summary["native_actions"],
+            "resume_context": status_summary["resume_context"],
+            "plan_readiness": status_summary["plan_readiness"],
+            "progress_status": status_summary["progress_status"],
         }
 
     async def api_run_snapshot(request: Request) -> JSONResponse:

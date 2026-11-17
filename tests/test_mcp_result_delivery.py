@@ -16,6 +16,7 @@ import pytest
 from mcp_types import CLIENT_CAPABILITIES_META_KEY, CLIENT_INFO_META_KEY, PROTOCOL_VERSION_META_KEY
 from orchestrator import __version__
 from orchestrator.db import SCHEMA_VERSION
+from orchestrator.mcp_shim import REQUIRED_CAPABILITIES
 
 
 @contextmanager
@@ -31,7 +32,7 @@ def shim_session(tmp_path, result, *, fail_delivery=False, error=False, protocol
             body = {"status": "ok", "pid": os.getpid(),
                     "port": self.server.server_port, "data_dir": str(data),
                     "software_version": __version__, "schema_version": SCHEMA_VERSION,
-                    "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"]}
+                    "capabilities": sorted(REQUIRED_CAPABILITIES)}
             self.reply(200, body)
 
         def do_POST(self):

@@ -74,12 +74,12 @@ def finish(service, step, evidence):
     return advance(service, service.get_step(step['id']), 'complete')
 
 
-def test_new_runs_use_workflow2_schema5_and_rpc_cannot_choose_version(tmp_path):
+def test_new_runs_use_workflow4_schema7_and_rpc_cannot_choose_version(tmp_path):
     settings = Settings(data_dir=tmp_path / 'data')
     db = Database(settings=settings)
     try:
-        assert SCHEMA_VERSION == db.migrate() == 5
-        assert db.create_run(mode='boost', title='new', project_root=tmp_path)['workflow_version'] == 2
+        assert SCHEMA_VERSION == db.migrate() == 7
+        assert db.create_run(mode='boost', title='new', project_root=tmp_path)['workflow_version'] == 4
         dispatcher = RpcDispatcher(db, BoardService(db), WorkspaceManager(db, settings))
         with pytest.raises(ValueError, match='Unknown'):
             dispatcher.dispatch('run_create', {'mode': 'boost', 'title': 'bypass',
@@ -112,7 +112,7 @@ def test_schema4_upgrade_keeps_existing_run_contracts_and_adds_nullable_context(
         columns = {r['name']: r for r in db.connect().execute('PRAGMA table_info(inbox_messages)')}
         for column in ('step_packet_version', 'step_attempt', 'step_contract_revision'):
             assert column in columns and columns[column]['notnull'] == 0
-        assert db.migrate() == 5
+        assert db.migrate() == 7
     finally:
         db.close()
     before = path.read_bytes()
@@ -122,12 +122,12 @@ def test_schema4_upgrade_keeps_existing_run_contracts_and_adds_nullable_context(
     assert path.read_bytes() == before
 
 
-@pytest.mark.parametrize('version', [1, 2, 99])
+@pytest.mark.parametrize('version', [1, 2, 3, 99])
 def test_shared_completion_and_terminal_reopening_are_not_bypassable(mode_flow, version):
     db, service, run, step, *_ = mode_flow(version=version)
     with pytest.raises(WorkflowConflictError):
         db.update_run(run['id'], status='completed')
-    if version in (1, 2):
+    if version in (1, 2, 3):
         db.update_run(run['id'], status='archived')
         with pytest.raises(WorkflowConflictError):
             db.update_run(run['id'], status='active')
@@ -180,9 +180,10 @@ def test_boost_challenge_rejects_stale_foreign_and_previous_attempt_artifacts(mo
         record(service, step, current, evidence)
 
 
+@pytest.mark.parametrize('version', [2, 3])
 @pytest.mark.parametrize('replacement', ['owner', 'verifier', 'owner_binding', 'verifier_binding'])
-def test_executed_work_keeps_original_author_and_verifier(mode_flow, replacement):
-    db, service, run, step, *_ = mode_flow()
+def test_executed_work_keeps_original_author_and_verifier(mode_flow, replacement, version):
+    db, service, run, step, *_ = mode_flow(version=version)
     step = advance(service, step, 'dispatch')
     owner, verifier = 'author', 'verifier'
     if replacement == 'owner':
@@ -198,9 +199,10 @@ def test_executed_work_keeps_original_author_and_verifier(mode_flow, replacement
                           expected_revision=step['revision'])
 
 
+@pytest.mark.parametrize('version', [2, 3])
 @pytest.mark.parametrize('state', ['rework', 'needs_decision'])
-def test_packet_changes_do_not_revive_failed_steps_or_retry_budget(mode_flow, state):
-    db, service, run, step, *_ = mode_flow()
+def test_packet_changes_do_not_revive_failed_steps_or_retry_budget(mode_flow, state, version):
+    db, service, run, step, *_ = mode_flow(version=version)
     step = advance(service, step, 'dispatch')
     db.connect().execute('UPDATE workflow_steps SET state=?,attempt=3 WHERE id=?', (state, step['id']))
     before = service.get_step(step['id'])
@@ -214,8 +216,9 @@ def test_packet_changes_do_not_revive_failed_steps_or_retry_budget(mode_flow, st
         advance(service, current, 'dispatch')
 
 
-def test_packet_update_cannot_erase_original_bindings(mode_flow):
-    db, service, run, step, *_ = mode_flow()
+@pytest.mark.parametrize('version', [2, 3])
+def test_packet_update_cannot_erase_original_bindings(mode_flow, version):
+    db, service, run, step, *_ = mode_flow(version=version)
     step = advance(service, step, 'dispatch')
     db.save_task_packet(run['id'], title='Changed', goal='same work',
                         file_ownership={'author': ['source.txt'], 'other': ['source.txt']}, acceptance_criteria=['output'])
@@ -266,7 +269,7 @@ def test_start_rework_rechecks_dependencies_without_new_retry_counter(mode_flow)
     assert advance(service, second, 'start_rework')['attempt'] == 1
 
 
-@pytest.mark.parametrize('version', [1, 2, 99])
+@pytest.mark.parametrize('version', [1, 2, 3, 99])
 def test_workspace_merge_and_cleanup_do_not_skip_strict_or_unknown_versions(mode_flow, version):
     db, service, run, step, root, evidence, settings = mode_flow('swarm', version)
     manager = WorkspaceManager(db, settings)

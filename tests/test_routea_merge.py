@@ -29,6 +29,7 @@ def _setup(tmp_path, git=False):
     cfg = Settings(data_dir=tmp_path / "data", port_range=(23100, 23130))
     db = Database.from_settings(cfg)
     run = db.create_run(mode="swarm", title="strict merge", project_root=root)
+    db.connect().execute("UPDATE runs SET workflow_version=2 WHERE id=?", (run["id"],))
     mgr = WorkspaceManager(db, cfg)
     ws = mgr.workspace_create(run["id"], "writer", copy_env=False)
     return root, db, run, mgr, ws

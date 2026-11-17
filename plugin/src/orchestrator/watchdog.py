@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import json
 import time
 from typing import Any
 
@@ -11,6 +12,132 @@ from orchestrator.board import BoardService
 from orchestrator.db import Database
 
 logger = logging.getLogger(__name__)
+
+
+def classify_run(db: Database, run_id: str, *, now: float | None = None) -> dict[str, Any]:
+    """Read persisted facts, never infer host death or perform admission/dispatch.
+
+    Planned steps are potential work, not proof of current artifact admission.
+    Only the original coordinator may check that gate and perform native calls.
+    """
+    from orchestrator.db import NotFoundError
+    from orchestrator.native_actions import NativeActionStore
+    from orchestrator.workflow import WorkflowService
+
+    run = db.get_run(run_id)
+    if run is None:
+        raise NotFoundError(f'Run not found: {run_id}')
+    ts = time.time() if now is None else float(now)
+    flow = WorkflowService(db)
+    with db.read_connection() as conn:
+        steps = [dict(row) for row in conn.execute('SELECT * FROM workflow_steps WHERE run_id=? ORDER BY created_at,id', (run_id,))]
+    workers = {w['name']: w for w in db.list_workers(run_id=run_id)}
+    pending_steps = [s for s in steps if s['state'] != 'done']
+    native = NativeActionStore(db).project(run_id)
+    readiness = flow.plan_readiness(run_id)
+    with db.read_connection() as conn:
+        outstanding_inbox = [dict(row) for row in conn.execute("SELECT id,status,step_id FROM inbox_messages WHERE run_id=? AND kind!='notice' AND status IN ('pending','accepted')", (run_id,))]
+        failed_native = [dict(row) for row in conn.execute("SELECT action_id,source_type,source_id,recipient FROM native_actions WHERE run_id=? AND status='failed' AND outcome='failed'", (run_id,))]
+        native_wakes = [dict(row) for row in conn.execute("SELECT recipient,snapshot_json,history_json FROM native_actions WHERE run_id=? AND source_type!='control' AND status IN ('invoking','confirmed')", (run_id,))]
+        control_pending = conn.execute("SELECT count(*) FROM worker_controls WHERE run_id=? AND status='pending'", (run_id,)).fetchone()[0]
+    wake_epochs = {}
+    for wake in native_wakes:
+        binding = (wake['recipient'], json.loads(wake['snapshot_json'])['agent_id'])
+        for event in json.loads(wake['history_json']):
+            if event['operation'] == 'begin':
+                wake_epochs[binding] = max(wake_epochs.get(binding, 0), event['at'])
+    unsettled_native = any(native['counts'][status] for status in ('claimed', 'invoking', 'needs_reconciliation'))
+    incomplete = run['status'] == 'active' and bool(not steps or pending_steps or outstanding_inbox or control_pending or unsettled_native or failed_native or readiness['uncovered_criteria'] or native['next_actions_count'] or native['needs_clarification_count'])
+    blockers, executable, potential, dependency_waits = [], [], [], []
+    blocked_kinds = set()
+
+    def block(kind, reason, **context):
+        blocked_kinds.add(kind)
+        blockers.append(dict(kind=kind, reason=reason, **context))
+
+    for item in failed_native:
+        block('native_failure', 'Native invocation definitively failed; original coordinator must decide, not automatically replay', **item)
+    for item in native['needs_reconciliation']:
+        block('reconcile_native', 'Inspect the original native call; never automatically replay',
+              action_id=item['action_id'], revision=item['revision'], recipient=item['recipient'])
+    for item in native['needs_clarification']:
+        block('clarify_source', item['reason'], source_type=item['source_type'], source_id=item['source_id'])
+    for item in native['next_actions']:
+        if item['source_type'] == 'control':
+            executable.append(dict(kind='native_control', source_id=item['source_id'], recipient=item['recipient']))
+    for group in native['next_action_groups']:
+        executable.append(dict(kind='native_handoff', recipient=group['recipient'], agent_id=group['agent_id'],
+                               source_ids=[m['source_id'] for m in group['members']]))
+    states = {s['id']: s['state'] for s in steps}
+    for message in outstanding_inbox:
+        if message['status'] == 'accepted' and states.get(message['step_id']) == 'done':
+            block('reconcile_inbox', 'Step is done but its accepted business receipt is unresolved', message_id=message['id'])
+    for step in pending_steps:
+        state = step['state']
+        checkpoint = json.loads(step['checkpoint_json'])
+        identity = dict(step_id=step['id'], revision=step['revision'], state=state,
+                        attempt=step['attempt'], contract_revision=step['contract_revision'],
+                        state_entered_at=checkpoint.get('state_entered_at', step['created_at']))
+        if state == 'needs_decision':
+            block('user_decision', 'Original rework budget exhausted; an explicit decision is required', **identity)
+            continue
+        if state == 'reconciliation_required':
+            block('reconcile_step', 'Inspect the saved workflow checkpoint before continuing', **identity)
+            continue
+        role = 'verifier' if state in {'candidate_review', 'integrated_review'} else 'owner'
+        worker = workers.get(step[role])
+        if worker is None or worker['agent_id'] != step[role + '_agent_id']:
+            block('binding_changed', 'Original native binding is unavailable; do not replace it automatically', **identity)
+            continue
+        if worker['status'] in {'stopped', 'killed'}:
+            block('user_decision', 'Original worker is stopped; automatic resume is forbidden', worker=worker['name'], **identity)
+            continue
+        dependencies = json.loads(step['dependencies_json'])
+        unresolved = [identity for identity in dependencies if states.get(identity) != 'done']
+        if state == 'planned':
+            if unresolved:
+                dependency_waits.append(dict(step_id=step['id'], dependencies=unresolved))
+            else:
+                potential.append(dict(kind='dispatch_requires_admission', step_id=step['id']))
+            continue
+        if state in {'rework', 'ready_to_merge', 'handoff'}:
+            potential.append(dict(kind='workflow_gate_required', step_id=step['id'], state=state))
+            continue
+        observation = checkpoint.get('native_observations', {}).get(worker['agent_id'])
+        after = checkpoint.get('owner_last_dispatch_at', step['created_at']) if role == 'owner' else checkpoint.get('state_entered_at', step['created_at'])
+        after = max(after, wake_epochs.get((worker['name'], worker['agent_id']), 0))
+        current = observation is not None and observation['observed_at'] >= after and ts - observation['observed_at'] <= worker['stall_threshold_sec']
+        if current and observation['state'] == 'ended':
+            block('user_decision', 'Original native agent ended; replacement requires a decision', worker=worker['name'], **identity)
+        elif current and observation['state'] in {'idle', 'interrupted'}:
+            block('idle_incomplete', 'Observed native agent is not progressing its incomplete step', worker=worker['name'], **identity)
+        elif not current and worker['status'] == 'working' and ts - worker['last_heartbeat_at'] > worker['stall_threshold_sec']:
+            block('observe_host', 'Heartbeat expired; inspect native state, not evidence of agent death', worker=worker['name'], **identity)
+    if not steps and not executable:
+        potential.append(dict(kind='plan_required'))
+    if not incomplete:
+        classification = 'completed' if run['status'] == 'completed' or run['status'] == 'active' and steps and not pending_steps else 'inactive'
+    elif executable:
+        classification = 'ready'
+    elif blocked_kinds & {'reconcile_native', 'reconcile_step', 'binding_changed', 'clarify_source', 'reconcile_inbox'}:
+        classification = 'needs_reconciliation'
+    elif blocked_kinds & {'user_decision', 'native_failure'}:
+        classification = 'user_decision'
+    elif 'observe_host' in blocked_kinds:
+        classification = 'host_unknown'
+    elif 'idle_incomplete' in blocked_kinds:
+        classification = 'no_progress'
+    elif dependency_waits:
+        classification = 'dependency_wait'
+    else:
+        classification = 'normal_wait'
+    # A draft is not proven executable, but is also not proof of global stagnation.
+    alert_required = bool(incomplete and not executable and not potential and blockers)
+    return dict(classification=classification, incomplete=incomplete,
+                executable_candidates=executable, potential_candidates=potential,
+                blockers=blockers, dependency_waits=dependency_waits, plan_readiness=readiness,
+                coordinator_required=bool(incomplete and (executable or potential or blockers)),
+                alert_required=alert_required, lifecycle_authority='original_root_coordinator')
 
 
 class StallWatchdog:
@@ -52,9 +179,37 @@ class StallWatchdog:
 
     def scan_once(self, *, now: float | None = None) -> list[dict[str, Any]]:
         """Scan once for stalled workers, post board alert, mark alerted, and broadcast SSE."""
+        from orchestrator.native_actions import NativeActionStore
+        NativeActionStore(self.db).expire()
         ts = float(now) if now is not None else time.time()
-        stalled_workers = self.db.find_stalled_workers(now=ts)
+        # Workflow0-3 keep their historical heartbeat alert contract.
+        stalled_workers = [w for w in self.db.find_stalled_workers(now=ts)
+                           if self.db.get_run(w['run_id'])['workflow_version'] != 4]
         alerts: list[dict[str, Any]] = []
+        with self.db.read_connection() as conn:
+            run_ids = [row['id'] for row in conn.execute("SELECT id FROM runs WHERE status='active' AND workflow_version=4")]
+        for run_id in run_ids:
+            facts = classify_run(self.db, run_id, now=ts)
+            if not facts['alert_required']:
+                continue
+            with self.db.transaction() as conn:
+                # A closed run or newly executable handoff must win the read/post race.
+                facts = classify_run(self.db, run_id, now=ts)
+                if not facts['alert_required']:
+                    continue
+                from orchestrator.native_actions import digest
+                signature = digest([facts['classification'], [{k: v for k, v in blocker.items() if k != 'revision'} for blocker in facts['blockers']]])[:16]
+                summary = f"Coordination alert: {facts['classification']} [{signature}]"
+                if conn.execute("SELECT 1 FROM board_messages WHERE run_id=? AND sender='watchdog' AND msg_type='alert' AND summary=?", (run_id, summary)).fetchone():
+                    continue
+                pointer = self.board.board_post(run_id, sender='watchdog', sender_role='system',
+                    mentions=['coordinator'], msg_type='alert', summary=summary,
+                    body_md='Waiting for coordinator handling. Events are hints; recover from the database.\n\n' +
+                        '\n'.join('- ' + item['reason'] for item in facts['blockers']))
+            message = self.board.get_message(pointer['seq'])
+            self._emit('board_message', {'run_id': run_id, 'message': message}, run_id=run_id)
+            self._emit('stall_alert', {'run_id': run_id, 'classification': facts, 'message': message}, run_id=run_id)
+            alerts.append(dict(classification=facts, message=message))
 
         for worker in stalled_workers:
             worker_id = worker["id"]

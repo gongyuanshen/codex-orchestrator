@@ -557,6 +557,8 @@ def test_sse_live_events_and_watchdog_stall_alert(tmp_path: Path) -> None:
 
                 # Register a worker whose heartbeat is already stale
                 db: Database = srv.app.state.db
+                # This test retains the pre-workflow4 heartbeat alert contract.
+                db.connect().execute('UPDATE runs SET workflow_version=3 WHERE id IN (?,?)', (run1_id, run2_id))
                 board: BoardService = srv.app.state.board
                 event_bus = srv.app.state.event_bus
                 old_ts = time.time() - 120.0
@@ -708,6 +710,7 @@ def test_merge_preview_conflict_and_watchdog_background_loop(tmp_path: Path) -> 
             assert (repo_dir / "app.py").read_text(encoding="utf-8") == "VALUE = 'main'\n"
 
             # Register stale worker and let the real background watchdog loop detect it
+            srv.app.state.db.connect().execute('UPDATE runs SET workflow_version=3 WHERE id=?', (run_id,))
             board: BoardService = srv.app.state.board
             board.worker_register(
                 run_id,

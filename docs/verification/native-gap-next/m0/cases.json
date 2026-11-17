@@ -1,0 +1,208 @@
+[
+  {
+    "id": "boost-known-fix",
+    "mode": "boost",
+    "task": "Fix clamp returning input unchanged; preserve reversed-bounds rejection.",
+    "fixtures": [
+      {
+        "source": "clamp.py",
+        "broken": "def clamp(value, low, high):\n    return value\n",
+        "repaired": "def clamp(value, low, high):\n    if low > high:\n        raise ValueError(\"low must not exceed high\")\n    return min(max(value, low), high)\n",
+        "test": "test_clamp.py",
+        "test_source": "import pytest\r\nfrom clamp import clamp\r\n\r\ndef test_clamp_bounds():\r\n    assert clamp(5, 0, 3) == 3\r\n    assert clamp(-1, 0, 3) == 0\r\n    assert clamp(2, 0, 3) == 2\r\n\r\ndef test_reversed_bounds_fail():\r\n    with pytest.raises(ValueError):\r\n        clamp(2, 4, 1)\r\n",
+        "provenance": {
+          "path": "docs/verification/modes-20261117/native-fixtures.json -> boost-delegated/test_clamp.py",
+          "sha256": "3656348c1e1b7ca6dbb4cad5d854f70d207916b4d3fde2850f1439f4f6c5886f",
+          "original_seed_sha256": "b2c24b1b17738f405556e1901d5dd8db5cf6c96859a7329257f48645f01ea9d7",
+          "source_policy": "frozen original test; explicit new fault seed; repaired source from original accepted local fixture"
+        }
+      }
+    ],
+    "contracts": [
+      "tests/test_mode_workflows.py::test_boost_three_reworks_same_bindings_and_integrated_completion"
+    ],
+    "fault": "out-of-bound input returned unchanged",
+    "failure_condition": "Frozen business pytest exits 1 with >=1 assertion failure (not collection error); negative workflow/inbox action must reject as asserted by referenced contract test.",
+    "success_condition": "Same frozen business tests after explicit scripted source repair and all referenced baseline contract tests exit 0 with zero failures/errors/skips.",
+    "permissions": "isolated temporary files and in-process SQLite/ASGI only; no production network or native agent calls",
+    "model": null,
+    "concurrency": 1
+  },
+  {
+    "id": "boost-unknown-root",
+    "mode": "boost",
+    "task": "normalize_ids produces wrong IDs for heterogeneous inputs; diagnose from frozen counterexample without a cause hint.",
+    "fixtures": [
+      {
+        "source": "normalizer.py",
+        "broken": "def normalize_ids(values):\n    return [v for v in values if isinstance(v, int) and v > 0]\n",
+        "repaired": "def normalize_ids(values):\n    seen = set()\n    result = []\n    for value in values:\n        if type(value) is int and value > 0 and value not in seen:\n            seen.add(value)\n            result.append(value)\n    return result\n",
+        "test": "test_normalizer.py",
+        "test_source": "from normalizer import normalize_ids\r\n\r\ndef test_positive_unique_ids():\r\n    assert normalize_ids([True, 1, 2, 2, -1, 0, \"3\", 4]) == [1, 2, 4]\r\n",
+        "provenance": {
+          "path": "docs/verification/modes-20261117/native-fixtures.json -> boost-solo/test_normalizer.py",
+          "sha256": "ee5b8f33d1c4553f50c92e2a24319b9a58b74c15a4c1409643666e61b6c9a0d7",
+          "original_seed_sha256": "2f43c49fb4fff1634ebed16fa9306ae369fbc953c8406e4fd70f44cc0b2b8c7c",
+          "source_policy": "frozen original test; explicit new fault seed; repaired source from original accepted local fixture"
+        }
+      }
+    ],
+    "contracts": [
+      "tests/test_mode_workflows.py::test_boost_challenge_rejects_stale_foreign_and_previous_attempt_artifacts"
+    ],
+    "fault": "duplicate IDs survive; bool-as-int additionally remains an unisolated defect in the frozen equality check",
+    "failure_condition": "Frozen business pytest exits 1 with >=1 assertion failure (not collection error); negative workflow/inbox action must reject as asserted by referenced contract test.",
+    "success_condition": "Same frozen business tests after explicit scripted source repair and all referenced baseline contract tests exit 0 with zero failures/errors/skips.",
+    "permissions": "isolated temporary files and in-process SQLite/ASGI only; no production network or native agent calls",
+    "model": null,
+    "concurrency": 1
+  },
+  {
+    "id": "teamwork-two-milestones",
+    "mode": "teamwork",
+    "task": "Deliver parse milestone, then sum milestone after current verified handoff.",
+    "fixtures": [
+      {
+        "source": "parse_ids.py",
+        "broken": "def parse_ids(raw):\n    return raw.split(\",\")\n",
+        "repaired": "def parse_ids(raw):\n    return [int(token.strip()) for token in raw.split(\",\")]\n",
+        "test": "test_parse_ids.py",
+        "test_source": "from parse_ids import parse_ids\r\n\r\ndef test_parse_ids():\r\n    assert parse_ids(\" 2,3 \") == [2, 3]\r\n",
+        "provenance": {
+          "path": "docs/verification/modes-20261117/native-fixtures.json -> teamwork/test_parse_ids.py",
+          "sha256": "86973406e919dfee766e96d7bcd7e441220740bf03042f959c8eb511fc84efea",
+          "original_seed_sha256": "22dd0391d2a3257649f0d1f9b4e7e990a2316c1605244241b58bfa815666d12d",
+          "source_policy": "frozen original test; explicit new fault seed; repaired source from original accepted local fixture"
+        }
+      },
+      {
+        "source": "sum_ids.py",
+        "broken": "from parse_ids import parse_ids\n\ndef sum_ids(raw):\n    return len(parse_ids(raw))\n",
+        "repaired": "from parse_ids import parse_ids\n\ndef sum_ids(raw):\n    return sum(parse_ids(raw))\n",
+        "test": "test_sum_ids.py",
+        "test_source": "from sum_ids import sum_ids\r\n\r\ndef test_sum_ids():\r\n    assert sum_ids(\"2,3\") == 5\r\n",
+        "provenance": {
+          "path": "docs/verification/modes-20261117/native-fixtures.json -> teamwork/test_sum_ids.py",
+          "sha256": "86c7f5ab112e8448335c51716708d3a5f43339efe24ee973bcae149efe8f21d3",
+          "original_seed_sha256": "86d3c5845a0dae8c95efa69de8e7f528ecc593a47336c2200d67e8b484972b32",
+          "source_policy": "frozen original test; explicit new fault seed; repaired source from original accepted local fixture"
+        }
+      }
+    ],
+    "contracts": [
+      "tests/test_mode_workflows.py::test_teamwork_targets_exact_handoff_recipient_and_rechecks_current_pass"
+    ],
+    "fault": "parser returns strings; dependent sum returns count",
+    "failure_condition": "Frozen business pytest exits 1 with >=1 assertion failure (not collection error); negative workflow/inbox action must reject as asserted by referenced contract test.",
+    "success_condition": "Same frozen business tests after explicit scripted source repair and all referenced baseline contract tests exit 0 with zero failures/errors/skips.",
+    "permissions": "isolated temporary files and in-process SQLite/ASGI only; no production network or native agent calls",
+    "model": null,
+    "concurrency": 1
+  },
+  {
+    "id": "teamwork-interrupted-handoff",
+    "mode": "teamwork",
+    "task": "Recover an interrupted milestone handoff; reject wrong recipient and stale artifacts, then acknowledge exact current recipient.",
+    "fixtures": [
+      {
+        "source": "parse_ids.py",
+        "broken": "def parse_ids(raw):\n    return []\n",
+        "repaired": "def parse_ids(raw):\n    return [int(token.strip()) for token in raw.split(\",\")]\n",
+        "test": "test_parse_ids.py",
+        "test_source": "from parse_ids import parse_ids\r\n\r\ndef test_parse_ids():\r\n    assert parse_ids(\" 2,3 \") == [2, 3]\r\n",
+        "provenance": {
+          "path": "docs/verification/modes-20261117/native-fixtures.json -> teamwork/test_parse_ids.py",
+          "sha256": "86973406e919dfee766e96d7bcd7e441220740bf03042f959c8eb511fc84efea",
+          "original_seed_sha256": "22dd0391d2a3257649f0d1f9b4e7e990a2316c1605244241b58bfa815666d12d",
+          "source_policy": "frozen original test; explicit new fault seed; repaired source from original accepted local fixture"
+        }
+      }
+    ],
+    "contracts": [
+      "tests/test_mode_workflows.py::test_teamwork_targets_exact_handoff_recipient_and_rechecks_current_pass",
+      "tests/test_mode_workflows.py::test_teamwork_handoff_send_cannot_preserve_stale_verification",
+      "@m0:test_teamwork_disconnect_reopen_before_handoff_ack"
+    ],
+    "fault": "empty parser output plus stale/wrong-recipient handoff",
+    "failure_condition": "Frozen business pytest exits 1 with >=1 assertion failure (not collection error); negative workflow/inbox action must reject as asserted by referenced contract test.",
+    "success_condition": "Same frozen business tests after explicit scripted source repair and all referenced baseline contract tests exit 0 with zero failures/errors/skips.",
+    "permissions": "isolated temporary files and in-process SQLite/ASGI only; no production network or native agent calls",
+    "model": null,
+    "concurrency": 1
+  },
+  {
+    "id": "swarm-parallel-messages",
+    "mode": "swarm",
+    "task": "Deliver independent label and parity repairs in parallel; conflicting message keys must not overwrite durable winners.",
+    "fixtures": [
+      {
+        "source": "label.py",
+        "broken": "def encode_label(value):\n    return value\n",
+        "repaired": "def encode_label(value):\n    return value.strip().upper()\n",
+        "test": "test_label.py",
+        "test_source": "from label import encode_label\r\n\r\ndef test_label():\r\n    assert encode_label(\" hello \") == \"HELLO\"\r\n",
+        "provenance": {
+          "path": "docs/verification/modes-20261117/native-fixtures.json -> swarm/test_label.py",
+          "sha256": "2d485490c0776eb43decd91abff1d27a9832d854e87d3df3b31a439befec6c24",
+          "original_seed_sha256": "44c281dfd568236b5b8fd58b77583d91e920e0282213491def867ddd5882a636",
+          "source_policy": "frozen original test; explicit new fault seed; repaired source from original accepted local fixture"
+        }
+      },
+      {
+        "source": "parity.py",
+        "broken": "def is_even(value):\n    return value % 2 == 1\n",
+        "repaired": "def is_even(value):\n    return value % 2 == 0\n",
+        "test": "test_parity.py",
+        "test_source": "from parity import is_even\r\n\r\ndef test_even():\r\n    assert is_even(2) is True\r\n    assert is_even(3) is False\r\n",
+        "provenance": {
+          "path": "docs/verification/modes-20261117/native-fixtures.json -> swarm/test_parity.py",
+          "sha256": "d691f0a6b753892f924151c54deb0881f519e5a748b64bdc03fe8d06d968e84e",
+          "original_seed_sha256": "fb4779eb0de9dc7b1177163eea0a01aa5f062f024c32f78ee56c63e596e48f7f",
+          "source_policy": "frozen original test; explicit new fault seed; repaired source from original accepted local fixture"
+        }
+      }
+    ],
+    "contracts": [
+      "tests/test_inbox.py::test_parallel_duplicate_sends_use_one_durable_message",
+      "tests/test_inbox.py::test_parallel_different_payload_cannot_overwrite_key"
+    ],
+    "fault": "untrimmed label, inverted parity, competing message payloads",
+    "failure_condition": "Frozen business pytest exits 1 with >=1 assertion failure (not collection error); negative workflow/inbox action must reject as asserted by referenced contract test.",
+    "success_condition": "Same frozen business tests after explicit scripted source repair and all referenced baseline contract tests exit 0 with zero failures/errors/skips.",
+    "permissions": "isolated temporary files and in-process SQLite/ASGI only; no production network or native agent calls",
+    "model": null,
+    "concurrency": 2
+  },
+  {
+    "id": "swarm-stop-disconnect-reconcile",
+    "mode": "swarm",
+    "task": "Stop pending work; recover accepted-but-unconfirmed receipt after database reopen without replay; release disconnected wait subscriptions.",
+    "fixtures": [
+      {
+        "source": "effect.py",
+        "broken": "def effect():\n    return \"unexpected execution\"\n",
+        "repaired": "def effect():\n    return \"no execution yet\"\n",
+        "test": "test_effect.py",
+        "test_source": "from effect import effect\r\n\r\ndef test_effect():\r\n    assert effect() == \"no execution yet\"\r\n",
+        "provenance": {
+          "path": "docs/verification/modes-20261117/native-fixtures.json -> stop-recovery/test_effect.py",
+          "sha256": "0d9d9ce7ec6325128b889560dd668cc59414dbb412daa37c1f34a69f423ed76c",
+          "original_seed_sha256": "1fea88888b051b1b2ae336e6943cb538db1a8ff74d2a366d18ca15748a4179f2",
+          "source_policy": "frozen original test; explicit new fault seed; repaired source from original accepted local fixture"
+        }
+      }
+    ],
+    "contracts": [
+      "tests/test_inbox_wait.py::test_paused_workers_do_not_receive_pending_messages[stopped]",
+      "tests/test_inbox.py::test_reopen_preserves_accepted_for_reconciliation_and_terminal_receipts",
+      "tests/test_inbox_wait.py::test_asgi_disconnect_releases_subscription",
+      "@m0:test_swarm_effect_then_disconnect_reconcile_without_replay"
+    ],
+    "fault": "effect result violates no-execution fixture; stopped delivery and disconnected wait",
+    "failure_condition": "Frozen business pytest exits 1 with >=1 assertion failure (not collection error); negative workflow/inbox action must reject as asserted by referenced contract test.",
+    "success_condition": "Same frozen business tests after explicit scripted source repair and all referenced baseline contract tests exit 0 with zero failures/errors/skips.",
+    "permissions": "isolated temporary files and in-process SQLite/ASGI only; no production network or native agent calls",
+    "model": null,
+    "concurrency": 1
+  }
+]

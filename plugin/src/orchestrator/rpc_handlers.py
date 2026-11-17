@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.board import BoardService
+from orchestrator.native_actions import NativeActionStore
 from orchestrator.inbox import INBOX_TOOL_DEFINITIONS, InboxStore
 from orchestrator.workflow import WorkflowService
 from orchestrator.db import (
@@ -449,6 +450,21 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
 ]
 
+TOOL_DEFINITIONS.append({
+    "name": "native_action_update",
+    "description": "Root-coordinator native handoff ledger; never invokes host tools or acknowledges business work.",
+    "inputSchema": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["claim", "begin", "record", "reconcile", "claim_group", "begin_group", "record_group", "reconcile_group"]},
+        "group_id": {"type": "string"},
+        "members": {"type": "array", "minItems": 1, "items": {"type": "object"}},
+        **{key: {"type": "string"} for key in ("run_id", "source_id", "recipient", "action_id", "claim_token", "source_digest", "evidence_ref", "evidence_digest", "result")},
+        "source_type": {"type": "string", "enum": ["inbox", "control", "human"]},
+        "action_type": {"type": "string", "enum": ["followup_task", "send_message", "interrupt_agent"]},
+        "expected_revision": {"type": "integer", "minimum": 1},
+        "cancel": {"type": "boolean", "default": False},
+        "outcome": {"type": "string", "enum": ["confirmed", "failed", "not_called", "rejected", "unknown"]}
+    }, "required": ["action"], "additionalProperties": False}
+})
 TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
     {
         "name": "workflow_step_save",
@@ -464,6 +480,8 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                 "expected_revision": {"type": "integer", "minimum": 0},
                 "handoff_required": {"type": "boolean", "default": False},
                 "criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "complexity": {"type": "string", "enum": ["normal", "high"], "default": "normal"},
+                "execution_kind": {"type": "string", "enum": ["native", "coordinator_local"], "default": "native"},
             },
             "required": ["run_id", "step_key", "owner", "verifier"], "additionalProperties": False,
         },
@@ -476,10 +494,13 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
             "properties": {
                 "step_id": {"type": "string"},
                 "action": {"type": "string", "enum": ["dispatch", "accept", "submit", "challenge", "start_rework",
-                    "begin_integrated_review", "complete", "handoff", "ack_handoff", "reconcile", "observe", "reverify"]},
+                    "begin_integrated_review", "complete", "handoff", "ack_handoff", "reconcile", "observe", "reverify", "local_revision_boundary"]},
                 "expected_revision": {"type": "integer", "minimum": 0},
                 "evidence": {"type": "string"}, "agent_id": {"type": "string"},
                 "artifact_id": {"type": "string"}, "recipient_agent_id": {"type": "string"},
+                "handoff_digest": {"type": "string"}, "next_responsibility": {"type": "string"},
+                "forbidden_actions": {"type": "array", "items": {"type": "string"}},
+                "decision_seqs": {"type": "array", "items": {"type": "integer", "minimum": 1}},
                 "observation": {
                     "type": "object",
                     "properties": {
@@ -501,6 +522,14 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                 "step_id": {"type": "string"},
                 "scope": {"type": "string", "enum": ["candidate", "integrated"], "default": "candidate"},
                 "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "verification_commands": {"type": "array", "minItems": 1, "items": {
+                    "type": "object", "properties": {
+                        "id": {"type": "string", "minLength": 1},
+                        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                        "cwd": {"type": "string"}, "timeout_sec": {"type": "number", "exclusiveMinimum": 0},
+                        "env_keys": {"type": "array", "uniqueItems": True, "items": {"type": "string"}},
+                        "criteria": {"type": "array", "minItems": 1, "uniqueItems": True, "items": {"type": "string"}}},
+                    "required": ["id", "argv", "cwd", "timeout_sec", "env_keys", "criteria"], "additionalProperties": False}},
             },
             "required": ["step_id"], "additionalProperties": False,
         },
@@ -518,10 +547,25 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                     "type": "object", "properties": {"criterion": {"type": "string"}, "status": {"type": "string"}},
                     "required": ["criterion", "status"], "additionalProperties": False}},
                 "evidence_files": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "receipt_files": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "resolved_finding_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+                "dismissed_finding_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+                "review_dimensions": {"type": "object", "properties": {
+                    dimension: {"type": "string", "enum": ["PASS", "FAIL", "NOT_RUN"]}
+                    for dimension in ("specification", "code", "stress", "evidence")},
+                    "required": ["specification", "code", "stress", "evidence"], "additionalProperties": False},
             },
             "required": ["step_id", "artifact_id", "verifier", "verdict", "criteria_results", "evidence_files", "key"],
             "additionalProperties": False,
         },
+    },
+    {
+        "name": "workflow_review",
+        "description": "Append a read-only challenger's mapped finding; the original verifier owns FAIL, rework and resolution.",
+        "inputSchema": {"type": "object", "properties": {
+            "step_id": {"type": "string"}, "expected_revision": {"type": "integer", "minimum": 0},
+            "agent_id": {"type": "string"}, "criterion": {"type": "string"}, "evidence": {"type": "string"}},
+            "required": ["step_id", "expected_revision", "agent_id", "criterion", "evidence"], "additionalProperties": False},
     },
 ])
 
@@ -545,6 +589,7 @@ class RpcDispatcher:
         self.board = board
         self.workspace_mgr = workspace_mgr
         self.event_bus = event_bus
+        self.native_actions = NativeActionStore(db)
         self.inbox = InboxStore(db, board)
         self.workflow = WorkflowService(db)
         self._handlers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
@@ -556,6 +601,7 @@ class RpcDispatcher:
             "board_post": self._handle_board_post,
             "board_read": self._handle_board_read,
             "board_status": self._handle_board_status,
+            "native_action_update": self._handle_native_action_update,
             "board_channel_list": self._handle_board_channel_list,
             "worker_control_ack": self._handle_worker_control_ack,
             "worker_register": self._handle_worker_register,
@@ -575,6 +621,7 @@ class RpcDispatcher:
             "workflow_step_advance": self._handle_workflow_step_advance,
             "artifact_capture": self._handle_artifact_capture,
             "verification_record": self._handle_verification_record,
+            "workflow_review": self._handle_workflow_review,
         }
 
     @property
@@ -835,6 +882,18 @@ class RpcDispatcher:
         del args
         raise ValueError("inbox_wait requires the asynchronous /api/rpc path")
 
+    def _handle_native_action_update(self, args: dict[str, Any]) -> dict[str, Any]:
+        result = self.native_actions.update(**args)
+        if 'group_id' in result:
+            run_id = result['members'][0]['run_id']
+            event = {'run_id': run_id, 'group_id': result['group_id'], 'members': [
+                {'action_id': member['action_id'], 'status': member['status']} for member in result['members']]}
+        else:
+            run_id = result['run_id']
+            event = {'run_id': run_id, 'action_id': result['action_id'], 'status': result['status']}
+        self._emit('native_action_updated', event, run_id=run_id)
+        return result
+
     def _handle_inbox_send(self, args: dict[str, Any]) -> dict[str, Any]:
         result = self.inbox.send(**args)
         if not result["duplicate"]:
@@ -871,6 +930,12 @@ class RpcDispatcher:
         run_id = self.workflow.get_step(verification["step_id"])["run_id"]
         self._emit("workflow_updated", {"run_id": run_id, "verification": verification}, run_id=run_id)
         return verification
+
+    def _handle_workflow_review(self, args: dict[str, Any]) -> dict[str, Any]:
+        finding = self.workflow.review(**args)
+        run_id = self.workflow.get_step(args['step_id'])['run_id']
+        self._emit('workflow_updated', {'run_id': run_id, 'finding': finding}, run_id=run_id)
+        return finding
 
     # ------------------------------------------------------------------
     # Isolated Workspace Handlers
