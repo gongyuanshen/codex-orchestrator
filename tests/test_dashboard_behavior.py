@@ -1,5 +1,7 @@
 import pathlib
+import re
 import subprocess
+from html.parser import HTMLParser
 
 import pytest
 
@@ -65,23 +67,26 @@ const fs=require('fs'), vm=require('vm'), assert=require('assert');
 const source=fs.readFileSync(process.argv[1],'utf8');
 function node() {
  const classes=new Set(), attributes={}, events={};
- return {innerHTML:'',textContent:'',value:'',style:{},dataset:{},disabled:false,scrollTop:0,scrollHeight:0,clientHeight:100,
+ return {innerHTML:'',textContent:'',value:'',style:{},dataset:{},disabled:false,isConnected:true,inert:false,scrollTop:0,scrollHeight:0,clientHeight:100,
  classList:{add:(x)=>classes.add(x),remove:(x)=>classes.delete(x),contains:(x)=>classes.has(x),toggle:(x,v)=>v?classes.add(x):classes.delete(x)},
- setAttribute(k,v){attributes[k]=v},removeAttribute(k){delete attributes[k]},getAttribute(k){return attributes[k]??null},
+ setAttribute(k,v){attributes[k]=String(v)},removeAttribute(k){delete attributes[k]},getAttribute(k){return attributes[k]??null},
  addEventListener(type,listener){(events[type]??=[]).push(listener)},dispatchEvent(event){for(const listener of events[event.type]||[])listener(event)},
  querySelectorAll(){return []},querySelector(q){return q==='.toast-close'?node():null},
- appendChild(){},getBoundingClientRect(){return {width:1000,height:600}},focus(){},contains(){return false}};
+ appendChild(){},getBoundingClientRect(){return {width:1000,height:600}},getClientRects(){return [{}]},closest(){return null},focus(){document.activeElement=this},contains(target){return this===target}};
 }
 const nodes=new Map(), requests=[], streams=[], intervals=new Map();let nextInterval=0;
 const links=['boost','teamwork','swarm'].flatMap(mode=>['chooser','nav'].map(kind=>{const link=node();link.dataset.modeLink=mode;nodes.set(kind+'-'+mode,link);return link}));
-const document={getElementById:(id)=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id)},querySelectorAll:(selector)=>selector==='[data-mode-link]'?links:[],createElement:node,addEventListener(){},documentElement:node()};
+const tabs=['overview','board','members','graph'].map(name=>{const tab=node();tab.setAttribute('data-tab',name);return tab});
+const background=[node(),node(),node()];
+const document=Object.assign(node(),{activeElement:null,getElementById:(id)=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id)},querySelectorAll:(selector)=>selector==='[data-mode-link]'?links:selector==='.tab-item'?tabs:selector==='.mode-bar, .topbar, .main-pane'?background:[],createElement:node,documentElement:node()});
+document.getElementById('exportMenu').classList.add('hidden');
 class EventSource {static CONNECTING=0;constructor(url){this.url=url;this.events={};streams.push(this)}addEventListener(n,f){this.events[n]=f}close(){this.closed=true}}
 const ctx={document,URLSearchParams,EventSource,console,Map,Set,Date,encodeURIComponent,setImmediate,requestAnimationFrame:(f)=>f(),setTimeout:()=>0,clearTimeout(){},setInterval:(f)=>{intervals.set(++nextInterval,f);return nextInterval},clearInterval:(id)=>intervals.delete(id),CSS:{escape:String},
- window:{location:{search:process.argv[3]||'',pathname:process.argv[2]||'/swarm',replace(url){this.redirected=url}},history:{replaceState(_a,_b,url){ctx.window.location.pathname=url.split('?')[0];ctx.window.location.search=url.includes('?')?'?'+url.split('?')[1]:''}},addEventListener(){},innerWidth:1200},
+ window:Object.assign(node(),{location:{search:process.argv[3]||'',pathname:process.argv[2]||'/swarm',replace(url){this.redirected=url}},history:{replaceState(_a,_b,url){ctx.window.location.pathname=url.split('?')[0];ctx.window.location.search=url.includes('?')?'?'+url.split('?')[1]:''}},matchMedia:()=>({matches:ctx.window.reducedMotion===true}),innerWidth:1200}),
  fetch:(url)=>new Promise((resolve,reject)=>requests.push({url,resolve:(data)=>resolve({ok:true,headers:{get:()=> 'application/json'},json:async()=>data}),reject}))};
 vm.createContext(ctx);
 vm.runInContext(source.replace('  init();','  globalThis.runTest = (code) => eval(code);'),ctx);
-ctx.assert=assert;ctx.requests=requests;ctx.streams=streams;ctx.nodes=nodes;ctx.intervals=intervals;
+ctx.assert=assert;ctx.requests=requests;ctx.streams=streams;ctx.nodes=nodes;ctx.intervals=intervals;ctx.testNode=node;ctx.background=background;
 async function run(code){await ctx.runTest(code)}
 """
 
@@ -643,7 +648,7 @@ def test_graph_keyboard_and_mouse_share_toggle_without_page_space_scroll():
       const attrs={'data-node-id':'coder','data-default-stroke':'var(--primary)'}, rectAttrs={};
       const graphNode={style:{},getAttribute:k=>attrs[k]??null,setAttribute:(k,v)=>attrs[k]=v,
         closest:selector=>selector==='.graph-node'?graphNode:null,
-        querySelector:selector=>selector==='rect'?{setAttribute:(k,v)=>rectAttrs[k]=v}:null};
+        querySelector:selector=>selector==='rect'?{style:{},setAttribute:(k,v)=>rectAttrs[k]=v}:null};
       const svg={querySelectorAll:selector=>selector==='.graph-node'?[graphNode]:[]};
       el.graphCanvasHost.querySelector=selector=>selector==='.graph-svg'?svg:null;
       function activate(key){
@@ -668,3 +673,312 @@ def test_graph_keyboard_and_mouse_share_toggle_without_page_space_scroll():
       el.graphCanvasHost.dispatchEvent({type:'click',target:{closest:()=>null}});
       assert.equal(state.graphSelectedNode,null);assert.equal(attrs['aria-pressed'],'false');
     })()''')
+
+
+def test_main_tabs_roving_focus_and_arrow_home_end_navigation():
+    run_dashboard(r'''(()=>{
+      bindEvents();switchTab('overview');
+      function key(index,key){let prevented=false;el.tabButtons[index].dispatchEvent({type:'keydown',key,preventDefault(){prevented=true}});assert.equal(prevented,true)}
+      assert.deepEqual(el.tabButtons.map(tab=>tab.getAttribute('tabindex')),['0','-1','-1','-1']);
+      key(0,'ArrowRight');assert.equal(state.activeTab,'board');assert.equal(document.activeElement,el.tabButtons[1]);
+      key(1,'End');assert.equal(state.activeTab,'graph');assert.equal(document.activeElement,el.tabButtons[3]);
+      key(3,'ArrowRight');assert.equal(state.activeTab,'overview');
+      key(0,'ArrowLeft');assert.equal(state.activeTab,'graph');
+      key(3,'Home');assert.equal(state.activeTab,'overview');
+      assert.deepEqual(el.tabButtons.map(tab=>tab.getAttribute('tabindex')),['0','-1','-1','-1']);
+      document.activeElement=el.overviewContent;switchTab('members');
+      assert.equal(document.activeElement,el.tabButtons[2],'a hidden overview action must not retain focus');
+    })()''')
+
+
+def test_channel_filters_are_toggle_buttons_and_keep_focus_when_refreshed():
+    run_dashboard(r'''(()=>{
+      const old=testNode(),replacement=testNode();old.setAttribute('data-channel','human');old.focus();
+      el.channelTabs.contains=target=>target===old;el.channelTabs.querySelector=selector=>selector.includes('human')?replacement:null;
+      state.activeChannel='human';renderChannelTabsOnly();
+      const buttons=[...el.channelTabs.innerHTML.matchAll(/<button\b[^>]*>/g)].map(match=>match[0]);
+      assert.ok(buttons.every(button=>!button.includes('role="tab"')),'filters do not own tabpanels');
+      assert.ok(buttons.find(button=>button.includes('data-channel="human"')).includes('aria-pressed="true"'));
+      assert.ok(buttons.find(button=>button.includes('data-channel="all"')).includes('aria-pressed="false"'));
+      assert.equal(document.activeElement,replacement,'SSE refresh must preserve the focused filter');
+    })()''')
+
+
+def test_members_keep_native_button_role_and_refreshed_worker_focus():
+    run_dashboard(r'''(()=>{
+      state.workers=[{id:'w',name:'coder',role:'coder',status:'working'}];
+      const old=testNode(),replacement=testNode();old.setAttribute('data-worker-id','w');old.closest=()=>old;old.focus();
+      el.workersList.contains=target=>target===old;el.workersList.querySelector=selector=>selector.includes('w')?replacement:null;
+      renderWorkers();
+      assert.ok(!renderMemberRow(state.workers[0]).match(/<button\b[^>]*role="listitem"/));
+      assert.ok(renderMemberRow(state.workers[0]).match(/<div[^>]*role="listitem"[^>]*>\s*<button/));
+      assert.ok(el.workersList.innerHTML.includes('role="list"'));
+      assert.equal(document.activeElement,replacement,'refresh must focus the replacement member button');
+    })()''')
+
+
+def test_inspector_repaint_restores_action_focus_and_removed_action_uses_heading():
+    run_dashboard(r'''(()=>{
+      state.workers=[{id:'w',name:'coder',role:'coder',status:'working'}];state.selectedWorkerId='w';
+      const old=testNode(),replacement=testNode();old.setAttribute('data-action','status-stopped');old.focus();
+      el.inspectorDrawer.contains=target=>target===old;el.inspectorDrawer.querySelector=selector=>selector.includes('status-stopped')?replacement:null;
+      renderInspector();assert.equal(document.activeElement,replacement);
+      old.focus();el.inspectorDrawer.querySelector=()=>null;renderInspector();
+      assert.equal(document.activeElement,el.inspectorTitle,'a removed/disabled action has an explicit stable destination');
+    })()''')
+
+
+def test_inspector_refresh_focus_moves_to_heading_when_workspace_disappears():
+    run_dashboard(r'''(()=>{
+      state.workers=[{id:'w',name:'coder',status:'working'}];state.selectedWorkerId='w';
+      el.refreshDiffBtn.setAttribute('id','refreshDiffBtn');el.refreshDiffBtn.focus();
+      el.inspectorDrawer.contains=target=>target===el.refreshDiffBtn;
+      el.inspectorDrawer.querySelector=selector=>selector==='#refreshDiffBtn'?el.refreshDiffBtn:null;
+      el.refreshDiffBtn.closest=selector=>selector==='.hidden'&&el.refreshDiffBtn.classList.contains('hidden')?el.refreshDiffBtn:null;
+      renderInspector();assert.equal(document.activeElement,el.inspectorTitle,'a now-hidden header action must not retain focus');
+    })()''')
+
+
+@pytest.mark.parametrize('width', [800, 1200])
+def test_inspector_entry_close_escape_and_responsive_modal_focus(width):
+    run_dashboard(r'''(async()=>{
+      bindEvents();window.innerWidth=Number(new URLSearchParams(window.location.search).get('width'));
+      const trigger=testNode(),replacement=testNode();trigger.setAttribute('data-worker-id','w');trigger.closest=selector=>selector==='[data-worker-id]'?trigger:null;
+      trigger.focus();state.workers=[{id:'w',name:'coder',status:'working'}];
+      el.workersList.querySelector=()=>replacement;
+      await selectWorkerAndOpenInspector('w');trigger.isConnected=false;
+      assert.equal(document.activeElement,el.inspectorTitle,'opening must enter inspector after member repaint');
+      const modal=window.innerWidth<=1080;
+      assert.equal(el.inspectorDrawer.getAttribute('role'),modal?'dialog':'complementary');
+      assert.equal(el.inspectorDrawer.getAttribute('aria-modal'),modal?'true':null);
+      assert.ok(background.every(node=>node.inert===modal));
+      document.dispatchEvent({type:'keydown',key:'Escape',preventDefault(){}});
+      assert.equal(state.inspectorOpen,false);assert.equal(document.activeElement,replacement);
+      assert.equal(el.inspectorDrawer.getAttribute('role'),'complementary');
+      assert.ok(background.every(node=>node.inert===false));
+      el.toggleInspectorBtn.focus();setInspectorOpen(true);window.innerWidth=800;window.dispatchEvent({type:'resize'});
+      assert.equal(el.inspectorDrawer.getAttribute('aria-modal'),'true');assert.ok(background.every(node=>node.inert));
+      window.innerWidth=1200;window.dispatchEvent({type:'resize'});
+      assert.equal(el.inspectorDrawer.getAttribute('role'),'complementary');
+      assert.equal(el.inspectorDrawer.getAttribute('aria-modal'),null);assert.ok(background.every(node=>!node.inert));
+      setInspectorOpen(false);assert.equal(document.activeElement,el.toggleInspectorBtn);
+    })()''', search='?width='+str(width))
+
+
+def test_inspector_container_can_switch_from_landmark_to_modal_dialog():
+    class DrawerParser(HTMLParser):
+        drawer = None
+
+        def handle_starttag(self, tag, attrs):
+            attributes = dict(attrs)
+            if attributes.get('id') == 'inspectorDrawer':
+                self.drawer = (tag, attributes)
+
+    parser = DrawerParser()
+    parser.feed(APP.with_name('index.html').read_text(encoding='utf-8'))
+    tag, attributes = parser.drawer
+    assert tag == 'div', 'The responsive dialog needs a neutral container, not an aside with a prohibited role override'
+    assert attributes['role'] == 'complementary'
+    assert attributes['aria-label'] == '工作区检查器与安全操作'
+
+
+def test_modal_inspector_tab_wraps_and_desktop_does_not_trap():
+    run_dashboard(r'''(()=>{
+      bindEvents();window.innerWidth=800;el.toggleInspectorBtn.focus();setInspectorOpen(true);
+      const first=testNode(),last=testNode();el.inspectorDrawer.querySelectorAll=()=>[first,last];
+      function tab(shift){let prevented=false;document.dispatchEvent({type:'keydown',key:'Tab',shiftKey:shift,preventDefault(){prevented=true}});return prevented}
+      last.focus();assert.equal(tab(false),true);assert.equal(document.activeElement,first);
+      first.focus();assert.equal(tab(true),true);assert.equal(document.activeElement,last);
+      window.innerWidth=1200;window.dispatchEvent({type:'resize'});assert.equal(tab(false),false);
+    })()''')
+
+
+def test_export_menu_keyboard_navigation_escape_and_tab_exit():
+    run_dashboard(r'''(()=>{
+      bindEvents();el.exportMenu.classList.add('hidden');el.exportMdBtn.disabled=false;el.exportJsonBtn.disabled=false;
+      el.exportMenu.querySelectorAll=()=>[el.exportMdBtn,el.exportJsonBtn];el.exportMenu.contains=target=>[el.exportMdBtn,el.exportJsonBtn].includes(target);
+      function key(node,key){let prevented=false;node.dispatchEvent({type:'keydown',key,preventDefault(){prevented=true}});return prevented}
+      assert.equal(key(el.exportMenuBtn,'Enter'),true);assert.equal(document.activeElement,el.exportMdBtn);
+      key(el.exportMenu,'ArrowDown');assert.equal(document.activeElement,el.exportJsonBtn);
+      key(el.exportMenu,'ArrowDown');assert.equal(document.activeElement,el.exportMdBtn);
+      key(el.exportMenu,'End');assert.equal(document.activeElement,el.exportJsonBtn);
+      key(el.exportMenu,'Home');assert.equal(document.activeElement,el.exportMdBtn);
+      key(el.exportMenu,'ArrowUp');assert.equal(document.activeElement,el.exportJsonBtn);
+      document.dispatchEvent({type:'keydown',key:'Escape',preventDefault(){}});
+      assert.equal(el.exportMenu.classList.contains('hidden'),true);assert.equal(document.activeElement,el.exportMenuBtn);
+      key(el.exportMenuBtn,' ');assert.equal(document.activeElement,el.exportMdBtn);
+      assert.equal(key(el.exportMenu,'Tab'),false);assert.equal(el.exportMenu.classList.contains('hidden'),true);
+      assert.equal(document.activeElement,el.exportMenuBtn,'native Tab starts from trigger, not a now-hidden item');
+    })()''')
+
+
+def test_reduced_motion_uses_immediate_jump_without_flash():
+    run_dashboard(r'''(()=>{
+      window.reducedMotion=true;const row=testNode();let behavior;
+      row.scrollIntoView=options=>behavior=options.behavior;el.boardFeed.querySelector=()=>row;
+      jumpToSeqRow(1);assert.equal(behavior,'auto');assert.equal(row.classList.contains('msg-highlight'),false);
+      assert.equal(document.activeElement,row);assert.equal(row.getAttribute('tabindex'),'-1');
+      window.reducedMotion=false;jumpToSeqRow(1);assert.equal(behavior,'smooth');assert.equal(row.classList.contains('msg-highlight'),true);
+    })()''')
+
+
+def test_unchanged_health_and_sse_labels_do_not_rebuild_live_subtrees():
+    run_dashboard(r'''(()=>{
+      let healthWrites=0,sseWrites=0,healthHtml='',sseHtml='';
+      Object.defineProperty(el.healthBadge,'innerHTML',{get:()=>healthHtml,set:value=>{healthWrites++;healthHtml=value}});
+      Object.defineProperty(el.sseBadge,'innerHTML',{get:()=>sseHtml,set:value=>{sseWrites++;sseHtml=value}});
+      state.healthOk=true;renderHealthPill();renderHealthPill();assert.equal(healthWrites,1);
+      setSseBadge('connected','已连接');setSseBadge('connected','已连接');assert.equal(sseWrites,1);assert.equal(healthWrites,2);
+      setSseBadge('reconnecting','重连中');assert.equal(sseWrites,2);
+      state.healthOk=false;renderHealthPill();renderHealthPill();assert.equal(healthWrites,4);
+    })()''')
+
+
+def test_graph_deemphasis_keeps_all_labels_opaque():
+    run_dashboard(r'''(()=>{
+      state.workers=['a','b','isolated'].map(name=>({id:name,name,role:'coder',status:'working'}));
+      state.messages=[{seq:1,sender:'a',mentions:['b']}];state.graphSelectedNode='isolated';renderGraph();
+      const groups=[...el.graphCanvasHost.innerHTML.matchAll(/<g class="graph-(?:node|edge)"[^>]*>/g)].map(match=>match[0]);
+      assert.ok(groups.every(group=>!group.includes('opacity:')),'text must not inherit group opacity');
+      const attrs={'data-node-id':'a','data-default-stroke':'var(--primary)'},rect={style:{},setAttribute(){}};
+      const graphNode={style:{},getAttribute:k=>attrs[k],setAttribute:(k,v)=>attrs[k]=v,querySelector:()=>rect};
+      const edgePath={style:{},setAttribute(){}};const edge={style:{},getAttribute:k=>({'data-from':'a','data-to':'b'}[k]),querySelector:q=>q==='path'?edgePath:{setAttribute(){}}};
+      el.graphCanvasHost.querySelector=()=>({querySelectorAll:q=>q==='.graph-node'?[graphNode]:[edge]});
+      applyGraphHighlightInPlace();assert.ok(!graphNode.style.opacity||graphNode.style.opacity==='1');assert.ok(!edge.style.opacity||edge.style.opacity==='1');
+      assert.equal(rect.style.opacity,'0.28');assert.equal(edgePath.style.opacity,'0.16');
+    })()''')
+
+
+@pytest.mark.parametrize('format', ['md', 'json'])
+def test_actual_export_selection_returns_focus_before_request_completes(format):
+    run_dashboard(r'''(async()=>{
+      state.selectedRunId='r';el.exportMenu.classList.remove('hidden');
+      const format=new URLSearchParams(window.location.search).get('format');
+      (format==='md'?el.exportMdBtn:el.exportJsonBtn).focus();
+      const exported=handleExport(format);
+      assert.equal(document.activeElement,el.exportMenuBtn,'export selection must return focus before awaiting the network');
+      assert.equal(el.exportMenu.classList.contains('hidden'),true);
+      assert.equal(requests[0].url,'/api/runs/r/export?format='+format);
+      requests[0].reject(Error('download transport stopped by test'));await exported;
+      assert.equal(document.activeElement,el.exportMenuBtn);
+    })()''', search='?format='+format)
+
+
+@pytest.mark.parametrize('caller', ['worker', 'message'])
+@pytest.mark.parametrize('outcome', ['survives', 'removed', 'outside'])
+def test_sse_graph_redraw_preserves_logical_node_focus(caller, outcome):
+    run_dashboard(r'''(()=>{
+      const params=new URLSearchParams(window.location.search),outcome=params.get('outcome');
+      state.workers=[{id:'w',name:'coder',status:'working',role:'coder'}];
+      const old=testNode(),replacement=testNode(),external=testNode();old.setAttribute('data-node-id','coder');old.closest=selector=>selector==='.graph-node'?old:null;
+      el.graphCanvasHost.contains=target=>target===old;
+      el.graphCanvasHost.querySelector=selector=>selector.includes('coder')&&outcome!=='removed'?replacement:null;
+      Object.defineProperty(el.graphCanvasHost,'innerHTML',{get:()=>'',set(){if(document.activeElement===old)document.activeElement=null}});
+      (outcome==='outside'?external:old).focus();
+      if(outcome==='removed'){state.workers=[];state.graphHideInactive=true}
+      if(params.get('caller')==='worker')upsertWorker({id:'other',name:'other',role:'coder',status:'working'});
+      else upsertBoardMessage({seq:1,sender:'other',channel:'main',body_md:'update'});
+      assert.equal(document.activeElement,outcome==='outside'?external:outcome==='removed'?el.tabButtons[3]:replacement);
+    })()''', search=f'?caller={caller}&outcome={outcome}')
+
+
+@pytest.mark.parametrize('outcome', ['survives', 'removed', 'outside'])
+def test_sse_graph_detail_redraw_preserves_action_and_target_focus(outcome):
+    run_dashboard(r'''(()=>{
+      const outcome=new URLSearchParams(window.location.search).get('outcome');
+      state.workers=[{id:'w',name:'coder',status:'working',role:'coder'}];state.graphSelectedNode='coder';
+      const old=testNode(),replacement=testNode(),external=testNode();
+      old.setAttribute('data-graph-action','inspect-worker');old.setAttribute('data-worker-id','w');
+      el.graphDetailBar.contains=target=>target===old;
+      el.graphDetailBar.querySelector=selector=>selector.includes('inspect-worker')&&selector.includes('w')&&outcome!=='removed'?replacement:null;
+      Object.defineProperty(el.graphDetailBar,'innerHTML',{get:()=>'',set(){if(document.activeElement===old)document.activeElement=null}});
+      (outcome==='outside'?external:old).focus();if(outcome==='removed')state.graphSelectedNode=null;
+      upsertBoardMessage({seq:1,sender:'other',channel:'main',body_md:'update'});
+      assert.equal(document.activeElement,outcome==='outside'?external:outcome==='removed'?el.tabButtons[3]:replacement);
+    })()''', search='?outcome='+outcome)
+
+
+@pytest.mark.parametrize('attribute', ['data-worker-id', 'data-view', 'data-open-seq', 'summary'])
+@pytest.mark.parametrize('outcome', ['survives', 'removed', 'outside'])
+def test_sse_overview_redraw_preserves_control_identity_without_stealing_focus(attribute, outcome):
+    run_dashboard(r'''(()=>{
+      const params=new URLSearchParams(window.location.search),attribute=params.get('attribute'),outcome=params.get('outcome');
+      state.run={id:'r',status:'active'};state.loadState='ready';
+      state.workers=[{id:'w',name:'coder',status:'working',role:'coder'}];
+      const old=testNode(),replacement=testNode(),external=testNode();
+      if(attribute==='summary'){
+        old.tagName='SUMMARY';old.closest=()=>({getAttribute:()=> 'goal'});
+      }else old.setAttribute(attribute,attribute==='data-worker-id'?'w':attribute==='data-view'?'members':'1');
+      el.overviewContent.contains=target=>target===old;
+      let rendered='';
+      el.overviewContent.querySelector=selector=>rendered.includes(attribute==='summary'?'data-overview-detail="goal"':selector.slice(1,-1))?replacement:null;
+      Object.defineProperty(el.overviewContent,'innerHTML',{get:()=>rendered,set(value){rendered=value;if(document.activeElement===old)document.activeElement=null}});
+      (outcome==='outside'?external:old).focus();
+      if(attribute==='data-open-seq')state.messages=[{seq:1,sender:'coder',body_md:'old update'}];
+      if(outcome==='removed'){
+        if(attribute==='data-worker-id')state.workers=[];
+        else if(attribute==='data-open-seq')state.messages=Array.from({length:7},(_,i)=>({seq:i+2,sender:'coder',body_md:'new update'}));
+        else state.loadState='error';
+      }
+      upsertWorker({id:outcome==='removed'?'other':'w',name:outcome==='removed'?'other':'coder',status:'working'});
+      assert.equal(document.activeElement,outcome==='outside'?external:outcome==='removed'?el.tabButtons[0]:replacement);
+    })()''', search=f'?attribute={attribute}&outcome={outcome}')
+
+
+def test_sse_overview_member_retired_into_closed_details_uses_visible_tab():
+    run_dashboard(r'''(()=>{
+      state.run={id:'r',status:'active'};state.loadState='ready';
+      state.workers=[{id:'w',name:'coder',status:'working',role:'coder'}];
+      const old=testNode(),retired=testNode();old.setAttribute('data-worker-id','w');retired.getClientRects=()=>[];
+      el.overviewContent.contains=target=>target===old;el.overviewContent.querySelector=()=>retired;
+      let rendered='';Object.defineProperty(el.overviewContent,'innerHTML',{get:()=>rendered,set(value){rendered=value;if(document.activeElement===old)document.activeElement=null}});
+      old.focus();upsertWorker({id:'w',name:'coder',status:'stopped'});
+      assert.ok(rendered.includes('retired-members'));assert.ok(!state.overviewExpanded.has('retired'));
+      assert.equal(document.activeElement,el.tabButtons[0],'a target inside closed details is not a focus destination');
+    })()''')
+
+
+@pytest.mark.parametrize('target_type', ['member', 'summary'])
+def test_overview_closed_details_semantics_override_chrome_nonzero_child_rects(target_type):
+    run_dashboard(r'''(()=>{
+      const isSummary=new URLSearchParams(window.location.search).get('target')==='summary';
+      state.run={id:'r',status:'active'};state.loadState='ready';state.workers=[{id:'w',name:'coder',status:'working'}];
+      const old=testNode(),replacement=testNode(),summary=testNode(),closed=testNode();
+      closed.open=false;closed.setAttribute('data-overview-detail','retired');closed.parentElement=el.overviewContent;
+      closed.querySelector=selector=>selector===':scope > summary'?(isSummary?replacement:summary):null;
+      replacement.closest=selector=>selector==='details:not([open])'?closed:null;
+      if(isSummary){old.tagName='SUMMARY';old.closest=()=>closed}else old.setAttribute('data-worker-id','w');
+      el.overviewContent.contains=target=>target===old;el.overviewContent.querySelector=()=>replacement;
+      Object.defineProperty(el.overviewContent,'innerHTML',{get:()=>'',set(){if(document.activeElement===old)document.activeElement=null}});
+      // Chrome reports geometry even for a button in the non-summary content of closed details.
+      assert.equal(replacement.getClientRects().length,1);
+      old.focus();upsertWorker({id:'w',name:'coder',status:'stopped'});
+      assert.equal(document.activeElement,isSummary?replacement:el.tabButtons[0]);
+      assert.equal(closed.open,false,'restoring focus must not implicitly expand retired members');
+    })()''', search='?target='+target_type)
+
+
+def test_cyan_badge_text_contrast_on_real_theme_surfaces_preserves_dark_palette():
+    css = APP.with_name('styles.css').read_text(encoding='utf-8')
+
+    def rgb(value):
+        return tuple(int(value[index:index + 2], 16) for index in (1, 3, 5))
+
+    def luminance(color):
+        channels = [channel / 255 for channel in color]
+        linear = [channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4 for channel in channels]
+        return sum(channel * weight for channel, weight in zip(linear, (0.2126, 0.7152, 0.0722)))
+
+    for theme in ('light', 'dark'):
+        block = re.search(r'\[data-theme="' + theme + r'"\]\s*\{([^}]+)\}', css).group(1)
+        tokens = dict(re.findall(r'(--[\w-]+):\s*([^;]+);', block))
+        foreground = rgb(tokens['--cyan'])
+        tint = tuple(float(component) for component in re.fullmatch(r'rgba\(([^)]+)\)', tokens['--cyan-tint']).group(1).split(','))
+        if theme == 'dark':
+            assert foreground == (103, 232, 249)
+            assert tint == (34, 211, 238, 0.14)
+        for surface in ('--bg-surface', '--bg-card'):
+            background = tuple(round(channel * tint[3] + base * (1 - tint[3])) for channel, base in zip(tint[:3], rgb(tokens[surface])))
+            high, low = sorted((luminance(foreground), luminance(background)), reverse=True)
+            ratio = (high + 0.05) / (low + 0.05)
+            assert ratio >= 4.5, f'{theme} cyan badge on {surface}: {ratio:.3f}:1 is below 4.5:1'

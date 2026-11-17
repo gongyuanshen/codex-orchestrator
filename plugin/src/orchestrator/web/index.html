@@ -41,7 +41,7 @@
     <p class="mode-chooser-note">这里只查看和协调已有任务；进入页面不会启动任务。</p>
   </main>
   <div id="dashboardShell" class="app-shell hidden">
-    <div class="mode-bar">
+    <div class="mode-bar" role="region" aria-label="工作模式说明">
       <nav class="mode-nav" aria-label="工作模式">
         <a href="/boost" data-mode-link="boost">Boost <span>专注</span></a>
         <a href="/teamwork" data-mode-link="teamwork">Teamwork <span>协作</span></a>
@@ -82,7 +82,7 @@
       </div>
 
       <div class="topbar-right">
-        <div id="healthBadge" class="live-pill" title="守护进程健康状态与实时端口">
+        <div id="healthBadge" class="live-pill" role="status" aria-live="polite" title="守护进程健康状态与实时端口">
           <span class="status-dot dot-pending"></span>
           <span class="status-text">检测中</span>
         </div>
@@ -114,7 +114,7 @@
         </button>
 
         <div class="export-dropdown" id="exportDropdown">
-          <button id="exportMenuBtn" class="topbar-btn topbar-btn-ghost" type="button" disabled aria-haspopup="menu" aria-expanded="false" title="导出运行复盘报告 (.md / .json)">
+          <button id="exportMenuBtn" class="topbar-btn topbar-btn-ghost" type="button" disabled aria-haspopup="menu" aria-expanded="false" aria-controls="exportMenu" title="导出运行复盘报告 (.md / .json)">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
               <polyline points="7 10 12 15 17 10"></polyline>
@@ -123,11 +123,11 @@
             <span class="hide-sm">导出报告</span>
           </button>
           <div id="exportMenu" class="export-menu hidden" role="menu" aria-label="选择导出格式">
-            <button id="exportMdBtn" class="export-menu-item" type="button" role="menuitem" disabled>
+            <button id="exportMdBtn" class="export-menu-item" type="button" role="menuitem" tabindex="-1" disabled>
               <span class="export-fmt">Markdown</span>
               <span class="export-ext mono">.md</span>
             </button>
-            <button id="exportJsonBtn" class="export-menu-item" type="button" role="menuitem" disabled>
+            <button id="exportJsonBtn" class="export-menu-item" type="button" role="menuitem" tabindex="-1" disabled>
               <span class="export-fmt">JSON 数据</span>
               <span class="export-ext mono">.json</span>
             </button>
@@ -146,7 +146,7 @@
               <h1 id="runTitleHeading" class="run-title">未选择运行任务</h1>
               <p id="projectPathSubtitle" class="run-subtitle mono">请在上方选择项目与运行任务</p>
             </div>
-            <div id="sseBadge" class="sse-indicator" title="实时事件流 (SSE /api/events)">
+            <div id="sseBadge" class="sse-indicator" role="status" aria-live="polite" title="实时事件流 (SSE /api/events)">
               <span class="status-dot dot-muted"></span>
               <span class="status-text">SSE 空闲</span>
             </div>
@@ -154,16 +154,16 @@
 
           <p id="contextStatus" class="context-status hidden" role="status" aria-live="polite"></p>
           <nav class="tab-bar" role="tablist" aria-label="主视图页签">
-            <button type="button" id="tabBtnOverview" class="tab-item active" data-tab="overview" role="tab" aria-selected="true" aria-controls="tab-overview">概况</button>
-            <button type="button" id="tabBtnBoard" class="tab-item" data-tab="board" role="tab" aria-selected="false" aria-controls="tab-board">
+            <button type="button" id="tabBtnOverview" class="tab-item active" data-tab="overview" role="tab" tabindex="0" aria-selected="true" aria-controls="tab-overview">概况</button>
+            <button type="button" id="tabBtnBoard" class="tab-item" data-tab="board" role="tab" tabindex="-1" aria-selected="false" aria-controls="tab-board">
               <span>日志</span>
               <span id="tabBoardCount" class="tab-badge tabular">0</span>
             </button>
-            <button type="button" id="tabBtnMembers" class="tab-item" data-tab="members" role="tab" aria-selected="false" aria-controls="tab-members">
+            <button type="button" id="tabBtnMembers" class="tab-item" data-tab="members" role="tab" tabindex="-1" aria-selected="false" aria-controls="tab-members">
               <span>成员</span>
               <span id="tabMembersCount" class="tab-badge tabular">0</span>
             </button>
-            <button type="button" id="tabBtnGraph" class="tab-item" data-tab="graph" role="tab" aria-selected="false" aria-controls="tab-graph">
+            <button type="button" id="tabBtnGraph" class="tab-item" data-tab="graph" role="tab" tabindex="-1" aria-selected="false" aria-controls="tab-graph">
               <span>协作图</span>
             </button>
           </nav>
@@ -176,10 +176,10 @@
         <!-- Logs -->
         <section id="tab-board" class="tab-panel hidden" role="tabpanel" aria-labelledby="tabBtnBoard">
           <div class="filter-strip">
-            <div class="channel-pills" id="channelTabs" role="tablist" aria-label="频道筛选">
-              <button type="button" class="ch-pill active" data-channel="all" role="tab" aria-selected="true">全部 0</button>
-              <button type="button" class="ch-pill" data-channel="main" role="tab" aria-selected="false">主频道 0</button>
-              <button type="button" class="ch-pill" data-channel="human" role="tab" aria-selected="false">人工 0</button>
+            <div class="channel-pills" id="channelTabs" role="group" aria-label="频道筛选">
+              <button type="button" class="ch-pill active" data-channel="all" aria-pressed="true">全部 0</button>
+              <button type="button" class="ch-pill" data-channel="main" aria-pressed="false">主频道 0</button>
+              <button type="button" class="ch-pill" data-channel="human" aria-pressed="false">人工 0</button>
             </div>
 
             <div class="filter-controls">
@@ -241,7 +241,7 @@
                 </div>
                 <span class="muted-caption">点击任意成员行在右侧打开工作区检查器</span>
               </div>
-              <div id="workersList" class="workers-groups" role="list">
+              <div id="workersList" class="workers-groups">
                 <div class="empty-state">当前运行任务尚未注册成员。</div>
               </div>
             </div>
@@ -329,10 +329,10 @@
 
       <!-- Slide-Over Right Workspace Inspector -->
       <div id="drawerBackdrop" class="drawer-backdrop hidden" aria-hidden="true"></div>
-      <aside id="inspectorDrawer" class="inspector-drawer hidden" aria-label="工作区检查器与安全操作">
+      <div id="inspectorDrawer" class="inspector-drawer hidden" role="complementary" aria-label="工作区检查器与安全操作">
         <div class="drawer-header">
           <div class="drawer-title-wrap">
-            <div class="drawer-title" id="inspectorTitle">工作区检查器</div>
+            <div class="drawer-title" id="inspectorTitle" tabindex="-1">工作区检查器</div>
             <div class="drawer-subtitle mono" id="inspectorSubtitle">请选择成员以检查工作区</div>
           </div>
           <div class="drawer-header-actions">
@@ -348,7 +348,7 @@
             在“成员”页签点击任意成员行，即可在右侧检查其隔离工作区、变更文件状态、代码差异与安全操作。
           </div>
         </div>
-      </aside>
+      </div>
     </div>
   </div>
 
