@@ -103,3 +103,11 @@
 完整交付与恢复：G:/工具/codex-orchestrator/docs/verification/modes-20261117/report.md；独立证据同目录installed-final-review.md和installed-native-host-report.md/json。私有备份C:/Users/Administrator/.codex/backups/tri-orchestrator-030-20261117。
 
 下一步：本计划执行结束，不扩展新功能。保留本地feature/route-a-mode-enhancements分支，未推送/主分支合并/公开Release。未进行本批人工GUI/完整无障碍、跨平台验收，不承诺旧聊天自动热刷新。上方进行中/离线/待验收均为历史检查点，以本最终状态为准。
+
+## 2026-11-17 GUI 与旧聊天刷新后续验收
+
+按用户追加要求完成真实三模式GUI及原旧聊天本轮刷新检查。发现并根因修复Diff响应乱序/跨工作区loading、离开协作图后台回放、图节点键盘及播放状态ARIA问题；18个新增行为case，独立关联67项PASS，全套-W error 440 passed in69.39s。源码修复871cfe181bfb60d8c5a6f54696dbff05f664b014已推送GitHub开发分支feature/route-a-mode-enhancements并远端读回核对，不合main/不创建公开Release；文档同分支整理提交。
+
+真实IAB检查三个模式桌面1440×900及窄屏390×844、v2完成/失败/双里程碑、日志筛选全文、成员/检查器、主题、JSON下载和Tab/Enter/Space交互。正式只原子更新app.js/styles.css，无服务重启；18790仍PID25084，14表全哈希/8历史任务保持。原根聊天同ID新turn实际27工具/2原生调用通过，未换新聊天或用SDK冒充；不承诺任意进行中旧turn即时刷新。
+
+完整证据：G:/工具/codex-orchestrator/docs/verification/gui-hot-refresh-20261117/report.md。旧FAIL/安装事故和旧包清单保留，本轮两静态文件新哈希另记。19894自有GUI服务已结束，停止代理不恢复。未穷举实体手机触控、所有无障碍及副作用GUI操作；此范围不是后端/宿主能力承诺。以上补充覆盖此前未做本批GUI/未验证旧聊天的历史边界，不改写当时事实。
