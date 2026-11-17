@@ -13,7 +13,7 @@
 - `scripts/upgrade.py` 提供 `prepare/apply/verify/rollback` 的受控离线包辅助流程：所有模式无活动任务、服务停止和备份核验后才允许写入。它不会修改Codex注册表配置、停止服务、重命名版本化缓存或假装完成宿主安装激活。旧版缓存不得直接伪装成新版本。
 - 一旦新版产生真实新数据，拒绝用旧备份覆盖回滚，保留数据进行前向修复。当前旧聊天已在新一轮加载27工具并完成真实原生只读调用；这不承诺任意进行中的旧turn/旧shim即时刷新。需要手动刷新时仍由用户操作。
 
-开发和隔离验证记录：[执行台账](docs/superpowers/plans/2026-11-16-route-a-execution.md)。2026-11-17 两批已完成并受控安装0.3.0/schema5；验收及故障恢复见 [第二批交付](docs/verification/modes-20261117/report.md)。三模式真实GUI、旧聊天新turn刷新及后续修复见 [GUI与旧聊天验收](docs/verification/gui-hot-refresh-20261117/report.md)。先前 [0.2.0安装](docs/verification/install-020-20261117/report.md) 与 [安装后收尾](docs/verification/postinstall-small-fixes-20261117/report.md) 作为历史检查点保留。
+开发和隔离验证记录：[执行台账](docs/superpowers/plans/2026-11-16-route-a-execution.md)。2026-11-17 两批已完成并受控安装0.3.0/schema5；验收及故障恢复见 [第二批交付](docs/verification/modes-20261117/report.md)。三模式真实GUI、旧聊天新turn刷新及后续修复见 [GUI与旧聊天验收](docs/verification/gui-hot-refresh-20261117/report.md)。主分支集成、三模式键盘/实时刷新与工程无障碍收尾见 [最终收尾验收](docs/verification/main-closeout-20261117/report.md)。先前 [0.2.0安装](docs/verification/install-020-20261117/report.md) 与 [安装后收尾](docs/verification/postinstall-small-fixes-20261117/report.md) 作为历史检查点保留。
 
 仓库保留开发计划和验证摘要；本地运行数据库、配置快照、原始验证日志和备份不纳入仓库。
 
@@ -37,7 +37,7 @@ codex plugin add tri-orchestrator@tri-orchestrator
 ```
 
 安装后将自动完成以下过程：
-- Codex 按所选市场版本缓存 `./plugin/`；本开发分支为 `0.3.0`，对应缓存 `~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.3.0/`。开发分支未合入 `main` 时，上述默认 GitHub 安装命令仍以远端默认分支版本为准。
+- Codex 按所选市场版本缓存 `./plugin/`；当前 `main` 为 `0.3.0`，对应缓存 `~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.3.0/`。
 - 首次触发 MCP 时，Codex 在插件缓存目录内自动执行 `uv run --quiet --project . python -m orchestrator.mcp_shim`，安装运行时依赖（`mcp`、`starlette`、`uvicorn`、`httpx`）并拉起后台单例守护进程。
 - 若 `~/.codex/agents/*.toml` 中未安装专用角色配置，`$boost`、`$teamwork` 与 `$swarm` 会自动回退为 `default` 子代理并在提示词中内联角色契约。
 
