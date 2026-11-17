@@ -297,8 +297,13 @@ def verify(backup_dir: Path) -> dict:
     with opener.open(f"http://127.0.0.1:{manifest['port']}/api/health", timeout=5) as response:
         health = json.load(response)
     required = {"durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1"}
-    if manifest["supported_schema"] == 5:
+    if manifest["supported_schema"] >= 5:
         required.add("workflow_modes_v2")
+    if manifest["supported_schema"] >= 6:
+        required.add("native_actions_v1")
+        required.add("verification_receipts_v1")
+    if manifest["supported_schema"] >= 7:
+        required.update({"plan_admission_v1", "compact_handoff_v1", "recipient_groups_v1", "progress_classification_v1", "workflow_reviews_v1"})
     if (health.get("status") != "ok" or health.get("ok") is not True
             or type(health.get("pid")) is not int or not process_alive(health["pid"])
             or health.get("software_version") != manifest["source_identity"]["version"]

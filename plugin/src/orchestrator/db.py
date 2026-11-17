@@ -14,7 +14,7 @@ from typing import Any, Iterator
 
 from orchestrator.config import Settings, get_settings
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 VALID_RUN_MODES = frozenset({"boost", "teamwork", "swarm"})
 VALID_RUN_STATUSES = frozenset({"active", "completed", "failed", "archived"})
@@ -430,6 +430,8 @@ class Database:
                 conn.execute("ALTER TABLE runs ADD COLUMN workflow_version INTEGER NOT NULL DEFAULT 0")
             from orchestrator.workflow import install_schema
             install_schema(conn)
+            from orchestrator.native_actions import install_schema as install_native_schema
+            install_native_schema(conn)
             inbox_columns = {r["name"] for r in conn.execute("PRAGMA table_info(inbox_messages)")}
             for column in ("step_packet_version", "step_attempt", "step_contract_revision"):
                 if column not in inbox_columns:
@@ -594,7 +596,7 @@ class Database:
             conn.execute(
                 """
                 INSERT INTO runs (id, project_id, mode, title, status, metadata_json, created_at, updated_at, workflow_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 2);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 4);
                 """,
                 (rid, resolved_project_id, mode, title, status, meta_json, now, now),
             )
@@ -628,10 +630,10 @@ class Database:
                 raise NotFoundError(f"Run not found: {run_id}")
 
             new_status = status if status is not None else existing["status"]
-            if existing["workflow_version"] not in {0, 1, 2}:
+            if existing["workflow_version"] not in {0, 1, 2, 3, 4}:
                 from orchestrator.workflow import WorkflowConflictError
                 raise WorkflowConflictError("Unsupported workflow version")
-            if existing["workflow_version"] in {1, 2}:
+            if existing["workflow_version"] in {1, 2, 3, 4}:
                 from orchestrator.workflow import WorkflowConflictError, WorkflowService
                 if existing["status"] != "active" and new_status == "active":
                     raise WorkflowConflictError("Create a new continuation run instead of reopening a terminal workflow")
@@ -710,16 +712,22 @@ class Database:
             ).fetchone()
             if run_row is None:
                 raise NotFoundError(f"Run not found: {run_id}")
-            if run_row["workflow_version"] not in {0, 1, 2}:
+            if run_row["workflow_version"] not in {0, 1, 2, 3, 4}:
                 from orchestrator.workflow import WorkflowConflictError
                 raise WorkflowConflictError("Unsupported workflow version")
-            if run_row["workflow_version"] in {1, 2} and run_row["status"] != "active":
+            if run_row["workflow_version"] in {1, 2, 3, 4} and run_row["status"] != "active":
                 from orchestrator.workflow import WorkflowConflictError
                 raise WorkflowConflictError("Cannot change a terminal workflow task packet")
-            if run_row["workflow_version"] in {1, 2} and conn.execute(
+            if run_row["workflow_version"] in {1, 2, 3, 4} and conn.execute(
                     "SELECT 1 FROM workflow_steps WHERE run_id=? AND state IN ('integrating','reconciliation_required')", (run_id,)).fetchone():
                 from orchestrator.workflow import WorkflowConflictError
                 raise WorkflowConflictError("Reconcile the in-flight merge before changing its task packet")
+            if run_row["workflow_version"] == 4:
+                from orchestrator.workflow import WorkflowService
+                service = WorkflowService(self)
+                for step in service._steps(run_id):
+                    if 'original_bindings' in step['checkpoint']:
+                        service._revision_boundary(step)
 
             ver_row = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) AS max_ver FROM task_packets WHERE run_id = ?;",
@@ -748,10 +756,14 @@ class Database:
             )
             if run_row["workflow_version"] == 1:
                 conn.execute("UPDATE workflow_steps SET state='planned', packet_version=?, checkpoint_json='{}', revision=revision+1, contract_revision=contract_revision+1 WHERE run_id=?", (next_version, run_id))
-            elif run_row["workflow_version"] == 2:
+            elif run_row["workflow_version"] in {2, 3, 4}:
                 for step in conn.execute("SELECT id,state,checkpoint_json FROM workflow_steps WHERE run_id=?", (run_id,)).fetchall():
                     checkpoint = json.loads(step["checkpoint_json"])
                     retained = {"original_bindings": checkpoint["original_bindings"]} if "original_bindings" in checkpoint else {}
+                    if run_row["workflow_version"] == 4:
+                        retained.update({key: checkpoint[key] for key in ("merge_history", "handoff_history", "handoff_ack_history", "findings", "review_dimensions", "complexity", "execution_kind", "coordinator_local_boundaries", "local_revision_boundaries", "native_observations", "owner_last_dispatch_at", "last_failure_at") if key in checkpoint})
+                        if step['state'] == 'rework':
+                            retained['admission_revision_required'] = True
                     state = step["state"] if step["state"] in {"rework", "needs_decision"} else "planned"
                     conn.execute("UPDATE workflow_steps SET state=?,packet_version=?,checkpoint_json=?,revision=revision+1,contract_revision=contract_revision+1 WHERE id=?",
                                  (state, next_version, _json_dumps(retained, "{}"), step["id"]))

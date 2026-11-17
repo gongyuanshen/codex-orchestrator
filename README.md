@@ -2,7 +2,21 @@
 
 面向 Codex 的自包含多代理编排插件，提供 **`$boost`**（极速模式）、**`$teamwork`**（协同模式）、**`$swarm`**（蜂窝模式）三种显式工作流，底层由本地单例 HTTP/SSE 守护进程、SQLite WAL `#seq` 消息板、`git clone --local` / 三方目录快照隔离工作区（含非破坏性冲突预检）以及极简中文 Web 控制台（`http://127.0.0.1:18790`）提供支撑。
 
-## Route A（0.3.0，已完成本机受控安装）
+## 0.5.0 更新
+
+- **可靠派发：**记录原生代理调用的领取、开始、结果和核对过程，区分“尚未调用”和“结果未知”。
+- **真实验收：**新增命令行采集器 `tri-orchestrator-verify`，保存真实退出码、输出和绑定当前产物的验收回执。
+- **协同交接：**计划准入检查文件冲突，紧凑交接包保留关键状态，结构化审查关联具体发现与返工。
+- **更直接的工作流：**Boost 按任务难度选择执行路径；批量消息和停滞分类帮助协调者处理待办。
+- **兼容升级：**新增工作流版本 4，保留旧任务规则；统一提供 29 个 MCP 工具，数据库版本为 7，并修复 Windows 后台进程启动问题。
+
+主助手仍通过 Codex 原生工具创建和控制代理。插件提供持久记录、工作区、验收和交接；主助手不再协调后，插件不会独立接管旧代理继续运行。
+
+发布与验证记录见 [0.5.0 发布记录](docs/verification/github-050-20261117/report.md)。历史开发记录保留在后文引用的项目文档中。
+
+`tri-orchestrator-verify` 由验收者在终端运行，不通过后台服务执行任意命令。验收命令和工作目录由产物清单冻结，标准输出与错误输出分别保存。
+
+## Route A 历史交付（0.3.0；当前正式版本已升级0.5.0）
 
 正式服务新增可靠收件箱、版本绑定的候选／集成验收、步骤检查点和最多3轮自动返工。原生代理仍由根协调者投递、唤醒和中断；消息回执不是独立验收。
 
@@ -37,7 +51,7 @@ codex plugin add tri-orchestrator@tri-orchestrator
 ```
 
 安装后将自动完成以下过程：
-- Codex 按所选市场版本缓存 `./plugin/`；当前 `main` 为 `0.3.0`，对应缓存 `~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.3.0/`。
+- Codex 按所选市场版本缓存 `./plugin/`；当前版本为 `0.5.0`，对应缓存 `~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.5.0/`。
 - 首次触发 MCP 时，Codex 在插件缓存目录内自动执行 `uv run --quiet --project . python -m orchestrator.mcp_shim`，安装运行时依赖（`mcp`、`starlette`、`uvicorn`、`httpx`）并拉起后台单例守护进程。
 - 若 `~/.codex/agents/*.toml` 中未安装专用角色配置，`$boost`、`$teamwork` 与 `$swarm` 会自动回退为 `default` 子代理并在提示词中内联角色契约。
 
@@ -96,11 +110,11 @@ uv run --quiet --project . python -m orchestrator.mcp_shim
    │  daemon.lock 互斥锁（msvcrt / fcntl）-> 自动拉起唯一后台守护进程
    ▼
 单例 HTTP/SSE 守护进程（127.0.0.1:18790）
-   ├── /api/rpc & /api/tools   ──► RpcDispatcher（27 个 MCP 工具）
+   ├── /api/rpc & /api/tools   ──► RpcDispatcher（29 个 MCP 工具）
    ├── /api/events             ──► EventBus（SSE 实时事件流）
    ├── /                     ──► Boost / Teamwork / Swarm 入口选择
    ├── /boost, /teamwork, /swarm ──► 各模式控制台（共用本地静态资源）
-   ├── Watchdog Loop           ──► 成员心跳超时卡死告警
+   ├── Watchdog Loop           ──► workflow4进展分类/需处理告警；旧合同保留心跳规则
    ├── SQLite WAL Engine       ──► projects、runs、task_packets、workers、
    │                               board_messages（#seq）、read_cursors、workspaces
    └── WorkspaceManager        ──► .swarm-workspaces/<run>-<worker>
@@ -129,7 +143,7 @@ uv run --quiet --project . python -m orchestrator.mcp_shim
 
 ---
 
-## MCP 工具（27 个）
+## MCP 工具（当前源码与正式0.5.0安装版均为29个）
 
 | 分类 | 工具名 | 功能说明 |
 | :--- | :--- | :--- |
@@ -140,12 +154,22 @@ uv run --quiet --project . python -m orchestrator.mcp_shim
 | | `task_packet_get` | 获取指定运行最新（或指定 `version`）的任务契约。 |
 | **消息板 (`#seq`)** | `board_post` | 发布消息、差异或测试报告至指定频道（`main`、`#verify` 等），返回紧凑指针 `{seq, channel, mentions, summary}`。 |
 | | `board_read` | 按 `since_seq` 或 `reader_name` 游标增量读取消息（支持 `advance_cursor=true`）。 |
-| | `board_status` | 返回全员状态、心跳延迟、卡死标记、频道未读计数及最新任务契约。 |
+| | `board_status` | 只读返回成员登记、消息/转交待办、需核对项、计划准备度、恢复上下文、进展分类与任务契约；不隐式ACK或派发。 |
 | | `board_channel_list` | 列出当前运行的活跃频道及消息计数。 |
 | **成员管理** | `worker_register` | 绑定真实 Codex `agent_id` 并注册或更新成员节点（`interviewer`、`planner`、`investigator`、`coder`、`verifier`、`swarm_worker`）。 |
 | | `worker_heartbeat` | 刷新成员心跳时间戳并清除 `stalled_alerted` 告警标记。 |
 | | `worker_status_update` | 变更成员状态（`waiting`、`working`、`stopped`、`killed`）。 |
 | | `worker_control_ack` | 协调者执行原生中断后，提交带真实结果的 applied/failed 回执；只有 applied 原子更新成员状态。 |
+| **转交账本** | `native_action_update` | 根协调者领取/开始/记录/核对原生转交；支持冻结收件人批量，逐消息回执保留。工具自身不调用宿主或完成业务。 |
+| **持久收件箱** | `inbox_send` | 发送绑定收件人和步骤版本的消息，同key同payload幂等。 |
+| | `inbox_get` | 按消息ID读取内容及独立回执历史。 |
+| | `inbox_ack` | 记录accepted/completed/failed或明确取消；消息回执不等于独立验收。 |
+| | `inbox_wait` | 有界异步等待未终态消息，不隐式ACK；已accepted工作需核对而非盲重放。 |
+| **工作流与证据** | `workflow_step_save` | 创建或显式修订冻结步骤；CAS版本检查、原绑定与预算保留，workflow4准入/本地执行合同。 |
+| | `workflow_step_advance` | 按门禁推进、观察、交接/精确ACK或生成本地单次修订边界；不伪造原生调用。 |
+| | `artifact_capture` | 捕获候选/集成源码指纹与冻结命令清单；独立workspace的候选/集成保持完整范围。 |
+| | `verification_record` | 原verifier追加不可变逐项验收及collector证据；仅消息板PASS不能通过门禁。 |
+| | `workflow_review` | 只读challenger记录映射发现；原verifier核实FAIL、驳回或解决，原作者预算不变。 |
 | **隔离工作区** | `workspace_create` | 在 `.swarm-workspaces/` 下创建隔离的 `git clone --local`（或快照）工作区并分配测试端口（`18800..18999`）。 |
 | | `workspace_status` | 返回工作区脏标记、领先提交数及变更文件列表。 |
 | | `workspace_diff` | 返回文件变更状态及统一 Diff 文本。 |

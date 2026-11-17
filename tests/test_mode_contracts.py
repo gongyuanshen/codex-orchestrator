@@ -4,10 +4,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1] / "plugin"
 
 
-def test_all_roles_and_modes_load_both_supported_strict_contracts():
+def test_all_roles_and_modes_load_all_supported_strict_contracts():
     for path in list((ROOT / "agents").glob("*.toml")) + list((ROOT / "skills").glob("*/SKILL.md")):
         text = path.read_text(encoding="utf-8")
-        assert "workflow_version=1 or2" in text, path
+        assert "workflow_version=1/2/3/4" in text, path
     shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
     assert 'artifact_id=candidate["id"]' in shared
     assert 'recipient_agent_id=next_coordinator_agent_id' in shared

@@ -24,19 +24,19 @@ def test_health_advertises_formal_backend_contract(tmp_path):
                 result = (await client.get("/api/health")).json()
                 assert result["software_version"] == __version__
                 assert result["schema_version"] == SCHEMA_VERSION
-                assert {"durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1"} <= set(result["capabilities"])
+                assert {"durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "verification_receipts_v1"} <= set(result["capabilities"])
 
     asyncio.run(check())
 
 
-@pytest.mark.parametrize("fault", ["old", "future_schema", "missing_wait", "wrong_software"])
+@pytest.mark.parametrize("fault", ["old", "future_schema", "missing_wait", "missing_receipts", "wrong_software"])
 def test_incompatible_live_daemon_is_not_restarted(tmp_path, monkeypatch, fault):
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             body = {"status": "ok", "pid": os.getpid(), "port": self.server.server_port,
                     "data_dir": str(tmp_path), "software_version": __version__,
                     "schema_version": SCHEMA_VERSION,
-                    "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"]}
+                    "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2", "native_actions_v1", "verification_receipts_v1", "plan_admission_v1", "compact_handoff_v1", "recipient_groups_v1", "progress_classification_v1", "workflow_reviews_v1"]}
             if fault == "old":
                 for field in ("software_version", "schema_version", "capabilities"):
                     del body[field]
@@ -44,6 +44,8 @@ def test_incompatible_live_daemon_is_not_restarted(tmp_path, monkeypatch, fault)
                 body["schema_version"] += 1
             elif fault == "missing_wait":
                 body["capabilities"].remove("async_inbox_wait_v1")
+            elif fault == "missing_receipts":
+                body["capabilities"].remove("verification_receipts_v1")
             else:
                 body["software_version"] = "0.0.0-old"
             raw = json.dumps(body).encode()
@@ -80,7 +82,7 @@ def test_real_http_fault_is_preserved_without_rpc_replay(tmp_path):
             raw = json.dumps({"status": "ok", "pid": os.getpid(), "port": self.server.server_port,
                               "data_dir": str(tmp_path), "software_version": __version__,
                               "schema_version": SCHEMA_VERSION,
-                              "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2"]}).encode()
+                              "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2", "native_actions_v1", "verification_receipts_v1", "plan_admission_v1", "compact_handoff_v1", "recipient_groups_v1", "progress_classification_v1", "workflow_reviews_v1"]}).encode()
             self.send_response(200)
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()

@@ -103,6 +103,10 @@
     taskPacket: null,
     workflow: null,
     inbox: null,
+    nativeActions: null,
+    progressStatus: null,
+    resumeContext: null,
+    planReadiness: null,
     workers: [],
     controlRequests: [],
     workspaces: [],
@@ -976,6 +980,10 @@
     state.taskPacket = null;
     state.workflow = null;
     state.inbox = null;
+    state.nativeActions = null;
+    state.progressStatus = null;
+    state.resumeContext = null;
+    state.planReadiness = null;
     state.workers = [];
     state.controlRequests = [];
     state.workspaces = [];
@@ -1035,6 +1043,10 @@
     state.run = snap.run;
     state.workflow = snap.workflow ?? null;
     state.inbox = snap.inbox ?? null;
+    state.nativeActions = snap.native_actions ?? null;
+    state.progressStatus = snap.progress_status ?? null;
+    state.resumeContext = snap.resume_context ?? null;
+    state.planReadiness = snap.plan_readiness ?? null;
 
     if (Array.isArray(snap.task_packets) && snap.task_packets.length > 0) {
       const sorted = [...snap.task_packets].sort((a, b) => Number(b.version || 0) - Number(a.version || 0));
@@ -1153,6 +1165,7 @@
           break;
         case 'workflow_updated':
         case 'inbox_updated':
+        case 'native_action_updated':
           refreshSnapshot(runId, { silent: true });
           break;
         case 'stall_alert':
@@ -1173,6 +1186,7 @@
       'stall_alert',
       'workflow_updated',
       'inbox_updated',
+      'native_action_updated',
     ];
     for (const evtName of namedEvents) {
       es.addEventListener(evtName, (evt) => handleEvent(evtName, evt.data));
@@ -1941,11 +1955,51 @@
     return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(step.step_key)}">${escapeHtml(step.step_key)}</span><span class="pill-badge ${attention ? 'tint-warning' : step.state === 'done' ? 'tint-success' : 'tint-muted'}">${escapeHtml(labelWorkflowState(step.state))}</span><span class="muted-caption tabular">返工 ${escapeHtml(step.attempt)} / 3</span></li>`;
   }
 
+  function renderProgressStatus() {
+    if (state.run.workflow_version !== 4) return '';
+    const progress = state.progressStatus;
+    const heading = '<div class="overview-section-heading"><h2>当前推进</h2></div>';
+    if (progress === null) return `<section class="overview-section">${heading}<p class="muted-caption">推进状态未加载，请同步后查看。</p></section>`;
+    const labels = {ready: '有可推进事项', completed: '步骤已完成', inactive: '任务非活动', normal_wait: '正常等待', dependency_wait: '等待前序步骤', user_decision: '等待用户决策', needs_reconciliation: '需要核对', host_unknown: '需要观察宿主状态', no_progress: '无可执行推进'};
+    const label = labels[progress.classification] || `未识别推进状态：${progress.classification}`;
+    const blockers = progress.blockers.map((item) => `<li>${escapeHtml(item.reason)}</li>`).join('');
+    return `<section class="overview-section" aria-label="当前推进与协调待办">${heading}<p>${escapeHtml(label)}${progress.coordinator_required ? ' · 等待协调者处理' : ''}</p><p class="muted-caption">依据登记事实判断，不代表宿主实时状态；心跳过期只要求观察，不会自动唤醒成员。</p>${blockers ? `<details class="workflow-blockers" data-overview-detail="progress-blockers" ${state.overviewExpanded.has('progress-blockers') ? 'open' : ''}><summary>查看 ${progress.blockers.length} 项阻塞依据</summary><ul>${blockers}</ul></details>` : ''}</section>`;
+  }
+
+  function renderResumeContext() {
+    if (state.run.workflow_version !== 4) return '';
+    const context = state.resumeContext;
+    const plan = state.planReadiness;
+    const heading = '<div class="overview-section-heading"><h2>计划与交接</h2></div>';
+    if (context === null || plan === null) return `<section class="overview-section">${heading}<p class="muted-caption">交接投影未加载，请同步后查看。</p></section>`;
+    const handoffs = context.handoffs.map((item) => `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(item.digest)}">${escapeHtml(item.digest)}</span><span class="pill-badge ${item.current ? 'tint-muted' : 'tint-warning'}">${item.current ? (item.acknowledged ? '交接包已确认' : '交接包待确认') : '交接包已过期'}</span><span class="muted-caption">${escapeHtml(item.recipient_agent_id)}</span></li>`).join('');
+    const references = [...context.artifact_refs, ...context.verification_refs].map((item) => `<li>${escapeHtml(item.id)}</li>`).join('');
+    return `<section class="overview-section" aria-label="计划准备度和交接包">${heading}<div class="workflow-delivery tabular"><span>未覆盖验收项 ${plan.uncovered_criteria.length}</span><span>范围冲突 ${plan.ownership_conflicts.length}</span><span>未处置业务消息 ${context.unresolved.inbox.length}</span><span>待处理控制 ${context.unresolved.controls.length}</span><span>未决转交 ${context.unresolved.native_actions.length}</span></div><p class="muted-caption">准备度提示不阻止创建合法草案；原协调者仍掌握旧子代理生命周期，接手不等于继承原生身份。</p><details class="workflow-more" data-overview-detail="resume-context" ${state.overviewExpanded.has('resume-context') ? 'open' : ''}><summary>交接包、证据引用与不得执行的操作</summary><p class="muted-caption">冻结任务包 ${escapeHtml(context.frozen_packet_id)} · 当前事实摘要 ${escapeHtml(context.facts_digest)}</p>${handoffs ? `<ul class="workflow-steps">${handoffs}</ul>` : '<p class="muted-caption">尚未建立交接包。</p>'}<ul>${plan.uncovered_criteria.map((item) => `<li>未覆盖：${escapeHtml(item)}</li>`).join('')}${plan.ownership_conflicts.map((item) => `<li>范围冲突：${escapeHtml(item.step_id)} / ${escapeHtml(item.other_step_id)} · ${escapeHtml(item.paths.join(' / '))}</li>`).join('')}${references}${context.forbidden_actions.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></details></section>`;
+  }
+
+  function renderLocalReceipts() {
+    if (![3, 4].includes(state.run.workflow_version)) return '';
+    const artifacts = state.workflow.artifacts.filter((item) => item.evidence_level === 'local_collector_v1');
+    const rows = artifacts.slice(0, 3).map((artifact) => {
+      const records = state.workflow.verifications.filter((record) => record.artifact_id === artifact.id);
+      const evidenceCount = records.reduce((total, record) => total + record.evidence_manifest.length, 0);
+      return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(artifact.id)}">${escapeHtml(artifact.id)}</span><span class="pill-badge tint-muted">${escapeHtml(artifact.scope)} · ${escapeHtml(artifact.verification_command_count)} 条冻结命令</span><span class="muted-caption">${records.length} 次验收登记 · 登记证据文件 ${evidenceCount}</span></li>`;
+    }).join('');
+    return `<p class="muted-caption">本地采集 · local_collector_v1：不是宿主身份认证；冻结清单不表示采集已完成，登记证据也不表示当前有效。门禁使用时重新核对。</p>${artifacts.length ? `<details class="workflow-more" data-overview-detail="local-receipts" ${state.overviewExpanded.has('local-receipts') ? 'open' : ''}><summary>已冻结 ${artifacts.length} 份采集清单（展开查看登记摘要）</summary><ul class="workflow-steps">${rows}</ul>${artifacts.length > 3 ? `<p class="muted-caption">另有 ${artifacts.length - 3} 份清单；概况仅展示前 3 份，不加载原始日志。</p>` : ''}</details>` : '<p class="muted-caption">尚未登记本地采集清单。</p>'}`;
+  }
+
+  function renderReviewDimensions() {
+    if (state.run.workflow_version !== 4) return '';
+    const reviews = state.workflow.steps.flatMap((step) => Object.entries(step.checkpoint?.review_dimensions || {}).map(([id, dimensions]) => ({id, dimensions})));
+    const rows = reviews.map(({id, dimensions}) => `<li>${escapeHtml(id)} · 规格检查：${escapeHtml(dimensions.specification)} · 代码正确性：${escapeHtml(dimensions.code)} · 压力与反例：${escapeHtml(dimensions.stress)} · 证据检查：${escapeHtml(dimensions.evidence)}</li>`).join('');
+    return `<p class="muted-caption">分项审查由原验收者记录；项目目标达成仍需最终集成门禁，不等于多角色独立审查。</p>${reviews.length ? `<details class="workflow-more" data-overview-detail="review-dimensions" ${state.overviewExpanded.has('review-dimensions') ? 'open' : ''}><summary>规格、代码、反例与证据检查（${reviews.length} 份）</summary><ul>${rows}</ul></details>` : '<p class="muted-caption">尚未记录分项审查。</p>'}`;
+  }
+
   function renderWorkflowSummary() {
     const version = state.run.workflow_version;
-    const versionLabel = version === 0 ? '旧流程，未启用结构化门禁' : [1, 2].includes(version) ? `结构化门禁 · v${version}` : '流程版本未记录';
+    const versionLabel = version === 0 ? '旧流程，未启用结构化门禁' : [1, 2, 3, 4].includes(version) ? `结构化门禁 · v${version}` : '流程版本未记录';
     const heading = `<div class="overview-section-heading"><h2>流程与验收</h2><span class="pill-badge tint-muted">${versionLabel}</span></div>`;
-    if (![1, 2].includes(version)) return `<section class="overview-section workflow-overview">${heading}</section>`;
+    if (![1, 2, 3, 4].includes(version)) return `<section class="overview-section workflow-overview">${heading}</section>`;
     if (state.workflow === null) return `<section class="overview-section workflow-overview">${heading}<p class="workflow-warning" role="status">结构化流程数据未加载，请同步后查看门禁状态。</p></section>`;
     const { steps, verifications, blockers } = state.workflow;
     // Keep urgent/current steps ahead of completed history without hiding any step.
@@ -1955,7 +2009,7 @@
     const more = ordered.length > 3 ? `<details class="workflow-more" data-overview-detail="workflow-more" ${state.overviewExpanded.has('workflow-more') ? 'open' : ''}><summary>其余 ${ordered.length - 3} 个步骤</summary><ul class="workflow-steps">${ordered.slice(3).map(renderWorkflowStep).join('')}</ul></details>` : '';
     const blockerLabels = blockers.map((blocker) => `${steps.find((step) => step.id === blocker.step_id).step_key}：${labelWorkflowState(blocker.state)}`);
     const blocking = blockerLabels.length ? `<details class="workflow-blockers" data-overview-detail="workflow-blockers" ${state.overviewExpanded.has('workflow-blockers') ? 'open' : ''}><summary class="workflow-warning">${escapeHtml(blockerLabels[0])}${blockers.length > 1 ? `（共 ${blockers.length} 项阻塞，展开查看）` : '（展开查看）'}</summary><ul>${blockerLabels.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}</ul></details>` : '<p class="muted-caption">流程记录暂无阻塞；最终完成仍由后端核对当前产物与验收证据。</p>';
-    return `<section class="overview-section workflow-overview" aria-label="结构化流程与收件状态">${heading}${delivery}<p class="muted-caption">回执不等于独立验收 · 已记录 ${verifications.length} 次验收，是否有效由当前门禁核对。</p>${blocking}${ordered.length ? `<ul class="workflow-steps">${ordered.slice(0, 3).map(renderWorkflowStep).join('')}</ul>${more}` : '<p class="muted-caption">尚未建立工作步骤，不能据此认定任务已验收。</p>'}</section>`;
+    return `<section class="overview-section workflow-overview" aria-label="结构化流程与收件状态">${heading}${delivery}<p class="muted-caption">回执不等于独立验收 · 已记录 ${verifications.length} 次验收，是否有效由当前门禁核对。</p>${renderLocalReceipts()}${renderReviewDimensions()}${blocking}${ordered.length ? `<ul class="workflow-steps">${ordered.slice(0, 3).map(renderWorkflowStep).join('')}</ul>${more}` : '<p class="muted-caption">尚未建立工作步骤，不能据此认定任务已验收。</p>'}</section>`;
   }
 
   function hostObservation(worker) {
@@ -1997,6 +2051,31 @@
           </button>`;
   }
 
+  function renderNativeActions() {
+    const projection = state.nativeActions;
+    const heading = '<h2>原生转交</h2>';
+    if (projection === null) return `<section class="overview-section workflow-overview">${heading}<p class="muted-caption">转交投影未加载，请同步后查看。</p></section>`;
+    const { counts, next_actions, needs_reconciliation, needs_clarification } = projection;
+    const lowerBound = projection.counts_complete ? '' : '≥';
+    const rows = [
+      ...next_actions.map((item) => ({ item, label: '等待转交' })),
+      ...needs_reconciliation.map((item) => ({ item, label: '需核对' })),
+      ...needs_clarification.map((item) => ({ item, label: '待澄清' })),
+    ];
+    const ledger = rows.map(({ item, label }) => {
+      const description = item.reason || item.source?.summary || item.action_type || item.status || '';
+      const identity = `${item.source_type} · ${item.source_id}${item.action_id ? ` · ${item.action_id}` : ''}${item.seq != null ? ` · #${item.seq}` : ''}`;
+      return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(description)}">${escapeHtml(item.recipient || '收件人待澄清')} · ${escapeHtml(description)}</span><span class="pill-badge ${label === '等待转交' ? 'tint-muted' : 'tint-warning'}">${label}</span><span class="muted-caption">${escapeHtml(identity)}</span></li>`;
+    }).join('');
+    return `<section class="overview-section workflow-overview" aria-label="原生转交登记与待核对项">
+      <div class="overview-section-heading">${heading}</div>
+      <div class="workflow-delivery tabular"><span>等待转交 ${lowerBound}${escapeHtml(projection.next_actions_count)}</span><span>已转交 ${escapeHtml(counts.confirmed)}</span><span>需核对 ${lowerBound}${escapeHtml(projection.needs_reconciliation_count)}</span><span>待澄清 ${lowerBound}${escapeHtml(projection.needs_clarification_count)}</span></div>
+      <p class="muted-caption">领取中 ${escapeHtml(counts.claimed)} · 调用中 ${escapeHtml(counts.invoking)} · 转交失败 ${escapeHtml(counts.failed)} · 已取消 ${escapeHtml(counts.cancelled)}</p>
+      <p class="muted-caption">转交登记不代表宿主实时状态；已转交不等于业务完成或独立验收。需核对项不会自动重放。</p>
+      <details class="workflow-more" data-overview-detail="native-ledger" ${state.overviewExpanded.has('native-ledger') ? 'open' : ''}><summary>转交账本与待办明细（本次 ${rows.length} 项${projection.native_actions_has_more ? '，有更多记录' : ''}）</summary><p class="muted-caption">每类最多 ${escapeHtml(projection.limit)} 项；${projection.counts_complete ? '待办计数完整。' : '待办计数为当前查询下界，不代表完整总数。'}转交状态计数来自账本。</p>${rows.length ? `<ul class="workflow-steps">${ledger}</ul>` : '<p class="muted-caption">当前没有等待转交、需核对或待澄清项。</p>'}</details>
+    </section>`;
+  }
+
   function renderOverview() {
     const focused = el.overviewContent.contains(document.activeElement) ? document.activeElement : null;
     const focusKey = ['id', 'data-action', 'data-view', 'data-open-seq', 'data-worker-id'].find((key) => focused?.getAttribute(key) != null);
@@ -2028,6 +2107,9 @@
         <p class="muted-caption">状态与工作内容来自登记记录；不代表代理当前在线或执行进度。</p>
       </section>
       ${renderWorkflowSummary()}
+      ${renderProgressStatus()}
+      ${renderResumeContext()}
+      ${renderNativeActions()}
       <div class="overview-columns">
       <section class="overview-section">
         <div class="overview-section-heading"><h2>成员分工</h2><button type="button" class="btn btn-ghost btn-xs" data-view="members">查看任务包与全部成员</button></div>

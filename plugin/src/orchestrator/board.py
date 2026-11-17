@@ -324,10 +324,18 @@ class BoardService:
         counts = dict.fromkeys(('pending', 'accepted', 'completed', 'failed', 'cancelled'), 0)
         counts.update({row['status']: row['n'] for row in inbox_rows})
 
+        from orchestrator.native_actions import NativeActionStore
+        from orchestrator.watchdog import classify_run
+        native = NativeActionStore(self.db).project(run_id)
         return {
+            **native,
+            "native_actions": native,
             "run": run,
             "run_id": run_id,
             "workflow": WorkflowService(self.db).summary(run_id),
+            "plan_readiness": WorkflowService(self.db).plan_readiness(run_id),
+            "resume_context": WorkflowService(self.db).resume_context(run_id),
+            "progress_status": classify_run(self.db, run_id, now=ts),
             "inbox": {"counts": counts, "blocking_count": blocking},
             "latest_seq": latest_seq,
             "reader_name": effective_reader,

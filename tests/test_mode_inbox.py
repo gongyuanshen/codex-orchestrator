@@ -18,6 +18,7 @@ def linked(tmp_path):
     db = Database(settings=Settings(data_dir=tmp_path / "state"))
     board = BoardService(db)
     run = db.create_run(mode="swarm", title="Linked inbox", project_root=tmp_path)
+    db.connect().execute("UPDATE runs SET workflow_version=2 WHERE id=?", (run["id"],))
     db.save_task_packet(run["id"], title="Frozen", goal="one work item",
                         file_ownership={"author": ["source.txt"], "other": ["source.txt"]},
                         acceptance_criteria=["output"])
@@ -264,6 +265,7 @@ def test_real_workflow2_rpc_wait_receive_rework_and_stale_wait_cleanup(tmp_path)
                     assert result.status_code == 200, result.text
                     return result.json()["result"]
                 run = await rpc("run_create", mode="swarm", title="Full2 transport", project_root=str(tmp_path))
+                app.state.db.connect().execute("UPDATE runs SET workflow_version=2 WHERE id=?", (run["id"],))
                 await rpc("task_packet_save", run_id=run["id"], title="frozen", goal="work",
                           file_ownership={"author": ["source.txt"]}, acceptance_criteria=["output"])
                 for name, role in (("author", "coder"), ("verifier", "verifier")):
