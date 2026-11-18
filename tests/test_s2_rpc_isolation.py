@@ -1,0 +1,292 @@
+"""S2 regression scenarios for run attribution and lifecycle isolation."""
+
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import subprocess
+from threading import Barrier
+
+import pytest
+from starlette.testclient import TestClient
+
+from orchestrator import codex_bridge, db as db_module
+from orchestrator.board import BoardService
+from orchestrator.config import Settings
+from orchestrator.daemon import create_app
+from orchestrator.db import Database
+from orchestrator.rpc_handlers import INTERNAL_RPC_DEFINITIONS, RpcDispatcher, TOOL_DEFINITIONS
+from orchestrator.workspace_mgr import WORKSPACES_DIRNAME, WorkspaceManager
+
+
+@pytest.fixture
+def env(tmp_path, monkeypatch):
+    # The live Codex home must not supply metadata to an isolated fixture.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "unused-codex-home"))
+    project = tmp_path / "root-project"
+    project.mkdir()
+    settings = Settings(data_dir=tmp_path / "data", port_range=(29100, 29130))
+    with Database(settings=settings) as db:
+        dispatcher = RpcDispatcher(db, BoardService(db, settings), WorkspaceManager(db, settings))
+
+        def rpc(tool, **kwargs):
+            return dispatcher.dispatch(tool, kwargs)
+
+        yield project, db, rpc
+
+
+def _git(path, *args):
+    subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)
+
+
+def _turn(rpc, session, turn, cwd, *, invoked=False):
+    return rpc(
+        "session_hook_check", session_id=session, event_name="UserPromptSubmit",
+        cwd=str(cwd), turn_id=turn, prompt_preview=f"preview {turn}", has_mode_invocation=invoked,
+    )
+
+
+def _run(rpc, root, session, **extra):
+    return rpc("run_create", mode="swarm", title=session, project_root=str(root), session_id=session, **extra)
+
+
+def _codex_project(monkeypatch, root):
+    project = {"project_id": "codex-main", "name": "Codex Main", "root_path": str(root)}
+    monkeypatch.setattr(codex_bridge, "list_codex_projects", lambda: [project])
+    return project
+
+
+def test_s2_wire_schemas_retained_strict_and_extended():
+    fields_by_tool = [
+        (TOOL_DEFINITIONS, "run_create", {"turn_id": "string", "trigger_prompt": "string", "execution_root": "string"}),
+        (INTERNAL_RPC_DEFINITIONS, "session_hook_check", {"turn_id": "string", "prompt_preview": "string", "has_mode_invocation": "boolean"}),
+    ]
+    for definitions, name, fields in fields_by_tool:
+        schema = next(tool["inputSchema"] for tool in definitions if tool["name"] == name)
+        assert schema["additionalProperties"] is False
+        assert not set(fields).intersection(schema["required"])
+        assert {key: schema["properties"][key]["type"] for key in fields if key in schema["properties"]} == fields
+
+
+def test_t3_tracks_three_runs_and_continuation_under_one_project(env, monkeypatch):
+    root, db, rpc = env
+    _git(root, "init")
+    parent = db.ensure_project(root, is_git=True)
+    codex = _codex_project(monkeypatch, root)
+    session = "thread"
+    slices = [root / "artifacts" / f"iteration-{i}" / "slice" for i in range(1, 4)]
+    for path in slices:
+        path.mkdir(parents=True)
+
+    assert not _turn(rpc, "ordinary", "turn-1", root)["bound"]
+    assert db.list_session_turns("ordinary") == []
+    runs = []
+    for i, path in enumerate(slices, 1):
+        turn_id = f"turn-{i}"
+        previous_run = runs[-1]["id"] if runs else None
+        check = _turn(rpc, session, turn_id, path, invoked=True)
+        assert check["run_id"] == previous_run
+        latest = db.list_session_turns(session)[0]
+        assert (latest["turn_id"], latest["cwd"], latest["active_run_id"]) == (turn_id, str(path), previous_run)
+        run = _run(rpc, path, session, project_name=path.name)
+        runs.append(run)
+        assert run["turn_id"] == turn_id
+        assert run["trigger_prompt"] == f"preview {turn_id}"
+        assert run["execution_root"] == str(path)
+        assert run["project_id"] == parent["id"]
+    assert [run["session_seq"] for run in runs] == [1, 2, 3]
+    assert len(db.list_projects()) == 1
+    project = db.get_project(parent["id"])
+    assert project["is_git"]
+    assert (project["codex_project_id"], project["codex_project_name"], project["name"]) == (
+        codex["project_id"], codex["name"], codex["name"],
+    )
+
+    _turn(rpc, session, "turn-4-continuation", root)
+    assert len(db.list_runs()) == 3
+    turns = db.list_session_turns(session)
+    assert [turn["turn_id"] for turn in turns] == ["turn-4-continuation", "turn-3", "turn-2", "turn-1"]
+    assert turns[0]["active_run_id"] == runs[-1]["id"]
+    assert turns[0]["prompt_preview"] == "preview turn-4-continuation"
+
+
+def test_t3_infers_project_honors_explicit_fields_and_keeps_nested_git_independent(env, monkeypatch):
+    root, db, rpc = env
+    codex = _codex_project(monkeypatch, root)
+    nested = root / "artifacts" / "local-repo"
+    nested.mkdir(parents=True)
+    _git(nested, "init")
+    outside = root.parent / "root-project-sibling"
+    outside.mkdir()
+    threads = {
+        "inferred": {
+            "cwd": str(nested), "codex_project_root": str(root),
+            "codex_project_id": codex["project_id"], "codex_project_name": codex["name"],
+        },
+        "cwd-only": {
+            "cwd": str(outside), "codex_project_root": None,
+            "codex_project_id": None, "codex_project_name": None,
+        },
+    }
+    monkeypatch.setattr(codex_bridge, "get_thread_meta", threads.get)
+    db.upsert_session_turn("inferred", "seen", cwd=str(root), prompt_preview="stored preview")
+    inferred = rpc(
+        "run_create", mode="swarm", title="inferred", session_id="inferred",
+        turn_id="explicit-turn", trigger_prompt="full prompt", execution_root=str(nested),
+    )
+    project = db.get_project(inferred["project_id"])
+    assert (project["root_path"], project["codex_project_id"], project["name"]) == (
+        str(root), codex["project_id"], codex["name"],
+    )
+    assert (inferred["turn_id"], inferred["trigger_prompt"], inferred["execution_root"]) == (
+        "explicit-turn", "full prompt", str(nested),
+    )
+    by_id = rpc("run_create", mode="swarm", title="by id", project_id=project["id"], session_id="inferred")
+    assert (by_id["project_id"], by_id["turn_id"], by_id["trigger_prompt"]) == (project["id"], "seen", "stored preview")
+
+    nested_run = _run(rpc, nested, "independent", is_git=False, project_name="Local Git")
+    local = db.get_project(nested_run["project_id"])
+    assert nested_run["execution_root"] == ""
+    assert local["id"] != project["id"]
+    assert (local["root_path"], local["name"], local["codex_project_id"]) == (
+        str(nested), "Local Git", codex["project_id"],
+    )
+    outside_run = rpc("run_create", mode="swarm", title="cwd only", session_id="cwd-only")
+    assert db.get_project(outside_run["project_id"])["root_path"] == str(outside)
+
+
+def test_t3_uses_deepest_registered_workspace_without_codex_metadata(env, monkeypatch):
+    root, db, rpc = env
+    parent = root / "nested-parent"
+    trial = parent / "slice"
+    trial.mkdir(parents=True)
+    original_classify = db_module.classify_project_kind
+
+    # Pytest stores this example in temp; model the project roots' persisted workspace classification.
+    roots = {str(root), str(parent)}
+    monkeypatch.setattr(db_module, "classify_project_kind",
+                        lambda path: "workspace" if str(path) in roots else original_classify(path))
+    db.ensure_project(root)
+    project = db.ensure_project(parent, name="Registered parent", codex_project_id="external-id",
+                                codex_project_name="Previously linked")
+    run = _run(rpc, trial, "real-project", project_name=trial.name)
+    assert run["project_id"] == project["id"]
+    assert run["execution_root"] == str(trial)
+    assert db.get_project(project["id"])["name"] == "Previously linked"
+    assert db_module.classify_project_kind("G:/repo/docs/verification/stage/fixture-project") == "fixture"
+
+
+@pytest.mark.parametrize("git", [False, True], ids=["snapshot", "git-clone"])
+def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypatch, git):
+    root, db, rpc = env
+    execution = root / "artifacts" / "slice"
+    execution.mkdir(parents=True)
+    (execution / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    if git:
+        _git(root, "init")
+        _git(root, "add", "artifacts")
+        _git(root, "-c", "user.email=test@example.test", "-c", "user.name=Test", "commit", "-m", "seed")
+    _codex_project(monkeypatch, root)
+    run = _run(rpc, execution, "workspace")
+    run_id = run["id"]
+    assert run["execution_root"] == str(execution)
+    direct = rpc("workspace_create", run_id=run_id, worker_name="direct", dep_mode="none", copy_env=False)
+    rpc(
+        "task_packet_save", run_id=run_id, title="Fixture", goal="Verify dispatch location",
+        file_ownership={"dispatched": ["app.py"]}, acceptance_criteria=["location"],
+    )
+    prep = rpc(
+        "workflow_prepare_dispatch", run_id=run_id, create_workspace=True, dep_mode="none",
+        copy_env=False, owner="dispatched", task_name="dispatched", verifier="verifier",
+        step_key="dispatch", instruction="Test location",
+    )
+    workspace = prep["workspace"]
+    assert Path(direct["path"]).parent == Path(workspace["path"]).parent == execution / WORKSPACES_DIRNAME
+    assert workspace["mode"] == ("git_clone" if git else "snapshot")
+    relative = (execution.relative_to(root) if git else Path()) / "app.py"
+    assert (Path(workspace["path"]) / relative).read_text(encoding="utf-8") == "VALUE = 1\n"
+
+    outside = root.parent / "elsewhere" / WORKSPACES_DIRNAME / "unrelated"
+    outside.mkdir(parents=True)
+    unrelated = db.create_workspace(run_id, "unrelated", path=outside, mode="snapshot")
+    legacy_path = root / WORKSPACES_DIRNAME / "previous"
+    legacy_path.mkdir(parents=True, exist_ok=True)
+    legacy = db.create_workspace(run_id, "previous", path=legacy_path, mode="snapshot")
+    opens = []
+    monkeypatch.setattr("orchestrator.daemon._launch_explorer", opens.append)
+    app = create_app(db.settings, db=db, start_watchdog=False, manage_pid_file=False)
+    with TestClient(app) as client:
+        assert client.post(f"/api/workspaces/{workspace['id']}/open-explorer", json={}).status_code == 200
+        assert client.post(f"/api/workspaces/{legacy['id']}/open-explorer", json={}).status_code == 200
+        assert client.post(f"/api/workspaces/{unrelated['id']}/open-explorer", json={}).status_code == 403
+    assert opens == [Path(workspace["path"]), legacy_path]
+
+
+def test_t4_concurrent_sessions_have_independent_runs_and_agents(env):
+    root, db, rpc = env
+    start = Barrier(2)
+
+    def create(session):
+        turn_id = f"turn-{session}"
+        _turn(rpc, session, turn_id, root, invoked=True)
+        start.wait(timeout=5)
+        run = _run(rpc, root, session)
+        rpc("worker_register", run_id=run["id"], name="coder", role="swarm_worker", agent_id=f"/root/{session}")
+        return run
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        run_a, run_b = list(pool.map(create, ["session_a", "session_b"]))
+    assert run_a["id"] != run_b["id"]
+    assert run_a["project_id"] == run_b["project_id"]
+    for session, run in [("session_a", run_a), ("session_b", run_b)]:
+        assert run["turn_id"] == f"turn-{session}"
+        assert run["session_seq"] == 1
+        assert [binding["run_id"] for binding in db.list_session_bindings(session)] == [run["id"]]
+        assert db.get_worker_by_name(run["id"], "coder")["agent_id"] == f"/root/{session}"
+        _turn(rpc, session, "continuation", root)
+        assert db.list_session_turns(session)[0]["active_run_id"] == run["id"]
+
+
+def test_t5_stop_walks_only_matching_active_runs_and_dedupes_per_binding(env, monkeypatch):
+    root, db, rpc = env
+    a1, a2, b1, b2 = [_run(rpc, root, session)["id"] for session in ("a", "a", "b", "b")]
+    # Seed a completed legacy Run without constructing an unrelated workflow's verification gates.
+    db.connect().execute("UPDATE runs SET workflow_version=0 WHERE id=?", (a1,))
+    db.update_run(a1, status="completed")
+    db.upsert_session_binding("a", a1)  # A later touch must not resurrect a completed Run.
+    db.upsert_session_binding("b", b1, is_primary=False)
+    for run_id in (a2, b1, b2):
+        rpc("worker_register", run_id=run_id, name="coder", role="swarm_worker", agent_id=f"/root/{run_id}")
+        rpc(
+            "board_post", run_id=run_id, sender="human", sender_role="human", channel="human",
+            msg_type="human", mentions=["coder"], summary="pending", body_md="@coder continue",
+        )
+    seen = []
+    original = BoardService.board_status
+
+    def record(self, run_id, *args, **kwargs):
+        seen.append(run_id)
+        return original(self, run_id, *args, **kwargs)
+
+    monkeypatch.setattr(BoardService, "board_status", record)
+
+    def stop(session, cwd=root):
+        return rpc("session_hook_check", session_id=session, event_name="Stop", cwd=str(cwd), mark_stop_blocked=True)
+
+    assert not stop("a", root.parent)["should_block_stop"]
+    assert not stop("a", root / WORKSPACES_DIRNAME / "isolated")["should_block_stop"]
+    seen.clear()
+    a_stop = stop("a")
+    assert a_stop["should_block_stop"] and a_stop["run_id"] == a2
+    assert seen == [a2]
+    assert not any(db.get_session_binding("b", run_id)["last_stop_blocked_key"] for run_id in (b1, b2))
+    assert db.get_session_binding("a", a1)["last_stop_blocked_key"] is None
+    assert not stop("a")["should_block_stop"]  # B's pending Runs are not candidates for A.
+
+    answers = [stop("b"), stop("b")]
+    assert [answer["run_id"] for answer in answers] == [b2, b1]
+    assert all(answer["should_block_stop"] for answer in answers)
+    assert answers[0]["blocked_key"] != answers[1]["blocked_key"]
+    for answer in answers:
+        assert db.get_session_binding("b", answer["run_id"])["last_stop_blocked_key"] == answer["blocked_key"]
+    assert db.get_session_binding("a", a2)["last_stop_blocked_key"] == a_stop["blocked_key"]
+    assert not stop("b")["should_block_stop"]
+
