@@ -1,8 +1,8 @@
 """S2 regression scenarios for run attribution and lifecycle isolation."""
 
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 import subprocess
+from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -106,6 +106,13 @@ def test_t3_tracks_three_runs_and_continuation_under_one_project(env, monkeypatc
     assert [turn["turn_id"] for turn in turns] == ["turn-4-continuation", "turn-3", "turn-2", "turn-1"]
     assert turns[0]["active_run_id"] == runs[-1]["id"]
     assert turns[0]["prompt_preview"] == "preview turn-4-continuation"
+    _turn(rpc, session, "return-to-first-slice", slices[0])
+    assert db.list_session_turns(session)[0]["active_run_id"] == runs[0]["id"]
+
+    _turn(rpc, "history-only", "invoked", root, invoked=True)
+    _turn(rpc, "history-only", "passive", root)
+    assert [row["turn_id"] for row in db.list_session_turns("history-only")] == ["passive", "invoked"]
+    assert db.list_session_bindings("history-only") == []
 
 
 def test_t3_infers_project_honors_explicit_fields_and_keeps_nested_git_independent(env, monkeypatch):
@@ -188,6 +195,18 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
     run = _run(rpc, execution, "workspace")
     run_id = run["id"]
     assert run["execution_root"] == str(execution)
+    # A post-create admission failure must roll back its empty directory as well as DB rows.
+    wrong_mode = "snapshot" if git else "git_clone"
+    with pytest.raises(ValueError, match="workspace_base_mode"):
+        rpc(
+            "workflow_prepare_dispatch", run_id=run_id, create_workspace=True,
+            workspace_base_mode=wrong_mode, dep_mode="none", copy_env=False,
+            owner="rollback", task_name="rollback", verifier="verifier",
+            step_key="rollback", instruction="Test rollback",
+        )
+    assert not (execution / WORKSPACES_DIRNAME).exists()
+    assert db.list_workspaces(run_id=run_id) == []
+
     direct = rpc("workspace_create", run_id=run_id, worker_name="direct", dep_mode="none", copy_env=False)
     rpc(
         "task_packet_save", run_id=run_id, title="Fixture", goal="Verify dispatch location",
@@ -210,14 +229,23 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
     legacy_path = root / WORKSPACES_DIRNAME / "previous"
     legacy_path.mkdir(parents=True, exist_ok=True)
     legacy = db.create_workspace(run_id, "previous", path=legacy_path, mode="snapshot")
+    # The legacy RPC also accepts an explicit workspace source override; its manifest
+    # records the authorized base rather than trusting any path named .swarm-workspaces.
+    explicit_source = root.parent / "separate-source"
+    explicit_source.mkdir()
+    explicit = rpc(
+        "workspace_create", run_id=run_id, worker_name="explicit", project_root=str(explicit_source),
+        dep_mode="none", copy_env=False,
+    )
     opens = []
     monkeypatch.setattr("orchestrator.daemon._launch_explorer", opens.append)
     app = create_app(db.settings, db=db, start_watchdog=False, manage_pid_file=False)
     with TestClient(app) as client:
         assert client.post(f"/api/workspaces/{workspace['id']}/open-explorer", json={}).status_code == 200
         assert client.post(f"/api/workspaces/{legacy['id']}/open-explorer", json={}).status_code == 200
+        assert client.post(f"/api/workspaces/{explicit['id']}/open-explorer", json={}).status_code == 200
         assert client.post(f"/api/workspaces/{unrelated['id']}/open-explorer", json={}).status_code == 403
-    assert opens == [Path(workspace["path"]), legacy_path]
+    assert opens == [Path(workspace["path"]), legacy_path, Path(explicit["path"])]
 
 
 def test_t4_concurrent_sessions_have_independent_runs_and_agents(env):
@@ -289,4 +317,26 @@ def test_t5_stop_walks_only_matching_active_runs_and_dedupes_per_binding(env, mo
         assert db.get_session_binding("b", answer["run_id"])["last_stop_blocked_key"] == answer["blocked_key"]
     assert db.get_session_binding("a", a2)["last_stop_blocked_key"] == a_stop["blocked_key"]
     assert not stop("b")["should_block_stop"]
+
+
+def test_t5_stop_skips_other_roots_in_one_session_and_marks_by_default(env):
+    root, db, rpc = env
+    other = root.parent / "other-project"
+    other.mkdir()
+    run_root, run_other = [_run(rpc, cwd, "same-session")["id"] for cwd in (root, other)]
+    for run_id in (run_root, run_other):
+        rpc("worker_register", run_id=run_id, name="coder", role="swarm_worker", agent_id=f"/root/{run_id}")
+        rpc(
+            "board_post", run_id=run_id, sender="human", sender_role="human", channel="human",
+            msg_type="human", mentions=["coder"], summary="pending", body_md="@coder continue",
+        )
+
+    def stop():
+        return rpc("session_hook_check", session_id="same-session", event_name="Stop", cwd=str(root))
+
+    result = stop()
+    assert result["should_block_stop"] and result["run_id"] == run_root
+    assert db.get_session_binding("same-session", run_root)["last_stop_blocked_key"] == result["blocked_key"]
+    assert db.get_session_binding("same-session", run_other)["last_stop_blocked_key"] is None
+    assert not stop()["should_block_stop"]
 

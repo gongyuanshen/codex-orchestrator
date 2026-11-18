@@ -351,8 +351,8 @@ class WorkspaceManager:
         run = self.db.get_run(run_id)
         if run is None:
             raise NotFoundError(f"Run not found: {run_id}")
-        if project_root is not None:
-            root = Path(project_root).resolve(strict=False)
+        if project_root is not None or run["execution_root"]:
+            root = Path(project_root if project_root is not None else run["execution_root"]).resolve(strict=False)
         else:
             project = self.db.get_project(run["project_id"])
             if project is None:
@@ -591,7 +591,7 @@ class WorkspaceManager:
             raise ValueError("worker_name must be a non-empty string")
 
         with self._lock:
-            _, resolved_root = self._resolve_project_root(run_id, project_root)
+            run, resolved_root = self._resolve_project_root(run_id, project_root)
             is_git_worktree, repo_root, git_common_dir, has_head = self._detect_git_repo(
                 resolved_root
             )
@@ -601,8 +601,13 @@ class WorkspaceManager:
 
             use_git_clone = is_git_worktree and has_head
             base_root = repo_root if use_git_clone else resolved_root
+            workspace_root = (
+                resolved_root
+                if run["execution_root"] and resolved_root == Path(run["execution_root"]).resolve(strict=False)
+                else base_root
+            )
             ws_dir, branch_name = self._allocate_workspace_dir_and_branch(
-                base_root, run_id, worker_name
+                workspace_root, run_id, worker_name
             )
 
             source_roots = [resolved_root]

@@ -16,6 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from orchestrator import codex_bridge
 from orchestrator.board import BoardService, _strip_artifact_manifests, _strip_step_manifests
 from orchestrator.native_actions import NativeActionStore, digest as native_digest
 from orchestrator.inbox import INBOX_TOOL_DEFINITIONS, InboxStore
@@ -192,6 +193,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "minLength": 1,
                     "description": "Optional root host session ID to bind for lifecycle hooks.",
                 },
+                "turn_id": {"type": "string", "description": "Codex turn that triggered this run."},
+                "trigger_prompt": {"type": "string", "description": "Prompt that triggered this run."},
+                "execution_root": {"type": "string", "description": "Execution directory within or separate from the registered project root."},
             },
             "required": ["mode", "title"],
             "additionalProperties": False,
@@ -812,15 +816,18 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
 INTERNAL_RPC_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "session_hook_check",
-        "description": "Evaluate read-only compact resume context and 3-guardrail Stop continuation check for a bound root session.",
+        "description": "Record eligible Codex turns, return compact resume context, and evaluate the per-Run Stop gate.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "session_id": {"type": "string"},
                 "event_name": {"type": "string"},
                 "cwd": {"type": "string"},
+                "turn_id": {"type": "string"},
+                "prompt_preview": {"type": "string"},
+                "has_mode_invocation": {"type": "boolean"},
                 "stop_hook_active": {"type": "boolean", "default": False},
-                "mark_stop_blocked": {"type": "boolean", "default": False},
+                "mark_stop_blocked": {"type": "boolean", "default": True},
             },
             "required": ["session_id", "event_name"],
             "additionalProperties": False,
@@ -955,31 +962,99 @@ class RpcDispatcher:
     def _handle_run_create(self, args: dict[str, Any]) -> dict[str, Any]:
         mode = self._require_str(args, "mode").strip()
         title = self._require_str(args, "title").strip()
-        project_root = args.get("project_root")
-        project_id = args.get("project_id")
-        is_git = args.get("is_git")
+        project_root, project_id = args.get("project_root"), args.get("project_id")
+        session_id = args.get("session_id")
+        if session_id is not None:
+            session_id = self._require_str(args, "session_id").strip()
+        turn_id, trigger_prompt = args.get("turn_id"), args.get("trigger_prompt")
+        execution_root = args.get("execution_root") or ""
+        project_fields = None
 
-        if project_root is not None and is_git is None:
-            root_path = Path(str(project_root)).resolve(strict=False)
-            if root_path.exists() and root_path.is_dir():
-                detected_git, _, _, _ = WorkspaceManager._detect_git_repo(root_path)
-                is_git = detected_git
+        if session_id and (turn_id is None or trigger_prompt is None):
+            turns = self.db.list_session_turns(session_id)
+            if turns:
+                if turn_id is None:
+                    turn_id = turns[0]["turn_id"]
+                if trigger_prompt is None:
+                    trigger_prompt = turns[0]["prompt_preview"]
 
-        run = self.db.create_run(
-            mode=mode,
-            title=title,
-            project_id=str(project_id) if project_id is not None else None,
-            project_root=str(project_root) if project_root is not None else None,
-            project_name=(
-                str(args["project_name"]) if args.get("project_name") is not None else None
-            ),
-            is_git=bool(is_git) if is_git is not None else None,
-            status=str(args.get("status") or "active"),
-            metadata=args.get("metadata"),
-            session_id=args.get("session_id"),
-        )
+        thread = None
+        if project_id is None and project_root is None and session_id:
+            thread = codex_bridge.get_thread_meta(session_id)
+            if thread:
+                project_root = thread["codex_project_root"] or thread["cwd"] or None
+
+        if project_root is not None and project_id is None:
+            requested_root = Path(project_root).resolve(strict=False)
+            root = requested_root
+            is_git = args.get("is_git")
+            if is_git is None:
+                is_git = self._is_git_project_root(root)
+            codex = codex_bridge.resolve_codex_project_for_path(root)
+            codex_root = Path(codex["root_path"]).resolve(strict=False) if codex else None
+            registered = None
+
+            if not is_git and not (root / ".git").exists() and root != codex_root:
+                registered_parents = [
+                    (path, project)
+                    for project in self.db.list_projects()
+                    if project["project_kind"] == "workspace"
+                    and (path := Path(project["root_path"]).resolve(strict=False)) in root.parents
+                ]
+                if registered_parents:
+                    root, registered = max(registered_parents, key=lambda parent: len(parent[0].parts))
+                if codex_root in requested_root.parents and (root == requested_root or root in codex_root.parents):
+                    root = codex_root
+                    registered = self.db.get_project_by_root(root)
+                if root != requested_root:
+                    execution_root = execution_root or str(requested_root)
+                    is_git = registered["is_git"] if registered else self._is_git_project_root(root)
+
+            codex_id = codex["project_id"] if codex else None
+            codex_name = codex["name"] if codex else None
+            if registered:
+                codex_id = codex_id or registered["codex_project_id"]
+                codex_name = codex_name or registered["codex_project_name"]
+            if thread and not codex:
+                codex_id = thread["codex_project_id"] or codex_id
+                codex_name = thread["codex_project_name"] or codex_name
+
+            name = (args.get("project_name") or "").strip() or None
+            if root != requested_root and name in {
+                None, requested_root.name, root.name, registered["name"] if registered else None,
+            }:
+                name = codex_name or (registered["name"] if registered else None)
+            elif name is None and (root == codex_root or thread):
+                name = codex_name
+            project_fields = (root, name, is_git, codex_id, codex_name)
+
+        with self.db.transaction():
+            if project_fields is not None:
+                root, name, is_git, codex_id, codex_name = project_fields
+                project_id = self.db.ensure_project(
+                    root, name=name, is_git=is_git,
+                    codex_project_id=codex_id, codex_project_name=codex_name,
+                )["id"]
+            run = self.db.create_run(
+                mode=mode,
+                title=title,
+                project_id=project_id,
+                status=str(args.get("status") or "active"),
+                metadata=args.get("metadata"),
+                session_id=session_id,
+                turn_id=turn_id,
+                trigger_prompt=trigger_prompt if trigger_prompt is not None else "",
+                execution_root=str(Path(execution_root).resolve(strict=False)) if execution_root else "",
+            )
         self._emit("run_updated", {"run_id": run["id"], "run": run}, run_id=run["id"])
         return {**run, "cli_executables": _discover_cli_executables()}
+
+    @staticmethod
+    def _is_git_project_root(root: Path) -> bool:
+        if not root.is_dir():
+            return False
+        is_git, repo_root, _, _ = WorkspaceManager._detect_git_repo(root)
+        return is_git and repo_root == root
 
     def _handle_run_update(self, args: dict[str, Any]) -> dict[str, Any]:
         run_id = self._require_str(args, "run_id")
@@ -1345,7 +1420,7 @@ class RpcDispatcher:
             raise NotFoundError(f"Run not found: {run_id}")
         proj_pre = self.db.get_project(run_pre["project_id"])
         if proj_pre is not None:
-            ws_parent = Path(proj_pre["root_path"]).resolve(strict=False) / WORKSPACES_DIRNAME
+            ws_parent = Path(run_pre["execution_root"] or proj_pre["root_path"]).resolve(strict=False) / WORKSPACES_DIRNAME
             ws_parent_existed_before = ws_parent.exists()
             created_ws_parent = ws_parent
 
@@ -2474,70 +2549,103 @@ class RpcDispatcher:
         return {"bound": True, **binding}
 
     def _handle_session_hook_check(self, args: dict[str, Any]) -> dict[str, Any]:
-        from orchestrator.watchdog import classify_run
+        empty = {
+            "bound": False,
+            "run_id": None,
+            "project_root": None,
+            "resume_context": "",
+            "should_block_stop": False,
+            "stop_reason": "",
+            "blocked_key": "",
+            "progress_classification": None,
+        }
+        session_id = args["session_id"]
+        if not isinstance(session_id, str) or not session_id.strip():
+            return empty
 
-        raw_session = args.get("session_id")
-        event_name = str(args.get("event_name") or "").strip()
-        if not isinstance(raw_session, str) or not raw_session.strip():
-            return {
-                "bound": False,
-                "run_id": None,
-                "project_root": None,
-                "resume_context": "",
-                "should_block_stop": False,
-                "stop_reason": "",
-                "blocked_key": "",
-                "progress_classification": None,
-            }
-
-        session_id = raw_session.strip()
-        binding = self.db.get_session_binding(session_id)
-        if binding is None:
-            return {
-                "bound": False,
-                "run_id": None,
-                "project_root": None,
-                "resume_context": "",
-                "should_block_stop": False,
-                "stop_reason": "",
-                "blocked_key": "",
-                "progress_classification": None,
-            }
-
-        run_id = binding["run_id"]
-        run = self.db.get_run(run_id)
-        if run is None or run["status"] != "active":
-            return {
-                "bound": False,
-                "run_id": run_id,
-                "project_root": binding["project_root"],
-                "resume_context": "",
-                "should_block_stop": False,
-                "stop_reason": "",
-                "blocked_key": "",
-                "progress_classification": "inactive" if run else None,
-            }
-
-        # Guardrail 1: prevent cross-talk from unrelated directories or subagent isolated workspaces.
+        session_id = session_id.strip()
+        event_name = str(args["event_name"] or "").strip().lower()
         raw_cwd = args.get("cwd")
-        in_subagent_workspace = False
-        if isinstance(raw_cwd, str) and raw_cwd.strip():
-            cwd_path = Path(raw_cwd.strip()).resolve(strict=False)
-            proj_path = Path(binding["project_root"]).resolve(strict=False)
-            if cwd_path != proj_path and not cwd_path.is_relative_to(proj_path):
-                return {
-                    "bound": False,
-                    "run_id": run_id,
-                    "project_root": binding["project_root"],
-                    "resume_context": "",
-                    "should_block_stop": False,
-                    "stop_reason": "",
-                    "blocked_key": "",
-                    "progress_classification": None,
-                }
-            if WORKSPACES_DIRNAME in cwd_path.parts and WORKSPACES_DIRNAME not in proj_path.parts:
-                in_subagent_workspace = True
+        cwd_text = raw_cwd.strip() if isinstance(raw_cwd, str) else ""
+        cwd = Path(cwd_text).resolve(strict=False) if cwd_text else None
+        bindings = self.db.list_session_bindings(session_id)
+        matching = []
+        for binding in bindings:
+            run = self.db.get_run(binding["run_id"])
+            if run is None or run["status"] != "active":
+                if empty["run_id"] is None:
+                    empty.update(run_id=binding["run_id"], project_root=binding["project_root"],
+                                 progress_classification="inactive" if run else None)
+                continue
 
+            scopes = [Path(binding["project_root"]).resolve(strict=False)]
+            if run["execution_root"]:
+                scopes.append(Path(run["execution_root"]).resolve(strict=False))
+            scope = max(
+                (p for p in scopes if cwd is None or cwd.is_relative_to(p)),
+                key=lambda p: len(p.parts),
+                default=None,
+            )
+            if scope is None:
+                if empty["run_id"] is None:
+                    empty.update(run_id=run["id"], project_root=binding["project_root"])
+                continue
+            in_subagent_workspace = cwd is not None and any(
+                os.path.normcase(part) == WORKSPACES_DIRNAME for part in cwd.relative_to(scope).parts
+            )
+            matching.append((binding, run, in_subagent_workspace, len(scope.parts) if cwd else 0))
+
+        if event_name == "userpromptsubmit":
+            selected = max(matching, key=lambda match: match[3], default=None)
+            turn_id = (args.get("turn_id") or "").strip()
+            invoked = args.get("has_mode_invocation")
+            if turn_id and (invoked is True or bindings or self.db.list_session_turns(session_id)):
+                self.db.upsert_session_turn(
+                    session_id, turn_id, cwd=cwd_text, prompt_preview=args.get("prompt_preview", ""),
+                    active_run_id=selected[1]["id"] if selected else None,
+                )
+            if selected is None:
+                return empty
+            binding, run, _, _ = selected
+            # A passive turn uses only its attribution; the hook emits no resume context.
+            if invoked is False:
+                return {**empty, "bound": True, "run_id": run["id"], "project_root": binding["project_root"]}
+            return self._session_run_hook_result(args, binding, run, check_stop=False)
+
+        if not matching:
+            return empty
+
+        if event_name != "stop":
+            binding, run, _, _ = matching[0]
+            return self._session_run_hook_result(args, binding, run, check_stop=False)
+
+        first = None
+        for binding, run, in_subagent_workspace, _ in matching:
+            result = self._session_run_hook_result(args, binding, run, check_stop=not in_subagent_workspace)
+            if result["should_block_stop"]:
+                if args.get("mark_stop_blocked") is False:
+                    return result
+                # Another Stop request may have marked the same binding while we read the board.
+                with self.db.transaction():
+                    current = self.db.get_session_binding(session_id, run["id"])
+                    current_run = self.db.get_run(run["id"])
+                    if (
+                        current is not None
+                        and current_run is not None
+                        and current_run["status"] == "active"
+                        and current["last_stop_blocked_key"] != result["blocked_key"]
+                    ):
+                        self.db.update_session_stop_blocked_key(session_id, result["blocked_key"], run_id=run["id"])
+                        return result
+                result.update(should_block_stop=False, stop_reason="")
+            if first is None:
+                first = result
+        return first
+
+    def _session_run_hook_result(
+        self, args: dict[str, Any], binding: dict[str, Any], run: dict[str, Any], *, check_stop: bool,
+    ) -> dict[str, Any]:
+        run_id = run["id"]
         status_compact = self.board.board_status(run_id, compact=True)
         pkt = status_compact.get("latest_task_packet")
         pkt_ver = pkt["version"] if pkt else 0
@@ -2598,7 +2706,7 @@ class RpcDispatcher:
         should_block = False
         stop_reason = ""
 
-        if event_name.lower() == "stop" and not in_subagent_workspace:
+        if check_stop:
             stop_hook_active = bool(args.get("stop_hook_active", False))
             has_pending_controls = any(
                 c["status"] == "pending" for c in status_compact.get("control_requests", [])
@@ -2714,8 +2822,6 @@ class RpcDispatcher:
                     f"Run {run_id} 仍有 {action_count} 项无阻塞待办动作（如 {act_desc[:120]}），"
                     "请按契约继续推进或明确说明阻塞原因。"
                 )
-                if bool(args.get("mark_stop_blocked", False)):
-                    self.db.update_session_stop_blocked_key(session_id, blocked_key)
 
         return {
             "bound": True,
