@@ -1,7 +1,9 @@
 """S2 regression scenarios for run attribution and lifecycle isolation."""
 
 from concurrent.futures import ThreadPoolExecutor
+import os
 import subprocess
+import sys
 from pathlib import Path
 from threading import Barrier
 
@@ -14,6 +16,7 @@ from orchestrator.config import Settings
 from orchestrator.daemon import create_app
 from orchestrator.db import Database
 from orchestrator.rpc_handlers import INTERNAL_RPC_DEFINITIONS, RpcDispatcher, TOOL_DEFINITIONS
+from orchestrator.verify_runner import collect
 from orchestrator.workspace_mgr import WORKSPACES_DIRNAME, WorkspaceManager
 
 
@@ -248,6 +251,98 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
     assert opens == [Path(workspace["path"]), legacy_path, Path(explicit["path"])]
 
 
+
+def test_t3_nested_snapshot_uses_canonical_paths_through_workflow5_closeout(env, monkeypatch, tmp_path):
+    root, db, rpc = env
+    _codex_project(monkeypatch, root)
+    execution = root / "artifacts" / "slice"
+    execution.mkdir(parents=True)
+    edited = execution / "app.py"
+    root_file = root / "app.py"
+    sibling = execution.parent / "sibling.py"
+    for path, text in [(edited, "old"), (root_file, "root"), (sibling, "sibling")]:
+        path.write_text(text, encoding="utf-8")
+
+    run = _run(rpc, execution, "merge-nested")
+    run_id = run["id"]
+    relative = edited.relative_to(root).as_posix()
+    criterion = "nested file updated without changing its canonical siblings"
+    rpc(
+        "task_packet_save", run_id=run_id, title="Nested snapshot", goal=criterion,
+        file_ownership={"author": [relative]}, acceptance_criteria=[criterion],
+    )
+
+    def record_fixture_native(action):
+        # This fixture injects the host reply only. Verification and merge are not mocked.
+        raw = (
+            {"task_name": action["target_agent_path"]}
+            if action["action_type"] == "spawn_agent"
+            else {"status": "queued"}
+        )
+        rpc(
+            "native_action_record_call", run_id=run_id, action_id=action["action_id"],
+            claim_token=action["claim_token"], expected_revision=action["expected_revision"],
+            outcome="confirmed", raw_response=raw,
+        )
+
+    author = rpc(
+        "workflow_prepare_dispatch", run_id=run_id, create_workspace=True, copy_env=False,
+        owner="author", task_name="author", verifier="verifier", verifier_task_name="verifier",
+        step_key="edit-nested", instruction=criterion,
+    )
+    record_fixture_native(author)
+    step_id = author["step"]["id"]
+    assert author["workspace"]["mode"] == "snapshot"
+    workspace = Path(author["workspace"]["path"])
+    assert workspace.parent == execution / WORKSPACES_DIRNAME
+    rpc("workflow_author_turn", run_id=run_id, step_id=step_id, message_id=author["message_id"], phase="accept")
+
+    # Find the intended file in either snapshot layout to exercise the old merge failure,
+    # rather than failing early because the old candidate used a slice-relative path.
+    [candidate] = [file for file in workspace.rglob("app.py") if file.read_text(encoding="utf-8") == "old"]
+    candidate.write_text("new", encoding="utf-8")
+    rpc(
+        "workflow_author_turn", run_id=run_id, step_id=step_id, message_id=author["message_id"],
+        phase="submit", summary="Changed nested app.py",
+    )
+
+    def verify(scope, cwd, target):
+        delivery = rpc(
+            "workflow_prepare_dispatch", run_id=run_id, step_id=step_id, dispatch_action="request_verify",
+            task_name="verifier", instruction=f"Verify {scope}",
+        )
+        record_fixture_native(delivery)
+        turn = rpc(
+            "workflow_verifier_turn", run_id=run_id, step_id=step_id, message_id=delivery["message_id"],
+            phase="prepare", scope=scope, env_profile="windows_minimal_py" if os.name == "nt" else "posix_minimal_py",
+            verification_commands=[{
+                "id": scope, "cwd": str(cwd), "timeout_sec": 15, "criteria": [criterion],
+                "argv": [sys.executable, "-c",
+                         "from pathlib import Path; import sys; assert Path(sys.argv[1]).read_text() == 'new'",
+                         str(target)],
+            }],
+        )
+        receipts = tmp_path / scope
+        receipt = collect(Path(turn["artifact"]["manifest_path"]), receipts)
+        assert receipt["status"] == "finished", receipt
+        assert receipt["commands"][0]["exit_code"] == 0
+        return rpc(
+            "workflow_verifier_turn", run_id=run_id, step_id=step_id, phase="record",
+            artifact_id=turn["artifact"]["id"], verdict="PASS", receipt_files=[str(receipts / "receipt.json")],
+        )
+
+    assert verify("candidate", workspace, candidate)["step"]["state"] == "ready_to_merge"
+    merged = rpc("workspace_merge", workspace_id=author["workspace"]["id"])
+    assert merged["files_changed"] == [relative]
+    assert candidate == workspace / relative
+    assert edited.read_text(encoding="utf-8") == "new"
+    assert root_file.read_text(encoding="utf-8") == "root"
+    assert sibling.read_text(encoding="utf-8") == "sibling"
+    verify("integrated", root, edited)
+    assert rpc("workflow_closeout_run", run_id=run_id)["run"]["status"] == "completed"
+    assert db.get_workspace(author["workspace"]["id"])["status"] == "cleaned" and not workspace.exists()
+
+
 def test_t4_concurrent_sessions_have_independent_runs_and_agents(env):
     root, db, rpc = env
     start = Barrier(2)
@@ -339,4 +434,3 @@ def test_t5_stop_skips_other_roots_in_one_session_and_marks_by_default(env):
     assert db.get_session_binding("same-session", run_root)["last_stop_blocked_key"] == result["blocked_key"]
     assert db.get_session_binding("same-session", run_other)["last_stop_blocked_key"] is None
     assert not stop()["should_block_stop"]
-
