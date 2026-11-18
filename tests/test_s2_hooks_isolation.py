@@ -107,4 +107,3 @@ def test_mode_prompt_reports_turn_metadata_and_injects_bounded_context(monkeypat
     assert arguments["turn_id"] == ("turn-2" if turn_id else "")
     assert arguments["prompt_preview"] == "/swarm finish the work"
     assert arguments["has_mode_invocation"] is True
-
