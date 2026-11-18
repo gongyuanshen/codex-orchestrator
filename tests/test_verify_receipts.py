@@ -4,7 +4,7 @@ from test_workflow_gates import flow
 
 def test_new_runs_default_receipts_workflow(flow):
     db, _, _, _, project, _ = flow
-    assert db.create_run(mode="boost", title="new", project_root=project)["workflow_version"] == 4
+    assert db.create_run(mode="boost", title="new", project_root=project)["workflow_version"] == 5
 
 def test_workflow3_requires_commands(flow):
     db, service, run, step, _, _ = flow
@@ -249,7 +249,7 @@ def test_workflow3_http_catalog_freeze_collect_record_and_gate(tmp_path):
                     return response.json()['result']
 
                 run = await rpc('run_create', mode='swarm', title='Workflow3 actual HTTP', project_root=str(project))
-                assert run['workflow_version'] == 4
+                assert run['workflow_version'] == 5
                 await rpc('task_packet_save', run_id=run['id'], title='Frozen HTTP', goal='actual collection',
                           file_ownership={'author': ['source.txt']}, acceptance_criteria=['exact output'])
                 for name, role in [('author', 'coder'), ('verifier', 'verifier')]:

@@ -169,3 +169,44 @@ def test_cli_bounded_real_summary(tmp_path, exit_code):
     assert summary['status'] == 'finished'
     assert summary['manifest_digest'] == digest(m)
     assert Path(summary['receipt_path']).is_file()
+
+
+def test_case_insensitive_systemroot_and_env_profile_never_leak_or_serialize(tmp_path, monkeypatch):
+    import os
+    from orchestrator.verify_runner import ENV_PROFILE_KEYS, build_isolated_env, lookup_env_value
+
+    found, val = lookup_env_value('systemroot', {'SystemRoot': r'C:\Windows'}, case_insensitive=True)
+    assert found is True and val == r'C:\Windows'
+    found_rev, val_rev = lookup_env_value('SystemRoot', {'SYSTEMROOT': r'C:\Windows'}, case_insensitive=True)
+    assert found_rev is True and val_rev == r'C:\Windows'
+
+    isolated = build_isolated_env(
+        ENV_PROFILE_KEYS['windows_minimal_py'],
+        {'SystemRoot': r'C:\Windows', 'Path': r'C:\Windows\System32', 'UNDECLARED_KEY': 'hidden-val'},
+        case_insensitive=True,
+        command_id='env_test',
+    )
+    assert 'UNDECLARED_KEY' not in isolated
+    assert [k for k in isolated if k.upper() == 'SYSTEMROOT'] == ['SYSTEMROOT']
+    assert isolated['SYSTEMROOT'] == r'C:\Windows'
+
+    monkeypatch.setenv('M6_RUNNER_SECRET', 'never-inherit-or-write')
+    monkeypatch.delenv('PYTHONIOENCODING', raising=False)
+    m, p = frozen(
+        tmp_path,
+        "import os, socket; assert 'M6_RUNNER_SECRET' not in os.environ; s = socket.socket(); s.close(); print('win-socket-ok')",
+    )
+    m['commands'][0]['env_keys'] = (
+        ['systemroot', 'SystemRoot', 'PATH', 'PYTHONIOENCODING']
+        if os.name == 'nt'
+        else list(ENV_PROFILE_KEYS['posix_minimal_py'])
+    )
+    p.write_text(json.dumps(m), encoding='utf-8')
+    r = collect(p, tmp_path / 'env-profile-out')
+    assert r['status'] == 'finished' and r['commands'][0]['exit_code'] == 0
+    assert Path(r['commands'][0]['stdout']['path']).read_text('utf-8').strip() == 'win-socket-ok'
+    validate_receipt(m, tmp_path / 'env-profile-out/receipt.json', require_success=True)
+    receipt_raw = (tmp_path / 'env-profile-out/receipt.json').read_text('utf-8')
+    assert 'never-inherit-or-write' not in receipt_raw
+    if os.name == 'nt' and os.environ.get('SYSTEMROOT'):
+        assert os.environ['SYSTEMROOT'] not in receipt_raw

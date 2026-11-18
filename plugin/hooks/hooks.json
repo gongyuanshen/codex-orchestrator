@@ -1,0 +1,52 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -x \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/tri-orchestrator-hook\" ]; then exec \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/tri-orchestrator-hook\"; elif [ -x \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\" ]; then exec \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\" -m orchestrator.hook_runner; elif [ -x \"${CLAUDE_PLUGIN_ROOT}/../.venv/bin/python\" ]; then PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}\" exec \"${CLAUDE_PLUGIN_ROOT}/../.venv/bin/python\" -m orchestrator.hook_runner; elif command -v python3 >/dev/null 2>&1; then PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}\" exec python3 -m orchestrator.hook_runner; else exit 0; fi",
+            "commandWindows": "$r = \"${CLAUDE_PLUGIN_ROOT}\"; if (Test-Path -LiteralPath \"$r\\.venv\\Scripts\\tri-orchestrator-hook.exe\") { & \"$r\\.venv\\Scripts\\tri-orchestrator-hook.exe\"; exit $LASTEXITCODE } elseif (Test-Path -LiteralPath \"$r\\.venv\\Scripts\\python.exe\") { & \"$r\\.venv\\Scripts\\python.exe\" -m orchestrator.hook_runner; exit $LASTEXITCODE } elseif (Test-Path -LiteralPath \"$r\\..\\.venv\\Scripts\\python.exe\") { $env:PYTHONPATH = \"$r\\src\"; & \"$r\\..\\.venv\\Scripts\\python.exe\" -m orchestrator.hook_runner; exit $LASTEXITCODE } elseif (($py = Get-Command python.exe -ErrorAction SilentlyContinue) -and ($py.Source -notlike \"*\\WindowsApps\\*\")) { $env:PYTHONUTF8 = \"1\"; $env:PYTHONPATH = if ($env:PYTHONPATH) { \"$r\\src;$env:PYTHONPATH\" } else { \"$r\\src\" }; & $py.Source -m orchestrator.hook_runner; exit $LASTEXITCODE } else { exit 0 }",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -x \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/tri-orchestrator-hook\" ]; then exec \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/tri-orchestrator-hook\"; elif [ -x \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\" ]; then exec \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\" -m orchestrator.hook_runner; elif [ -x \"${CLAUDE_PLUGIN_ROOT}/../.venv/bin/python\" ]; then PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}\" exec \"${CLAUDE_PLUGIN_ROOT}/../.venv/bin/python\" -m orchestrator.hook_runner; elif command -v python3 >/dev/null 2>&1; then PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}\" exec python3 -m orchestrator.hook_runner; else exit 0; fi",
+            "commandWindows": "$r = \"${CLAUDE_PLUGIN_ROOT}\"; if (Test-Path -LiteralPath \"$r\\.venv\\Scripts\\tri-orchestrator-hook.exe\") { & \"$r\\.venv\\Scripts\\tri-orchestrator-hook.exe\"; exit $LASTEXITCODE } elseif (Test-Path -LiteralPath \"$r\\.venv\\Scripts\\python.exe\") { & \"$r\\.venv\\Scripts\\python.exe\" -m orchestrator.hook_runner; exit $LASTEXITCODE } elseif (Test-Path -LiteralPath \"$r\\..\\.venv\\Scripts\\python.exe\") { $env:PYTHONPATH = \"$r\\src\"; & \"$r\\..\\.venv\\Scripts\\python.exe\" -m orchestrator.hook_runner; exit $LASTEXITCODE } elseif (($py = Get-Command python.exe -ErrorAction SilentlyContinue) -and ($py.Source -notlike \"*\\WindowsApps\\*\")) { $env:PYTHONUTF8 = \"1\"; $env:PYTHONPATH = if ($env:PYTHONPATH) { \"$r\\src;$env:PYTHONPATH\" } else { \"$r\\src\" }; & $py.Source -m orchestrator.hook_runner; exit $LASTEXITCODE } else { exit 0 }",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -x \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/tri-orchestrator-hook\" ]; then exec \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/tri-orchestrator-hook\"; elif [ -x \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\" ]; then exec \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\" -m orchestrator.hook_runner; elif [ -x \"${CLAUDE_PLUGIN_ROOT}/../.venv/bin/python\" ]; then PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}\" exec \"${CLAUDE_PLUGIN_ROOT}/../.venv/bin/python\" -m orchestrator.hook_runner; elif command -v python3 >/dev/null 2>&1; then PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}\" exec python3 -m orchestrator.hook_runner; else exit 0; fi",
+            "commandWindows": "$r = \"${CLAUDE_PLUGIN_ROOT}\"; if (Test-Path -LiteralPath \"$r\\.venv\\Scripts\\tri-orchestrator-hook.exe\") { & \"$r\\.venv\\Scripts\\tri-orchestrator-hook.exe\"; exit $LASTEXITCODE } elseif (Test-Path -LiteralPath \"$r\\.venv\\Scripts\\python.exe\") { & \"$r\\.venv\\Scripts\\python.exe\" -m orchestrator.hook_runner; exit $LASTEXITCODE } elseif (Test-Path -LiteralPath \"$r\\..\\.venv\\Scripts\\python.exe\") { $env:PYTHONPATH = \"$r\\src\"; & \"$r\\..\\.venv\\Scripts\\python.exe\" -m orchestrator.hook_runner; exit $LASTEXITCODE } elseif (($py = Get-Command python.exe -ErrorAction SilentlyContinue) -and ($py.Source -notlike \"*\\WindowsApps\\*\")) { $env:PYTHONUTF8 = \"1\"; $env:PYTHONPATH = if ($env:PYTHONPATH) { \"$r\\src;$env:PYTHONPATH\" } else { \"$r\\src\" }; & $py.Source -m orchestrator.hook_runner; exit $LASTEXITCODE } else { exit 0 }",
+            "timeout": 3
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ -x \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/tri-orchestrator-hook\" ]; then exec \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/tri-orchestrator-hook\"; elif [ -x \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\" ]; then exec \"${CLAUDE_PLUGIN_ROOT}/.venv/bin/python\" -m orchestrator.hook_runner; elif [ -x \"${CLAUDE_PLUGIN_ROOT}/../.venv/bin/python\" ]; then PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}\" exec \"${CLAUDE_PLUGIN_ROOT}/../.venv/bin/python\" -m orchestrator.hook_runner; elif command -v python3 >/dev/null 2>&1; then PYTHONPATH=\"${CLAUDE_PLUGIN_ROOT}/src${PYTHONPATH:+:$PYTHONPATH}\" exec python3 -m orchestrator.hook_runner; else exit 0; fi",
+            "commandWindows": "$r = \"${CLAUDE_PLUGIN_ROOT}\"; if (Test-Path -LiteralPath \"$r\\.venv\\Scripts\\tri-orchestrator-hook.exe\") { & \"$r\\.venv\\Scripts\\tri-orchestrator-hook.exe\"; exit $LASTEXITCODE } elseif (Test-Path -LiteralPath \"$r\\.venv\\Scripts\\python.exe\") { & \"$r\\.venv\\Scripts\\python.exe\" -m orchestrator.hook_runner; exit $LASTEXITCODE } elseif (Test-Path -LiteralPath \"$r\\..\\.venv\\Scripts\\python.exe\") { $env:PYTHONPATH = \"$r\\src\"; & \"$r\\..\\.venv\\Scripts\\python.exe\" -m orchestrator.hook_runner; exit $LASTEXITCODE } elseif (($py = Get-Command python.exe -ErrorAction SilentlyContinue) -and ($py.Source -notlike \"*\\WindowsApps\\*\")) { $env:PYTHONUTF8 = \"1\"; $env:PYTHONPATH = if ($env:PYTHONPATH) { \"$r\\src;$env:PYTHONPATH\" } else { \"$r\\src\" }; & $py.Source -m orchestrator.hook_runner; exit $LASTEXITCODE } else { exit 0 }",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

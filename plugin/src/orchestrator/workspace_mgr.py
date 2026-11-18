@@ -11,6 +11,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,16 @@ VALID_MERGE_STRATEGIES = frozenset({"merge", "cherry-pick"})
 WORKSPACES_DIRNAME = ".swarm-workspaces"
 EXCLUDE_ENTRY = ".swarm-workspaces/"
 SNAPSHOT_EXCLUDE_DIRS = frozenset(
-    {WORKSPACES_DIRNAME, ".git", "node_modules", ".venv", "__pycache__"}
+    {
+        WORKSPACES_DIRNAME,
+        ".git",
+        "node_modules",
+        ".venv",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+    }
 )
 ENV_FILENAMES = (".env", ".env.local")
 DEP_DIRNAMES = (".venv", "node_modules")
@@ -173,7 +183,21 @@ def _rmtree_safe(root: Path) -> None:
         if dep_path.is_symlink() or (hasattr(dep_path, "is_junction") and dep_path.is_junction()):
             _unlink_reparse_point(dep_path)
 
-    shutil.rmtree(root, onexc=_onexc_remove_readonly)
+    for attempt in range(6):
+        if not root.exists() and not root.is_symlink():
+            return
+        try:
+            shutil.rmtree(root, onexc=_onexc_remove_readonly)
+            return
+        except PermissionError:
+            if attempt >= 5:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as exc:
+            if getattr(exc, "winerror", None) in {5, 32, 145} and attempt < 5:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            raise
 
 
 def _append_git_exclude_entries(git_dir: Path, entries: list[str]) -> Path:
@@ -1187,28 +1211,32 @@ class WorkspaceManager:
             else:
                 desired.pop(rel, None)
         merge_id = "merge_" + uuid.uuid4().hex
-        staging = self.settings.data_dir / "merge-staging" / merge_id
-        (staging / "source").mkdir(parents=True, exist_ok=False)
-        (staging / "before").mkdir()
-        for rel in changes:
-            if rel in approved:
-                staged = staging / "source" / rel
-                staged.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(self._merge_file(source, rel), staged)
-                if _sha256_file(staged) != approved[rel]:
-                    raise WorkspaceConflictError(f"Candidate changed while staging: {rel}")
-            if rel in before:
-                backup = staging / "before" / rel
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(self._merge_file(root, rel), backup)
-                if _sha256_file(backup) != before[rel]:
-                    raise WorkspaceConflictError(f"Target changed while staging: {rel}")
-        checkpoint = {"merge_id": merge_id, "workspace_id": ws["id"], "mode": "snapshot",
-                      "project_root": str(root), "source_manifest": approved,
-                      "before_manifest": before, "desired_manifest": desired,
-                      "operations": changes, "staging_dir": str(staging), "strategy": strategy}
-        service.begin_merge(step["id"], checkpoint)
+        staging_parent = self.settings.data_dir / "merge-staging"
+        staging = staging_parent / merge_id
+        begun_merge = False
+        merge_finished = False
         try:
+            (staging / "source").mkdir(parents=True, exist_ok=False)
+            (staging / "before").mkdir()
+            for rel in changes:
+                if rel in approved:
+                    staged = staging / "source" / rel
+                    staged.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(self._merge_file(source, rel), staged)
+                    if _sha256_file(staged) != approved[rel]:
+                        raise WorkspaceConflictError(f"Candidate changed while staging: {rel}")
+                if rel in before:
+                    backup = staging / "before" / rel
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(self._merge_file(root, rel), backup)
+                    if _sha256_file(backup) != before[rel]:
+                        raise WorkspaceConflictError(f"Target changed while staging: {rel}")
+            checkpoint = {"merge_id": merge_id, "workspace_id": ws["id"], "mode": "snapshot",
+                          "project_root": str(root), "source_manifest": approved,
+                          "before_manifest": before, "desired_manifest": desired,
+                          "operations": changes, "staging_dir": str(staging), "strategy": strategy}
+            service.begin_merge(step["id"], checkpoint)
+            begun_merge = True
             for rel in changes:
                 target = self._merge_file(root, rel)
                 observed = _sha256_file(target) if target.is_file() else None
@@ -1229,14 +1257,24 @@ class WorkspaceManager:
                 self.db.update_workspace(ws["id"], status="merged", snapshot_manifest={
                     **ws["snapshot_manifest"], "files": approved})
                 service.finish_merge(step["id"], proof)
+            merge_finished = True
             return {"workspace_id": ws["id"], "mode": "snapshot", "merged": True,
                     "has_conflicts": False, "status": "merged", "target_branch": None,
                     "strategy": strategy, "commits_merged": [], "files_changed": changes,
                     "conflict_files": [], "merge_id": merge_id,
                     "message": f"Applied and read back {len(changes)} approved snapshot changes"}
         except BaseException as exc:
-            service.mark_merge_uncertain(step["id"], f"{type(exc).__name__}: {exc}")
+            if begun_merge:
+                service.mark_merge_uncertain(step["id"], f"{type(exc).__name__}: {exc}")
             raise
+        finally:
+            if merge_finished or not begun_merge:
+                _rmtree_safe(staging)
+                if staging_parent.is_dir():
+                    try:
+                        staging_parent.rmdir()
+                    except OSError:
+                        pass
 
     def _merge_git_gated(self, service: Any, ws: dict[str, Any], root: Path,
                          target_branch: str | None, strategy: str) -> dict[str, Any]:
@@ -1293,7 +1331,9 @@ class WorkspaceManager:
                 return {"workspace_id": ws["id"], "mode": "git_clone", "merged": True,
                         "has_conflicts": False, "status": "merged", "target_branch": target,
                         "strategy": strategy, "commits_merged": commits,
-                        "files_changed": _run_git(root, "diff", "--name-only", before, "HEAD", check=True).stdout.splitlines(),
+                        "files_changed": _run_git(
+                            root, "-c", "core.quotepath=false", "diff", "--name-only", before, "HEAD", check=True
+                        ).stdout.splitlines(),
                         "conflict_files": [], "merge_id": merge_id,
                         "message": "Merged and read back the approved candidate"}
             except BaseException as exc:
@@ -1333,6 +1373,15 @@ class WorkspaceManager:
         with self.db.transaction():
             self.db.update_workspace(ws["id"], status="merged", **updates)
             service.finish_merge(step["id"], proof)
+        if ws["mode"] == "snapshot" and checkpoint.get("staging_dir"):
+            reconciled_staging = Path(checkpoint["staging_dir"])
+            reconciled_parent = reconciled_staging.parent
+            _rmtree_safe(reconciled_staging)
+            if reconciled_parent.is_dir():
+                try:
+                    reconciled_parent.rmdir()
+                except OSError:
+                    pass
         return {"workspace_id": ws["id"], "mode": ws["mode"], "merged": True,
                 "has_conflicts": False, "status": "merged", "reconciled": True,
                 "merge_id": checkpoint["merge_id"], "message": "Existing target verified; no files or commits replayed"}
@@ -1671,11 +1720,18 @@ class WorkspaceManager:
                 from orchestrator.workflow import WorkflowService
                 WorkflowService(self.db).require_integrated(workspace_id)
 
-            status_info = self.workspace_status(workspace_id)
-            if status_info["dirty"] or status_info["has_uncommitted_changes"]:
-                raise WorkspaceCleanupGuardError(
-                    f"Refusing cleanup for workspace {workspace_id}: workspace has uncommitted changes ({status_info['uncommitted_files']})"
-                )
+            is_empty_git_shell = (
+                ws["mode"] == "git_clone"
+                and ws_path.is_dir()
+                and not (ws_path / ".git").exists()
+                and not any(ws_path.iterdir())
+            )
+            if not is_empty_git_shell:
+                status_info = self.workspace_status(workspace_id)
+                if status_info["dirty"] or status_info["has_uncommitted_changes"]:
+                    raise WorkspaceCleanupGuardError(
+                        f"Refusing cleanup for workspace {workspace_id}: workspace has uncommitted changes ({status_info['uncommitted_files']})"
+                    )
 
             if ws["mode"] == "git_clone":
                 if not ws["merged_commit"] or not ws["merged_target_commit"]:
@@ -1683,17 +1739,22 @@ class WorkspaceManager:
                         f"Refusing cleanup for workspace {workspace_id}: missing merged commit proof; merge again"
                     )
                 if ws_path.exists():
-                    actual_branch = self._current_branch_or_head(ws_path)
-                    if actual_branch != ws["branch_name"]:
+                    if (ws_path / ".git").exists():
+                        actual_branch = self._current_branch_or_head(ws_path)
+                        if actual_branch != ws["branch_name"]:
+                            raise WorkspaceCleanupGuardError(
+                                f"Refusing cleanup for workspace {workspace_id}: on {actual_branch!r}, "
+                                f"expected branch {ws['branch_name']!r}"
+                            )
+                        current_head = _run_git(ws_path, "rev-parse", "HEAD", check=True).stdout.strip()
+                        if current_head != ws["merged_commit"]:
+                            raise WorkspaceCleanupGuardError(
+                                f"Refusing cleanup for workspace {workspace_id}: HEAD {current_head} "
+                                f"differs from merged commit {ws['merged_commit']}; merge again"
+                            )
+                    elif any(ws_path.iterdir()):
                         raise WorkspaceCleanupGuardError(
-                            f"Refusing cleanup for workspace {workspace_id}: on {actual_branch!r}, "
-                            f"expected branch {ws['branch_name']!r}"
-                        )
-                    current_head = _run_git(ws_path, "rev-parse", "HEAD", check=True).stdout.strip()
-                    if current_head != ws["merged_commit"]:
-                        raise WorkspaceCleanupGuardError(
-                            f"Refusing cleanup for workspace {workspace_id}: HEAD {current_head} "
-                            f"differs from merged commit {ws['merged_commit']}; merge again"
+                            f"Refusing cleanup for workspace {workspace_id}: missing .git metadata in non-empty directory"
                         )
 
             if ws_path.exists() or ws_path.is_symlink():

@@ -126,7 +126,7 @@ def test_coordinator_local_enum_and_default_match_the_actual_public_catalog():
 
     schema = next(tool["inputSchema"] for tool in get_tool_definitions() if tool["name"] == "workflow_step_save")
     execution = schema["properties"]["execution_kind"]
-    assert execution["enum"] == ["native", "coordinator_local"]
+    assert execution["enum"] == ["native", "coordinator_local", "app_server_pipeline"]
     assert execution["default"] == "native"
 
 

@@ -175,3 +175,120 @@ def test_wmi_bootstrap_preserves_startup_failure_in_daemon_log(tmp_path):
     assert process.wait(timeout=10) != 0
     assert process.poll() != 0
     assert "not-a-port" in (data / "daemon.log").read_text(encoding="utf-8")
+
+
+def test_sdk_stdio_shim_pools_rpc_connections_and_invalidates_health_cache_on_fault(tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    from orchestrator import __version__
+    from orchestrator.db import SCHEMA_VERSION
+    from orchestrator.mcp_shim import REQUIRED_CAPABILITIES
+
+    data = tmp_path / "pooled_data"
+    data.mkdir()
+    lock = threading.Lock()
+    state = {
+        "health_calls": 0,
+        "rpc_ports": [],
+        "rpc_status": 200,
+        "rpc_body": {"ok": True, "result": {"runs": [], "count": 0}},
+        "schema_version": SCHEMA_VERSION,
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            with lock:
+                state["health_calls"] += 1
+                body = {
+                    "status": "ok",
+                    "pid": os.getpid(),
+                    "port": self.server.server_port,
+                    "data_dir": str(data),
+                    "software_version": __version__,
+                    "schema_version": state["schema_version"],
+                    "capabilities": sorted(REQUIRED_CAPABILITIES),
+                }
+            raw = json.dumps(body).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            with lock:
+                state["rpc_ports"].append(int(self.client_address[1]))
+                status = state["rpc_status"]
+                body = state["rpc_body"]
+            raw = json.dumps(body).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    (data / "daemon.pid.json").write_text(
+        json.dumps({"pid": os.getpid(), "port": server.server_port}),
+        encoding="utf-8",
+    )
+    env = dict(
+        os.environ,
+        TRI_ORCH_HOST="127.0.0.1",
+        TRI_ORCH_PORT=str(server.server_port),
+        TRI_ORCH_DATA_DIR=str(data),
+        TRI_ORCH_WATCHDOG_INTERVAL_SEC="60",
+        PYTHONDONTWRITEBYTECODE="1",
+    )
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "orchestrator.mcp_shim"],
+        env=env,
+        cwd=str(tmp_path),
+    )
+
+    async def exercise():
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                for _ in range(3):
+                    res = await session.call_tool("run_list", {"limit": 1})
+                    assert not res.is_error, res
+
+                with lock:
+                    assert state["health_calls"] == 1
+                    assert len(state["rpc_ports"]) == 3
+                    assert len(set(state["rpc_ports"])) == 1
+
+                # Inject HTTP 500 + schema bump inside 2.5s window: cache must drop immediately.
+                with lock:
+                    state["rpc_status"] = 500
+                    state["rpc_body"] = {"ok": False, "detail": "Transient 500"}
+                err_call = await session.call_tool("run_list", {"limit": 1})
+                assert err_call.is_error
+
+                with lock:
+                    state["rpc_status"] = 200
+                    state["rpc_body"] = {"ok": True, "result": {"runs": [], "count": 0}}
+                    state["schema_version"] = SCHEMA_VERSION + 1
+                mismatch_call = await session.call_tool("run_list", {"limit": 1})
+                assert mismatch_call.is_error
+                assert "UpgradeRequiredError" in mismatch_call.content[0].text
+                with lock:
+                    assert state["health_calls"] == 2
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()

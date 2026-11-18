@@ -12,10 +12,13 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import AsyncGenerator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Iterator
+import weakref
 
 import httpx
 import mcp.server.stdio
@@ -37,7 +40,64 @@ logger = logging.getLogger("orchestrator.mcp_shim")
 
 # Codex's modern stdio transport closes on an 8 MiB line. Leave room for the RPC envelope.
 INLINE_RESULT_BYTES = 1024 * 1024 - 1024
-REQUIRED_CAPABILITIES = frozenset({"durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2", "native_actions_v1", "verification_receipts_v1", "plan_admission_v1", "compact_handoff_v1", "recipient_groups_v1", "progress_classification_v1", "workflow_reviews_v1"})
+HEALTH_CACHE_TTL_SEC = 2.5
+REQUIRED_CAPABILITIES = frozenset({
+    "durable_inbox_v1",
+    "workflow_gates_v1",
+    "async_inbox_wait_v1",
+    "workflow_modes_v2",
+    "native_actions_v1",
+    "verification_receipts_v1",
+    "plan_admission_v1",
+    "compact_handoff_v1",
+    "recipient_groups_v1",
+    "progress_classification_v1",
+    "workflow_reviews_v1",
+    "macro_rpc_v1",
+    "compact_board_v1",
+    "workflow5_direct_spawn_v1",
+    "session_hooks_v1",
+    "pipeline_runner_v1",
+})
+
+_CONTRACT_REJECTION_MARKERS = (
+    "upgrade required",
+    "upgraderequired",
+    "schema_version",
+    "software_version",
+    "schema mismatch",
+    "newer schema",
+    "unsupported schema",
+    "missing capability",
+    "required_capabilities",
+    "capabilities",
+    "unknown tool",
+)
+
+
+@dataclass
+class _HealthCacheEntry:
+    base_url: str
+    data_dir: str
+    pid: int
+    had_pid_file: bool
+    software_version: str
+    schema_version: int
+    capabilities: frozenset[str]
+    verified_at: float
+    expires_at: float
+
+
+@dataclass
+class _PooledClientEntry:
+    client: httpx.AsyncClient
+    loop_ref: weakref.ReferenceType[asyncio.AbstractEventLoop]
+    base_url: str
+    cleanup_agen: AsyncGenerator[None, None] | None = None
+
+
+_HEALTH_CACHE: dict[tuple[str, str], _HealthCacheEntry] = {}
+_POOLED_CLIENTS: dict[tuple[int, str], _PooledClientEntry] = {}
 
 
 def configure_shim_logging(settings: Settings) -> None:
@@ -70,8 +130,19 @@ class UpgradeRequiredError(RuntimeError):
     """The live daemon does not implement this client's formal contract."""
 
 
-def fetch_health(settings: Settings, *, timeout_sec: float = 0.8) -> dict[str, Any] | None:
+def fetch_health(settings: Settings, *, timeout_sec: float = 0.8, _probe_first: bool = False) -> dict[str, Any] | None:
     """Return parsed /api/health payload when daemon is healthy, else None."""
+    # Fast-probe port availability via exclusive bind before expensive HTTP timeout.
+    if _probe_first:
+        with socket.socket(socket.AF_INET6 if ":" in settings.host else socket.AF_INET, socket.SOCK_STREAM) as probe:
+            if os.name == "nt":
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            try:
+                probe.bind((settings.host, settings.port))
+            except OSError:
+                pass  # Port occupied, there may be a daemon
+            else:
+                return None  # Port free, definitely no daemon
     url = f"{settings.base_url}/api/health"
     try:
         with httpx.Client(trust_env=False, timeout=timeout_sec) as client:
@@ -236,7 +307,8 @@ def _spawn_detached_daemon(settings: Settings):
         "--data-dir",
         str(settings.data_dir),
     ]
-    env = os.environ.copy()
+    _strip_keys_upper = {'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'VIRTUAL_ENV'}
+    env = {k: v for k, v in os.environ.items() if k.upper() not in _strip_keys_upper}
     env["TRI_ORCH_HOST"] = settings.host
     env["TRI_ORCH_PORT"] = str(settings.port)
     env["TRI_ORCH_DATA_DIR"] = str(settings.data_dir)
@@ -251,7 +323,8 @@ def _spawn_detached_daemon(settings: Settings):
 
     with settings.daemon_log_path.open("ab") as log_fh:
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_fh,
-                                stderr=log_fh, env=env, close_fds=True)
+                                stderr=log_fh, env=env, close_fds=True,
+                                cwd=str(settings.data_dir))
 
 
 def ensure_daemon_running(
@@ -264,7 +337,15 @@ def ensure_daemon_running(
     cfg = settings or get_settings()
     # Offline health probes bind exclusively; serialize them with startup too.
     with _acquire_daemon_lock(cfg.lock_path, timeout_sec=lock_timeout_sec):
-        health = fetch_health(cfg)
+        # Fast probe first when no live PID file exists to avoid 0.8s HTTP SYN timeout.
+        has_live_pid = False
+        if cfg.pid_path.exists():
+            try:
+                _pid_meta = json.loads(cfg.pid_path.read_text(encoding="utf-8"))
+                has_live_pid = _is_pid_alive(int(_pid_meta.get("pid", -1)))
+            except Exception:
+                has_live_pid = False
+        health = fetch_health(cfg, _probe_first=not has_live_pid)
         if health is not None:
             return {"spawned": False, "pid": health.get("pid"), "url": cfg.base_url}
 
@@ -308,6 +389,205 @@ def ensure_daemon_running(
     )
 
 
+def _health_cache_key(settings: Settings) -> tuple[str, str]:
+    return (settings.base_url, str(settings.data_dir.resolve()))
+
+
+def invalidate_health_cache(settings: Settings | None = None) -> None:
+    """Immediately drop cached health verification (for a target endpoint or globally)."""
+    if settings is None:
+        _HEALTH_CACHE.clear()
+        return
+    _HEALTH_CACHE.pop(_health_cache_key(settings), None)
+
+
+def _check_cached_health(settings: Settings) -> tuple[_HealthCacheEntry | None, bool]:
+    """Return `(valid_entry, pid_invalidated)` using local-only monotonic & PID checks."""
+    key = _health_cache_key(settings)
+    entry = _HEALTH_CACHE.get(key)
+    if entry is None:
+        return None, False
+
+    now = time.monotonic()
+    if now < entry.verified_at or now >= entry.expires_at:
+        _HEALTH_CACHE.pop(key, None)
+        return None, False
+
+    if (
+        entry.software_version != __version__
+        or entry.schema_version != SCHEMA_VERSION
+        or not REQUIRED_CAPABILITIES.issubset(entry.capabilities)
+    ):
+        _HEALTH_CACHE.pop(key, None)
+        return None, False
+
+    if not _is_pid_alive(entry.pid):
+        _HEALTH_CACHE.pop(key, None)
+        return None, True
+
+    has_pid_file = settings.pid_path.exists()
+    if entry.had_pid_file and not has_pid_file:
+        _HEALTH_CACHE.pop(key, None)
+        return None, True
+    if has_pid_file:
+        try:
+            owner = json.loads(settings.pid_path.read_text(encoding="utf-8"))
+            if owner.get("pid") != entry.pid:
+                _HEALTH_CACHE.pop(key, None)
+                return None, True
+        except Exception:
+            _HEALTH_CACHE.pop(key, None)
+            return None, True
+
+    return entry, False
+
+
+async def _client_lifecycle_guard(
+    key: tuple[int, str], entry: _PooledClientEntry
+) -> AsyncGenerator[None, None]:
+    """Ensure pooled AsyncClient is closed cleanly before its bound event loop shuts down."""
+    try:
+        yield
+    finally:
+        if _POOLED_CLIENTS.get(key) is entry:
+            _POOLED_CLIENTS.pop(key, None)
+        if not entry.client.is_closed:
+            await entry.client.aclose()
+
+
+async def _close_pooled_entry(key: tuple[int, str], entry: _PooledClientEntry) -> None:
+    if _POOLED_CLIENTS.get(key) is entry:
+        _POOLED_CLIENTS.pop(key, None)
+    agen = entry.cleanup_agen
+    entry.cleanup_agen = None
+    if agen is not None:
+        await agen.aclose()
+    if not entry.client.is_closed:
+        await entry.client.aclose()
+
+
+def _prune_dead_loop_clients() -> None:
+    stale_keys = [
+        k
+        for k, v in list(_POOLED_CLIENTS.items())
+        if (loop := v.loop_ref()) is None or loop.is_closed()
+    ]
+    for k in stale_keys:
+        _POOLED_CLIENTS.pop(k, None)
+
+
+async def _get_or_create_rpc_client(settings: Settings) -> httpx.AsyncClient:
+    """Return a reusable AsyncClient bound to the active event loop and settings.base_url."""
+    _prune_dead_loop_clients()
+    loop = asyncio.get_running_loop()
+    key = (id(loop), settings.base_url)
+    existing = _POOLED_CLIENTS.get(key)
+    if existing is not None:
+        if (
+            existing.loop_ref() is loop
+            and not loop.is_closed()
+            and existing.base_url == settings.base_url
+            and not existing.client.is_closed
+        ):
+            return existing.client
+        _POOLED_CLIENTS.pop(key, None)
+        if existing.loop_ref() is loop and not existing.client.is_closed:
+            await existing.client.aclose()
+
+    client = httpx.AsyncClient(
+        trust_env=False,
+        timeout=httpx.Timeout(60.0, connect=5.0),
+    )
+    entry = _PooledClientEntry(
+        client=client,
+        loop_ref=weakref.ref(loop),
+        base_url=settings.base_url,
+    )
+    agen = _client_lifecycle_guard(key, entry)
+    entry.cleanup_agen = agen
+    await agen.__anext__()
+    _POOLED_CLIENTS[key] = entry
+    return client
+
+
+async def _reset_pooled_client(
+    settings: Settings, *, failed_client: httpx.AsyncClient | None = None
+) -> None:
+    """Discard and close the pooled client for `settings` on the active loop."""
+    _prune_dead_loop_clients()
+    loop = asyncio.get_running_loop()
+    key = (id(loop), settings.base_url)
+    entry = _POOLED_CLIENTS.get(key)
+    if entry is None:
+        return
+    if failed_client is not None and entry.client is not failed_client:
+        return
+    await _close_pooled_entry(key, entry)
+
+
+async def aclose_rpc_clients() -> None:
+    """Close all pooled RPC AsyncClients bound to the currently running event loop."""
+    _prune_dead_loop_clients()
+    loop = asyncio.get_running_loop()
+    matching = [
+        (key, entry)
+        for key, entry in list(_POOLED_CLIENTS.items())
+        if entry.loop_ref() is loop
+    ]
+    for key, entry in matching:
+        await _close_pooled_entry(key, entry)
+
+
+async def _ensure_daemon_healthy_cached(settings: Settings) -> None:
+    cached, pid_invalidated = _check_cached_health(settings)
+    if cached is not None:
+        return
+    if pid_invalidated:
+        await _reset_pooled_client(settings)
+
+    key = _health_cache_key(settings)
+    previous = _HEALTH_CACHE.get(key)
+    try:
+        info = await asyncio.to_thread(ensure_daemon_running, settings)
+    except BaseException:
+        invalidate_health_cache(settings)
+        await _reset_pooled_client(settings)
+        raise
+
+    if isinstance(info, dict) and isinstance(info.get("pid"), int) and info["pid"] > 0:
+        pid = int(info["pid"])
+        if previous is not None and previous.pid != pid:
+            await _reset_pooled_client(settings)
+        now = time.monotonic()
+        _HEALTH_CACHE[key] = _HealthCacheEntry(
+            base_url=settings.base_url,
+            data_dir=str(settings.data_dir.resolve()),
+            pid=pid,
+            had_pid_file=settings.pid_path.exists(),
+            software_version=__version__,
+            schema_version=SCHEMA_VERSION,
+            capabilities=frozenset(REQUIRED_CAPABILITIES),
+            verified_at=now,
+            expires_at=now + HEALTH_CACHE_TTL_SEC,
+        )
+
+
+def _classify_rpc_invalidation(
+    status_code: int, body: dict[str, Any]
+) -> tuple[bool, bool]:
+    """Return `(invalidate_cache, reset_client)` for an `/api/rpc` HTTP response."""
+    if status_code >= 500 or status_code == 426:
+        return True, True
+    if status_code >= 400 or not body.get("ok", False):
+        error_type = str(body.get("error_type") or "")
+        if error_type in {"UpgradeRequiredError", "SchemaMismatchError", "VersionMismatchError"}:
+            return True, True
+        err_text = str(body.get("detail") or body.get("error") or "").lower()
+        if any(marker in err_text for marker in _CONTRACT_REJECTION_MARKERS):
+            return True, False
+    return False, False
+
+
 async def _forward_rpc(
     settings: Settings,
     tool_name: str,
@@ -316,21 +596,31 @@ async def _forward_rpc(
     startup_lock: asyncio.Lock,
 ) -> dict[str, Any]:
     async with startup_lock:
-        await asyncio.to_thread(ensure_daemon_running, settings)
+        await _ensure_daemon_healthy_cached(settings)
+        client = await _get_or_create_rpc_client(settings)
 
     url = f"{settings.base_url}/api/rpc"
     payload = {"tool": tool_name, "arguments": arguments}
-    async with httpx.AsyncClient(
-        trust_env=False,
-        timeout=httpx.Timeout(60.0, connect=5.0),
-    ) as client:
+    try:
         # Never replay an RPC: a missing response does not imply the write failed.
         resp = await client.post(url, json=payload)
+    except BaseException:
+        invalidate_health_cache(settings)
+        await _reset_pooled_client(settings, failed_client=client)
+        raise
 
     try:
         body = resp.json()
     except ValueError:
         body = {"ok": False, "error": resp.text}
+    if not isinstance(body, dict):
+        body = {"ok": False, "error": str(body)}
+
+    inv_cache, reset_pool = _classify_rpc_invalidation(resp.status_code, body)
+    if inv_cache:
+        invalidate_health_cache(settings)
+    if reset_pool:
+        await _reset_pooled_client(settings, failed_client=client)
 
     if resp.status_code >= 400 or not body.get("ok", False):
         err_msg = body.get("detail") or body.get("error") or f"HTTP {resp.status_code}"
@@ -342,16 +632,18 @@ def _deliver_tool_result(
     settings: Settings, tool_name: str, payload: Any, *, is_error: bool = False,
 ) -> types.CallToolResult:
     """Keep small results inline; deliver the complete large result as an atomic local file."""
-    text = json.dumps(payload, ensure_ascii=False, indent=None if is_error else 2)
+    # Compact format for inline MCP results (saves tokens); pretty for overflow files.
+    text_compact = json.dumps(payload, ensure_ascii=False, indent=None, separators=(",", ":")) if not is_error else json.dumps(payload, ensure_ascii=False)
     result = types.CallToolResult(
-        content=[types.TextContent(type="text", text=text)], is_error=is_error,
+        content=[types.TextContent(type="text", text=text_compact)], is_error=is_error,
     )
     # Measure the actual MCP encoding: escaped JSON text can be much larger than its file.
     wire_bytes = len(result.model_dump_json(by_alias=True, exclude_unset=True).encode("utf-8"))
     if wire_bytes <= INLINE_RESULT_BYTES:
         return result
 
-    encoded = text.encode("utf-8")
+    text_pretty = json.dumps(payload, ensure_ascii=False, indent=2)
+    encoded = text_pretty.encode("utf-8")
     directory = (settings.data_dir / "results").resolve()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{uuid.uuid4().hex}.json"
@@ -361,6 +653,21 @@ def _deliver_tool_result(
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
+    # Prune stale overflow files older than 24h, keeping latest 50.
+    try:
+        result_files = sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        cutoff = time.time() - 86400
+        kept = 0
+        for rf in reversed(result_files):
+            if kept >= 50 or rf.stat().st_mtime < cutoff:
+                try:
+                    rf.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            else:
+                kept += 1
+    except OSError:
+        pass
     delivery = {
         "delivery": "file", "tool": tool_name, "result_file": str(path),
         "bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest(),
@@ -443,7 +750,7 @@ async def async_main(settings: Settings | None = None) -> None:
     configure_shim_logging(cfg)
     # Probe and ensure singleton daemon is running before handling stdio requests.
     try:
-        await asyncio.to_thread(ensure_daemon_running, cfg)
+        await _ensure_daemon_healthy_cached(cfg)
     except UpgradeRequiredError:
         # A catalog backed by an incompatible live daemon must not look ready.
         raise
@@ -452,8 +759,11 @@ async def async_main(settings: Settings | None = None) -> None:
 
     server = create_mcp_server(cfg)
     init_options: InitializationOptions = server.create_initialization_options()
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, init_options)
+    try:
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, init_options)
+    finally:
+        await aclose_rpc_clients()
 
 
 def main() -> int:

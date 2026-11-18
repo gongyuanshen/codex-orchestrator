@@ -14,7 +14,9 @@ from orchestrator.db import Database
 logger = logging.getLogger(__name__)
 
 
-def classify_run(db: Database, run_id: str, *, now: float | None = None) -> dict[str, Any]:
+def classify_run(db: Database, run_id: str, *, now: float | None = None,
+                 precomputed_native: dict[str, Any] | None = None,
+                 precomputed_readiness: dict[str, Any] | None = None) -> dict[str, Any]:
     """Read persisted facts, never infer host death or perform admission/dispatch.
 
     Planned steps are potential work, not proof of current artifact admission.
@@ -33,8 +35,8 @@ def classify_run(db: Database, run_id: str, *, now: float | None = None) -> dict
         steps = [dict(row) for row in conn.execute('SELECT * FROM workflow_steps WHERE run_id=? ORDER BY created_at,id', (run_id,))]
     workers = {w['name']: w for w in db.list_workers(run_id=run_id)}
     pending_steps = [s for s in steps if s['state'] != 'done']
-    native = NativeActionStore(db).project(run_id)
-    readiness = flow.plan_readiness(run_id)
+    native = precomputed_native if precomputed_native is not None else NativeActionStore(db).project(run_id)
+    readiness = precomputed_readiness if precomputed_readiness is not None else flow.plan_readiness(run_id)
     with db.read_connection() as conn:
         outstanding_inbox = [dict(row) for row in conn.execute("SELECT id,status,step_id FROM inbox_messages WHERE run_id=? AND kind!='notice' AND status IN ('pending','accepted')", (run_id,))]
         failed_native = [dict(row) for row in conn.execute("SELECT action_id,source_type,source_id,recipient FROM native_actions WHERE run_id=? AND status='failed' AND outcome='failed'", (run_id,))]
@@ -42,7 +44,8 @@ def classify_run(db: Database, run_id: str, *, now: float | None = None) -> dict
         control_pending = conn.execute("SELECT count(*) FROM worker_controls WHERE run_id=? AND status='pending'", (run_id,)).fetchone()[0]
     wake_epochs = {}
     for wake in native_wakes:
-        binding = (wake['recipient'], json.loads(wake['snapshot_json'])['agent_id'])
+        snap = json.loads(wake['snapshot_json'])
+        binding = (wake['recipient'], snap.get('agent_id') or snap.get('pending_agent_path'))
         for event in json.loads(wake['history_json']):
             if event['operation'] == 'begin':
                 wake_epochs[binding] = max(wake_epochs.get(binding, 0), event['at'])
@@ -65,6 +68,9 @@ def classify_run(db: Database, run_id: str, *, now: float | None = None) -> dict
     for item in native['next_actions']:
         if item['source_type'] == 'control':
             executable.append(dict(kind='native_control', source_id=item['source_id'], recipient=item['recipient']))
+        elif item['action_type'] == 'spawn_agent':
+            executable.append(dict(kind='native_spawn', source_id=item['source_id'], recipient=item['recipient'],
+                                   pending_agent_path=item.get('pending_agent_path')))
     for group in native['next_action_groups']:
         executable.append(dict(kind='native_handoff', recipient=group['recipient'], agent_id=group['agent_id'],
                                source_ids=[m['source_id'] for m in group['members']]))
@@ -86,7 +92,27 @@ def classify_run(db: Database, run_id: str, *, now: float | None = None) -> dict
             continue
         role = 'verifier' if state in {'candidate_review', 'integrated_review'} else 'owner'
         worker = workers.get(step[role])
-        if worker is None or worker['agent_id'] != step[role + '_agent_id']:
+        expected_aid = step[role + '_agent_id']
+        if run['workflow_version'] == 5 and expected_aid == '':
+            if worker is None or worker['agent_id'] is not None:
+                block('binding_changed', 'Original native binding is unavailable; do not replace it automatically', **identity)
+                continue
+            if worker['status'] in {'stopped', 'killed'}:
+                block('user_decision', 'Original worker is stopped; automatic resume is forbidden', worker=worker['name'], **identity)
+                continue
+            dependencies = json.loads(step['dependencies_json'])
+            unresolved = [dep_id for dep_id in dependencies if states.get(dep_id) != 'done']
+            if state == 'planned':
+                if unresolved:
+                    dependency_waits.append(dict(step_id=step['id'], dependencies=unresolved))
+                else:
+                    potential.append(dict(kind='dispatch_requires_admission', step_id=step['id']))
+                continue
+            if state in {'candidate_review', 'integrated_review'}:
+                potential.append(dict(kind='verifier_spawn_required', step_id=step['id'], state=state, verifier=worker['name']))
+                continue
+            continue
+        if worker is None or worker['agent_id'] != expected_aid:
             block('binding_changed', 'Original native binding is unavailable; do not replace it automatically', **identity)
             continue
         if worker['status'] in {'stopped', 'killed'}:
@@ -184,10 +210,10 @@ class StallWatchdog:
         ts = float(now) if now is not None else time.time()
         # Workflow0-3 keep their historical heartbeat alert contract.
         stalled_workers = [w for w in self.db.find_stalled_workers(now=ts)
-                           if self.db.get_run(w['run_id'])['workflow_version'] != 4]
+                           if self.db.get_run(w['run_id'])['workflow_version'] not in {4, 5}]
         alerts: list[dict[str, Any]] = []
         with self.db.read_connection() as conn:
-            run_ids = [row['id'] for row in conn.execute("SELECT id FROM runs WHERE status='active' AND workflow_version=4")]
+            run_ids = [row['id'] for row in conn.execute("SELECT id FROM runs WHERE status='active' AND workflow_version IN (4, 5)")]
         for run_id in run_ids:
             facts = classify_run(self.db, run_id, now=ts)
             if not facts['alert_required']:
