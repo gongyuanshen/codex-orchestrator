@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -10,6 +12,7 @@ import time
 from pathlib import Path
 
 import httpx
+import pytest
 import uvicorn
 
 from orchestrator.config import Settings
@@ -145,6 +148,34 @@ def test_pipeline_skill_frontmatter_sections_and_guardrails() -> None:
         "thread/resume",
     ):
         assert guardrail in step3, guardrail
+
+
+def test_pipeline_skill_windows_lookup_runs_as_documented(tmp_path: Path) -> None:
+    shell = shutil.which("powershell.exe") or shutil.which("pwsh.exe")
+    if os.name != "nt" or not shell:
+        pytest.skip("Windows PowerShell is required")
+
+    command = next(
+        line.split("`")[1]
+        for line in PIPELINE_SKILL.read_text(encoding="utf-8").splitlines()
+        if "**Windows (PowerShell)**" in line
+    )
+    codex_home = tmp_path / "Codex Home"
+    executable = (
+        codex_home / "plugins/cache/tri-orchestrator/tri-orchestrator"
+        / "99.0.0/.venv/Scripts/tri-orchestrator-pipeline.exe"
+    )
+    executable.parent.mkdir(parents=True)
+    executable.touch()
+    proc = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; " + command],
+        env={**os.environ, "CODEX_HOME": str(codex_home)},
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert Path(proc.stdout.strip()) == executable
 
 
 def test_web_app_js_passes_node_syntax_check() -> None:

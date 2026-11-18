@@ -121,7 +121,7 @@ metadata:
    - 若当前会话已调用过 `run_create` 或 `board_status(compact=True)`，优先直接使用返回的 `cli_executables.pipeline` 精确绝对路径（`cli_executables` 同时暴露同 `.venv` 下的 `tri-orchestrator-verify` 与 `tri-orchestrator-challenge`）；
    - 否则优先使用宿主 `PATH` 中的 `tri-orchestrator-pipeline`；
    - 若未加入全局 `PATH`，按插件缓存通配目录动态解析最新已安装版本（不假设固定版本号）：
-     - **Windows (PowerShell)**：`Get-ChildItem (Join-Path (if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }) 'plugins\cache\tri-orchestrator\tri-orchestrator\*\.venv\Scripts\tri-orchestrator-pipeline.exe') -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName`（通配 `plugins/cache/tri-orchestrator/tri-orchestrator/*/.venv` 下的 `Scripts/tri-orchestrator-pipeline.exe`）
+     - **Windows (PowerShell)**：`Get-ChildItem (Join-Path $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }) 'plugins\cache\tri-orchestrator\tri-orchestrator\*\.venv\Scripts\tri-orchestrator-pipeline.exe') -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName`（通配 `plugins/cache/tri-orchestrator/tri-orchestrator/*/.venv` 下的 `Scripts/tri-orchestrator-pipeline.exe`）
      - **POSIX (sh/bash/zsh)**：`ls -1dt "${CODEX_HOME:-$HOME/.codex}"/plugins/cache/tri-orchestrator/tri-orchestrator/*/.venv/bin/tri-orchestrator-pipeline 2>/dev/null | head -n 1`（通配 `plugins/cache/tri-orchestrator/tri-orchestrator/*/.venv` 下的 `bin/tri-orchestrator-pipeline`）
 2. **标准调用命令**：
    ```bash
