@@ -255,6 +255,41 @@ def test_wal_snapshot_rejects_source_change_during_copy(codex_home, monkeypatch)
         assert bridge.get_thread_meta("named")["title"] == "After copy"
 
 
+@pytest.mark.parametrize("writer_stays_open", [False, True])
+def test_concurrent_wal_transition_never_opens_writable_sidecars(codex_home, monkeypatch, writer_stays_open):
+    bridge = _bridge()
+    db = codex_home / "state_5.sqlite"
+    original_connect = sqlite3.connect
+    baseline = None
+
+    with ExitStack() as stack:
+        def connect(filename, **kwargs):
+            nonlocal baseline
+            if baseline is None:
+                writer = original_connect(db)
+                try:
+                    assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+                    writer.execute("UPDATE threads SET name='WAL transition' WHERE id='named'")
+                    writer.commit()
+                finally:
+                    if writer_stays_open:
+                        stack.callback(writer.close)
+                    else:
+                        writer.close()
+                baseline = _snapshot(codex_home)
+                assert ("state_5.sqlite-wal" in baseline) == writer_stays_open
+                assert ("state_5.sqlite-shm" in baseline) == writer_stays_open
+            return original_connect(filename, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(bridge.sqlite3, "connect", connect)
+            bridge.get_thread_meta("named")
+        assert baseline is not None
+        assert _snapshot(codex_home) == baseline
+        assert bridge.get_thread_meta("named")["title"] == "WAL transition"
+        assert _snapshot(codex_home) == baseline
+
+
 @pytest.mark.parametrize("broken", ["missing", "corrupt", "columns", "locked"])
 def test_unavailable_state_returns_only_empty_values_and_never_writes(codex_home, broken, caplog):
     bridge = _bridge()

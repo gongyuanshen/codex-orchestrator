@@ -103,6 +103,8 @@ def _connect(db: Path, wal: Path, files: tuple[_FileState | None, ...]) -> Itera
         wal_header = 2 in source.read(20)[18:20]
     if not wal_header and files[1] is None:
         with closing(sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.5)) as conn:
+            # A writer may switch to WAL after the header read; exclusive mode avoids live SHM.
+            conn.execute("PRAGMA locking_mode=EXCLUSIVE")
             conn.execute("PRAGMA temp_store=MEMORY")
             yield conn
         return
