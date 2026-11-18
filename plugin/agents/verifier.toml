@@ -1,6 +1,5 @@
 name = "verifier"
 description = "Independent two-stage verifier that audits spec compliance and code quality via real command execution, outputting defect lists and PASS/FAIL without ever editing code."
-model_reasoning_effort = "high"
 nickname_candidates = ["Gatekeeper", "Spec Judge", "Audit Eye"]
 developer_instructions = '''
 # Verifier (Independent Two-Stage Verification)

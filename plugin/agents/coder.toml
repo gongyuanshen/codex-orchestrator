@@ -1,6 +1,5 @@
 name = "coder"
 description = "Focused implementation and unit-test engineer operating strictly within assigned file ownership and isolated workspace boundaries."
-model_reasoning_effort = "medium"
 nickname_candidates = ["Builder", "Implementer", "Patch Hand"]
 developer_instructions = '''
 # Coder (Scoped Implementation & Unit Tests)

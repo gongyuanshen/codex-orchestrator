@@ -1,6 +1,6 @@
 ---
 name: teamwork
-description: "Structured multi-agent engineering workflow ($teamwork) with optional [skip-interview], requirement clarification, xhigh architecture planning with mutually exclusive file ownership, isolated parallel coders, two-stage verification, same-thread rework, and safe sequential merge. Use for medium-to-large features or refactors needing strict spec freeze and file ownership separation (for unattended App-Server batch DAGs, use $pipeline)."
+description: "Structured multi-agent engineering workflow ($teamwork) with optional [skip-interview], requirement clarification, architecture planning with mutually exclusive file ownership, isolated parallel coders, two-stage verification, same-thread rework, and safe sequential merge. Use for medium-to-large features or refactors needing strict spec freeze and file ownership separation (for unattended App-Server batch DAGs, use $pipeline)."
 metadata:
   short-description: "Spec freeze -> Task Packet -> Parallel isolation -> 2-stage review"
 ---
@@ -45,15 +45,12 @@ Use one `kind="milestone"` work step per milestone with explicit criteria/depend
 
 ## Non-Negotiable Codex Subagent Rules
 
-- **Dynamic Model Inheritance**: NEVER pass a `model` parameter (or hardcoded/stale model preset name) to `spawn_agent`. Omit `model` so 100% of subagents inherit your active Codex session model.
-- **Role Resolution & Zero-Script `agent_type` Omission + Explicit `reasoning_effort`**: Prefer specialized `agent_type` (`interviewer`, `planner`, `investigator`, `coder`, `verifier`) when installed in `~/.codex/agents/*.toml`. When `install.ps1` / `install.sh` has not installed custom agent TOMLs, **omit `agent_type` entirely** (do NOT pass a fallback `"default"` role name, because `codex.exe` omits `agent_type` from `spawn_agent`'s `additionalProperties: false` schema when `~/.codex/agents/` is empty), inline the matching contract from **Inline Fallback Role Contracts** (with `fork_turns: "none"`), AND explicitly pass `reasoning_effort` by logical role:
-  - `planner` -> `"xhigh"`
-  - `verifier` / `investigator` / `interviewer` / `challenger` -> `"high"`
-  - `coder` / `swarm_worker` -> `"medium"` (or omit to inherit the session default)
+- **Dynamic Model & Reasoning Effort Inheritance**: NEVER pass a hardcoded `model` or `reasoning_effort` parameter to `spawn_agent` (unless the user explicitly asks for an override). Omit both `model` and `reasoning_effort` so 100% of subagents inherit your active Codex session model and reasoning effort tier.
+- **Role Resolution & Zero-Script `agent_type` Omission**: Prefer specialized `agent_type` (`interviewer`, `planner`, `investigator`, `coder`, `verifier`) when installed in `~/.codex/agents/*.toml` (which also omits `model` and `model_reasoning_effort` to inherit session defaults). When `install.ps1` / `install.sh` has not installed custom agent TOMLs, **omit `agent_type` entirely** (do NOT pass a fallback `"default"` role name, because `codex.exe` omits `agent_type` from `spawn_agent`'s `additionalProperties: false` schema when `~/.codex/agents/` is empty), inline the matching contract from **Inline Fallback Role Contracts**, and omit `model` and `reasoning_effort` so the subagent inherits your session model and reasoning effort tier.
   Always pass the logical role (`interviewer`, `planner`, `investigator`, `coder`, `verifier`) to `worker_register` / `workflow_prepare_dispatch`.
 - **Nuanced `fork_turns` Policy**:
-  - In Codex V2, custom `agent_type` applies regardless of `fork_turns`. MUST keep `fork_turns: "none"` to keep child context minimal for independent `verifier`, high-complexity counterexample `challenger` (unbiased blind review), and zero-script roles requiring an explicit `reasoning_effort` override such as `planner` or `interviewer`.
-  - ALLOW `fork_turns: "all"` when the coordinator has already loaded key context and the subagent (`coder`, `swarm_worker`, or scoped branch `investigator`) does not need context isolation or a `reasoning_effort` override, reusing warm KV cache instead of cold rescanning.
+  - In Codex V2, custom `agent_type` applies regardless of `fork_turns`. MUST keep `fork_turns: "none"` to keep child context minimal for independent `verifier` and high-complexity counterexample `challenger` (unbiased blind review).
+  - ALLOW `fork_turns: "all"` when the coordinator has already loaded key context and the subagent (`coder`, `swarm_worker`, or scoped branch `investigator`) does not need context isolation, reusing warm KV cache instead of cold rescanning.
 - **Controlled `max_depth = 2` Read-Only `investigator` Helpers**:
   - `interviewer`, `investigator`, and `challenger` are strictly forbidden from spawning subagents.
   - Depth-1 `planner`, `coder`, `swarm_worker`, and `verifier` MAY spawn pure read-only `investigator` helpers within active concurrency budget ONLY for cross-module call-chain lookup (helpers must never edit files, never register as author/verifier on `18790`, and never submit verification receipts; caller remains solely accountable).
@@ -94,16 +91,16 @@ Include the matching contract verbatim in the child prompt whenever omitting `ag
 
 ### Step 1: Requirement Clarification (`interviewer`, unless `[skip-interview]`)
 
-- If `[skip-interview]` is NOT set and requirements are ambiguous: register `worker_register(run_id=run_id, name="interviewer", role="interviewer", status="waiting", current_task="Clarify requirements")`, dispatch `spawn_agent(agent_type="interviewer", fork_turns="none", ...)` (or omit `agent_type` when `~/.codex/agents/` is absent and pass `reasoning_effort="high"`, omit `model`), clarify one question per round, and post the frozen contract via `board_post`.
+- If `[skip-interview]` is NOT set and requirements are ambiguous: register `worker_register(run_id=run_id, name="interviewer", role="interviewer", status="waiting", current_task="Clarify requirements")`, dispatch `spawn_agent(agent_type="interviewer", fork_turns="none", ...)` (or omit `agent_type` when `~/.codex/agents/` is absent, omitting `model` and `reasoning_effort` to inherit session defaults), clarify one question per round, and post the frozen contract via `board_post`.
 
 ### Step 2: Architecture & Mutually Exclusive File Ownership (`planner`)
 
-1. Register `worker_register(run_id=run_id, name="planner", role="planner", status="waiting", current_task="Decompose architecture & file ownership")` and dispatch `spawn_agent(agent_type="planner", fork_turns="none", ...)` (or omit `agent_type` when `~/.codex/agents/` is absent and pass `reasoning_effort="xhigh"`, omit `model`).
+1. Register `worker_register(run_id=run_id, name="planner", role="planner", status="waiting", current_task="Decompose architecture & file ownership")` and dispatch `spawn_agent(agent_type="planner", fork_turns="none", ...)` (or omit `agent_type` when `~/.codex/agents/` is absent, omitting `model` and `reasoning_effort` to inherit session defaults).
 2. Persist locked interfaces, mutually exclusive `file_ownership`, verifiable acceptance criteria, and sequential merge order via `task_packet_save` and verify via `task_packet_get(run_id=run_id)`.
 
 ### Step 3: Isolated Workspaces & Parallel Implementation (`coder`)
 
-1. **Primary `workflow5` 1-turn Direct Dispatch**: Register logical `verifier` (`verifier_agent_id=""`), then for each admitted parallel writer (`coder-1`, `coder-2`, ...) call `workflow_prepare_dispatch(run_id=run_id, create_workspace=True, task_name="coder_1", owner="coder-1", verifier="verifier", dispatch_action="dispatch", ...)` -> top-level 1-turn `spawn_agent(task_name="coder_1", ...)` (`fork_turns="all"` when context is warm without `reasoning_effort` override, or `fork_turns="none"`, omit `model`) -> `native_action_record_call(...)`. Coders accept/submit via `workflow_author_turn(phase="accept"|"submit")`. (Stored `workflow1..4` fallback via `board_status.workflow.workflow_version`: spawn a bootstrap-only prebound verifier, run `workspace_create` + `worker_register(run_id=run_id, name="coder-1", role="coder", status="waiting", workspace_id=ws["id"])`, call `workflow_step_advance(action="dispatch")`, and deliver briefs via `followup_task`.)
+1. **Primary `workflow5` 1-turn Direct Dispatch**: Register logical `verifier` (`verifier_agent_id=""`), then for each admitted parallel writer (`coder-1`, `coder-2`, ...) call `workflow_prepare_dispatch(run_id=run_id, create_workspace=True, task_name="coder_1", owner="coder-1", verifier="verifier", dispatch_action="dispatch", ...)` -> top-level 1-turn `spawn_agent(task_name="coder_1", ...)` (`fork_turns="all"` when context is warm, or `fork_turns="none"`, omit `model` and `reasoning_effort`) -> `native_action_record_call(...)`. Coders accept/submit via `workflow_author_turn(phase="accept"|"submit")`. (Stored `workflow1..4` fallback via `board_status.workflow.workflow_version`: spawn a bootstrap-only prebound verifier, run `workspace_create` + `worker_register(run_id=run_id, name="coder-1", role="coder", status="waiting", workspace_id=ws["id"])`, call `workflow_step_advance(action="dispatch")`, and deliver briefs via `followup_task`.)
 2. Poll `board_status(run_id=run_id, compact=True)` / `board_read` around `wait_agent(timeout_ms=30000)`.
 
 ### Step 4: Two-Stage Independent Verification (`verifier`)

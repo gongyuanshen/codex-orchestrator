@@ -226,7 +226,7 @@ class _ThreadContext:
         role: str,
         cwd: str,
         model: str | None,
-        effort: str,
+        effort: str | None,
         allow_network: bool,
     ) -> None:
         self.thread_id = thread_id
@@ -586,7 +586,7 @@ class AppServerStdioClient:
         cwd: str | Path,
         *,
         model: str | None = None,
-        effort: str = "medium",
+        effort: str | None = None,
         allow_network: bool = False,
     ) -> AttrDict:
         """Start a persistent ``workspace-write`` author thread in ``cwd``."""
@@ -631,7 +631,7 @@ class AppServerStdioClient:
             role="author",
             cwd=resolved_cwd,
             model=model,
-            effort=effort or "medium",
+            effort=effort or None,
             allow_network=bool(allow_network),
         )
         return AttrDict(
@@ -647,7 +647,7 @@ class AppServerStdioClient:
         cwd: str | Path,
         *,
         model: str | None = None,
-        effort: str = "high",
+        effort: str | None = None,
     ) -> AttrDict:
         """Start an independent persistent ``read-only`` verifier thread in ``cwd``."""
         await self._ensure_started()
@@ -678,7 +678,7 @@ class AppServerStdioClient:
             role="verifier",
             cwd=resolved_cwd,
             model=model,
-            effort=effort or "high",
+            effort=effort or None,
             allow_network=False,
         )
         return AttrDict(
@@ -768,13 +768,13 @@ class AppServerStdioClient:
         if effective_cwd is None:
             effective_cwd = self._cwd or os.getcwd()
 
-        default_effort = "high" if role == "verifier" else "medium"
+        prev_effort = self._threads[tid].effort if tid in self._threads else None
         self._threads[tid] = _ThreadContext(
             thread_id=tid,
             role=role,
             cwd=effective_cwd,
             model=model,
-            effort=effort or default_effort,
+            effort=effort if effort is not None else prev_effort,
             allow_network=False if role == "verifier" else bool(allow_network),
         )
         return AttrDict(
@@ -841,11 +841,11 @@ class AppServerStdioClient:
 
         effective_model = model if model is not None else (ctx.model if ctx is not None else None)
         if effort is not None:
-            effective_effort = effort
+            effective_effort = effort or None
         elif ctx is not None:
             effective_effort = ctx.effort
         else:
-            effective_effort = "high" if effective_role == "verifier" else "medium"
+            effective_effort = None
 
         if allow_network is not None:
             effective_network = bool(allow_network)
@@ -864,7 +864,6 @@ class AppServerStdioClient:
                 if output_schema is not None
                 else copy.deepcopy(BUILTIN_VERIFIER_OUTPUT_SCHEMA)
             )
-            effective_effort = effective_effort or "high"
         else:
             sandbox_policy = {
                 "type": "workspaceWrite",
@@ -878,9 +877,10 @@ class AppServerStdioClient:
             "cwd": effective_cwd,
             "approvalPolicy": "never",
             "sandboxPolicy": sandbox_policy,
-            "effort": effective_effort,
             "input": [{"type": "text", "text": prompt}],
         }
+        if effective_effort:
+            params["effort"] = effective_effort
         if effective_model is not None:
             params["model"] = effective_model
         if resolved_schema is not None:

@@ -1,6 +1,5 @@
 name = "swarm_worker"
 description = "Concurrent swarm worker restricted to its isolated .swarm-workspaces/<worker> path that publishes detailed logs and diffs to board_post and returns only a one-line #seq pointer."
-model_reasoning_effort = "medium"
 nickname_candidates = ["Swarm Node", "Leaf Worker", "Board Writer"]
 developer_instructions = '''
 # Swarm Worker (Isolated Execution & #seq Short-Pointer Discipline)

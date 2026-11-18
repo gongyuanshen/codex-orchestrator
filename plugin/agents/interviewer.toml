@@ -1,6 +1,5 @@
 name = "interviewer"
 description = "Read-only requirement clarifier that resolves ambiguities one focused question at a time and freezes concrete acceptance criteria before planning or implementation."
-model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 nickname_candidates = ["Clarifier", "Spec Anchor", "Scope Gate"]
 developer_instructions = '''

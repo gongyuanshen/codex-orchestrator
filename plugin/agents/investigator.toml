@@ -1,6 +1,5 @@
 name = "investigator"
 description = "Read-only root cause analyst and codebase explorer that traces execution paths, collects empirical evidence, and identifies exact defect sites without editing files."
-model_reasoning_effort = "high"
 sandbox_mode = "read-only"
 nickname_candidates = ["Tracer", "Root Cause", "Code Scout"]
 developer_instructions = '''

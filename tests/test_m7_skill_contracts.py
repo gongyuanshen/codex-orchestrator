@@ -12,14 +12,7 @@ MODES = ("boost", "teamwork", "swarm")
 ALL_SKILLS = ("boost", "teamwork", "swarm", "pipeline")
 STRICT_NO_SPAWN_ROLES = ("interviewer", "investigator")
 DEPTH1_HELPER_ROLES = ("planner", "coder", "swarm_worker", "verifier")
-EXPECTED_TOML_REASONING = {
-    "planner": "xhigh",
-    "verifier": "high",
-    "investigator": "high",
-    "interviewer": "high",
-    "coder": "medium",
-    "swarm_worker": "medium",
-}
+EXPECTED_AGENT_ROLES = frozenset((*STRICT_NO_SPAWN_ROLES, *DEPTH1_HELPER_ROLES))
 
 
 def _skill_text(mode: str) -> str:
@@ -36,22 +29,18 @@ def _inline_role_map(text: str) -> dict[str, str]:
 
 
 @pytest.mark.parametrize("mode", MODES)
-def test_zero_script_agent_type_omission_explicit_reasoning_effort_and_model_omission(mode: str) -> None:
+def test_zero_script_agent_type_omission_and_full_model_and_reasoning_effort_inheritance(mode: str) -> None:
     text = _skill_text(mode)
     assert 'agent_type: "default"' not in text
     assert 'agent_type="default"' not in text
+    assert "xhigh" not in text
     rules = text.split("## Non-Negotiable Codex Subagent Rules", 1)[1].split("\n## ", 1)[0]
     assert "omit `agent_type`" in rules
     assert "additionalProperties: false" in rules
     assert "install.ps1" in rules
     assert "reasoning_effort" in rules
-    assert '`planner` -> `"xhigh"`' in rules
-    for high_role in ("verifier", "investigator", "interviewer", "challenger"):
-        assert high_role in rules
-    assert '"high"' in rules
-    assert '"medium"' in rules
-    assert "Omit `model`" in rules
-    assert "NEVER pass a `model` parameter" in rules
+    assert "Omit both `model` and `reasoning_effort`" in rules
+    assert "NEVER pass a hardcoded `model` or `reasoning_effort` parameter" in rules
 
 
 def test_zero_functions_exec_and_zero_default_agent_type_across_all_skills_and_roles() -> None:
@@ -63,13 +52,15 @@ def test_zero_functions_exec_and_zero_default_agent_type_across_all_skills_and_r
         assert "functions.exec" not in text, f"{path} still references removed functions.exec"
         assert 'agent_type="default"' not in text, f"{path} still instructs agent_type=\"default\""
         assert 'agent_type: "default"' not in text, f"{path} still instructs agent_type: \"default\""
+        assert "xhigh" not in text, f"{path} still hardcodes xhigh reasoning effort"
 
 
 @pytest.mark.parametrize("path", sorted((ROOT / "agents").glob("*.toml")), ids=lambda p: p.stem)
-def test_agent_tomls_match_reasoning_tiers_and_omit_model(path: Path) -> None:
+def test_agent_tomls_omit_model_and_reasoning_effort_to_inherit_session(path: Path) -> None:
+    assert path.stem in EXPECTED_AGENT_ROLES
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     assert "model" not in data
-    assert data["model_reasoning_effort"] == EXPECTED_TOML_REASONING[path.stem]
+    assert "model_reasoning_effort" not in data
     if path.stem in STRICT_NO_SPAWN_ROLES:
         assert data["sandbox_mode"] == "read-only"
     else:
@@ -97,7 +88,7 @@ def test_shared_workflow_documents_nuanced_fork_turns_and_reasoning_effort() -> 
     assert "custom `agent_type` applies regardless of `fork_turns`" in shared
     assert 'fork_turns: "none"' in shared
     assert 'fork_turns: "all"' in shared
-    assert 'planner="xhigh"' in shared
+    assert "Omit both `model` and `reasoning_effort` on `spawn_agent`" in shared
     assert "reasoning_effort" in shared
 
 

@@ -557,15 +557,16 @@ def test_real_codex_isolation_no_mcp_or_hook_leakage_and_sandbox_contracts(
                 user_agent = str(client.server_info.get("userAgent") or "")
                 assert "0.166.0" in user_agent or "codex" in user_agent.lower()
 
-                # 1) Author thread MUST have workspaceWrite (never silently coerced to readOnly!)
-                author = await client.start_author_thread(work_dir, model="gpt-5", effort="medium")
+                # 1) Author thread MUST have workspaceWrite (never silently coerced to readOnly!) and inherit session reasoningEffort
+                author = await client.start_author_thread(work_dir)
                 assert author.raw_response["sandbox"]["type"] == "workspaceWrite"
-                assert author.raw_response["reasoningEffort"] == "medium"
+                assert author.raw_response["model"] == "gpt-5"
 
-                # 2) Verifier thread MUST have readOnly + high reasoningEffort
-                verifier = await client.start_verifier_thread(work_dir, model="gpt-5", effort="high")
+                # 2) Verifier thread MUST have readOnly and inherit session reasoningEffort
+                verifier = await client.start_verifier_thread(work_dir)
                 assert verifier.raw_response["sandbox"]["type"] == "readOnly"
-                assert verifier.raw_response["reasoningEffort"] == "high"
+                assert verifier.raw_response["model"] == "gpt-5"
+                assert verifier.raw_response["reasoningEffort"] == author.raw_response["reasoningEffort"]
 
                 # 3) Author turn executes real sandboxed exec_command writing probe_written.txt
                 auth_turn = await client.run_turn(

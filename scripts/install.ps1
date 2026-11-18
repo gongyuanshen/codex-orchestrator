@@ -493,6 +493,7 @@ $roleCheckPy = @'
 import sys, tomllib
 d = tomllib.loads(open(sys.argv[1], "r", encoding="utf-8").read())
 assert "model" not in d, "hardcoded model forbidden"
+assert "model_reasoning_effort" not in d, "hardcoded model_reasoning_effort forbidden"
 assert d.get("name") and d.get("description") and d.get("developer_instructions"), "missing required fields"
 '@
 
