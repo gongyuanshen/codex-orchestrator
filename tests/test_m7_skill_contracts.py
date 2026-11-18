@@ -9,7 +9,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1] / "plugin"
 MODES = ("boost", "teamwork", "swarm")
-ALL_SKILLS = ("boost", "teamwork", "swarm", "pipeline")
+ALL_SKILLS = ("boost", "teamwork", "swarm")
 STRICT_NO_SPAWN_ROLES = ("interviewer", "investigator")
 DEPTH1_HELPER_ROLES = ("planner", "coder", "swarm_worker", "verifier")
 EXPECTED_AGENT_ROLES = frozenset((*STRICT_NO_SPAWN_ROLES, *DEPTH1_HELPER_ROLES))
@@ -216,8 +216,7 @@ def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_verifier_cl
         assert "self-contained" in instructions, path
         assert "cli_executables" in instructions, path
         assert "tri-orchestrator-challenge" in instructions, path
-        assert 'execution_kind="app_server_pipeline"' in instructions, path
-        assert "appserver://<thread_id>" in instructions, path
+        assert 'execution_kind' in instructions, path
         # Streamlined Route A footer stays compact (<= 6 bullet lines under ## Route A structured workflow)
         footer = instructions.split("## Route A structured workflow", 1)[1].strip().splitlines()
         assert len(footer) <= 6, (path, len(footer))

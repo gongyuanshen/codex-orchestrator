@@ -45,5 +45,4 @@ def test_local_verification_collector_console_entry():
         'tri-orchestrator-verify': 'orchestrator.verify_runner:main',
         'tri-orchestrator-hook': 'orchestrator.hook_runner:main',
         'tri-orchestrator-challenge': 'orchestrator.challenge_runner:main',
-        'tri-orchestrator-pipeline': 'orchestrator.pipeline_runner:main',
     }

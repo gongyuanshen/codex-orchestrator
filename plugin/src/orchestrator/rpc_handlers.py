@@ -28,7 +28,6 @@ from orchestrator.db import (
     VALID_WORKER_STATUSES,
     Database,
     NotFoundError,
-    is_appserver_agent_id,
 )
 from orchestrator.workspace_mgr import (
     VALID_DEP_MODES,
@@ -45,7 +44,7 @@ def _discover_cli_executables() -> dict[str, str | None]:
     scripts_dir = Path(sys.executable).parent
     ext = ".exe" if os.name == "nt" else ""
     result: dict[str, str | None] = {}
-    for name in ("tri-orchestrator-verify", "tri-orchestrator-challenge", "tri-orchestrator-pipeline"):
+    for name in ("tri-orchestrator-verify", "tri-orchestrator-challenge"):
         candidate = scripts_dir / (name + ext)
         if candidate.is_file():
             result[name.replace("tri-orchestrator-", "")] = str(candidate)
@@ -528,7 +527,7 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                 "handoff_required": {"type": "boolean", "default": False},
                 "criteria": {"type": "array", "items": {"type": "string"}, "minItems": 1},
                 "complexity": {"type": "string", "enum": ["normal", "high"], "default": "normal"},
-                "execution_kind": {"type": "string", "enum": ["native", "coordinator_local", "app_server_pipeline"], "default": "native"},
+                "execution_kind": {"type": "string", "enum": ["native", "coordinator_local"], "default": "native"},
             },
             "required": ["run_id", "step_key", "owner", "verifier"], "additionalProperties": False,
         },
@@ -569,7 +568,6 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                 "step_id": {"type": "string"},
                 "scope": {"type": "string", "enum": ["candidate", "integrated"], "default": "candidate"},
                 "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                "verifier_agent_id": {"type": "string"},
                 "env_profile": {
                     "type": "string",
                     "enum": sorted(ENV_PROFILES),
@@ -595,7 +593,7 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
             "type": "object",
             "properties": {
                 "step_id": {"type": "string"}, "artifact_id": {"type": "string"},
-                "verifier": {"type": "string"}, "verifier_agent_id": {"type": "string"},
+                "verifier": {"type": "string"},
                 "verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
                 "key": {"type": "string"},
                 "criteria_results": {"type": "array", "items": {
@@ -669,7 +667,7 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                 "step_kind": {"type": "string", "enum": ["task", "milestone"], "default": "task"},
                 "handoff_required": {"type": "boolean", "default": False},
                 "complexity": {"type": "string", "enum": ["normal", "high"], "default": "normal"},
-                "execution_kind": {"type": "string", "enum": ["native", "coordinator_local", "app_server_pipeline"], "default": "native"},
+                "execution_kind": {"type": "string", "enum": ["native", "coordinator_local"], "default": "native"},
                 "expected_step_revision": {"type": "integer", "minimum": 0},
                 "advance_evidence": {"type": "string"},
                 "advance_agent_id": {"type": "string"},
@@ -1419,28 +1417,6 @@ class RpcDispatcher:
                         else args.get("verifier_task_name")
                     )
 
-                effective_exec_kind = str(
-                    args.get("execution_kind")
-                    or (existing_step["checkpoint"].get("execution_kind", "native") if existing_step else "native")
-                )
-                if effective_exec_kind == "app_server_pipeline":
-                    if (
-                        target_task_name is not None
-                        or args.get("pending_agent_path") is not None
-                        or args.get("verifier_task_name") is not None
-                    ):
-                        raise WorkflowConflictError(
-                            "app_server_pipeline forbids /root/... pre-spawn pending_agent_path or task_name"
-                        )
-                    if target_agent_id is not None and not is_appserver_agent_id(str(target_agent_id)):
-                        raise WorkflowConflictError(
-                            f"app_server_pipeline requires appserver://<thread_id>, got {target_agent_id!r}"
-                        )
-                    if args.get("verifier_agent_id") is not None and not is_appserver_agent_id(str(args["verifier_agent_id"])):
-                        raise WorkflowConflictError(
-                            f"app_server_pipeline requires appserver://<thread_id> for verifier, got {args['verifier_agent_id']!r}"
-                        )
-
                 # 1) Optional workspace creation
                 ws: dict[str, Any] | None = None
                 requested_ws_id = args.get("workspace_id").strip() if isinstance(args.get("workspace_id"), str) and args.get("workspace_id").strip() else None
@@ -1539,10 +1515,6 @@ class RpcDispatcher:
                             task_name=args.get("verifier_task_name"),
                             status=existing_ver_worker["status"],
                         )
-
-                # Refresh existing_step after worker_register in case lazy appserver:// bindings were backfilled in-tx.
-                if existing_step is not None:
-                    existing_step = self.workflow.get_step(existing_step["id"])
 
                 # If lazy verifier is now pre-binding a task_name on request_verify, sync pending_verifier_path on unbound steps.
                 if (

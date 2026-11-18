@@ -487,7 +487,6 @@ def create_app(
                     "compact_board_v1",
                     "workflow5_direct_spawn_v1",
                     "session_hooks_v1",
-                    "pipeline_runner_v1",
                 ],
             }
         )

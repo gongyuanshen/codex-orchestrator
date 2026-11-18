@@ -413,9 +413,7 @@ def test_user_prompt_submit_mode_gating_and_subagent_isolation(tmp_path: Path) -
     assert detect_explicit_mode_invocation("/teamwork split modules") == "teamwork"
     assert detect_explicit_mode_invocation("请用 $swarm 并发推进") == "swarm"
     assert detect_explicit_mode_invocation("boost performance of loop") is None
-    # New: $pipeline support
-    assert detect_explicit_mode_invocation("$pipeline 批量重构模块") == "pipeline"
-    assert detect_explicit_mode_invocation("/pipeline 执行DAG") == "pipeline"
+    assert detect_explicit_mode_invocation("$pipeline 批量重构模块") is None
     # New: CJK no-space
     assert detect_explicit_mode_invocation("$swarm开始补全") == "swarm"
     assert detect_explicit_mode_invocation("/boost修复这个问题") == "boost"
@@ -892,7 +890,6 @@ def test_upgrade_script_verifies_schema8_capabilities(tmp_path: Path) -> None:
         "compact_board_v1",
         "workflow5_direct_spawn_v1",
         "session_hooks_v1",
-        "pipeline_runner_v1",
     ]
 
     state = {"capabilities": list(base_caps)}
@@ -933,7 +930,7 @@ def test_upgrade_script_verifies_schema8_capabilities(tmp_path: Path) -> None:
         th = threading.Thread(target=srv.serve_forever, daemon=True)
         th.start()
         try:
-            # Missing 0.6.0 capabilities (including pipeline_runner_v1) must fail verification on schema 8
+            # Missing 0.6.0 capabilities must fail verification on schema 8
             with pytest.raises(upgrade_mod.UpgradeError, match="mismatch"):
                 upgrade_mod.verify(backup_dir)
 
@@ -941,7 +938,7 @@ def test_upgrade_script_verifies_schema8_capabilities(tmp_path: Path) -> None:
             with pytest.raises(upgrade_mod.UpgradeError, match="mismatch"):
                 upgrade_mod.verify(backup_dir)
 
-            # With all 5 new capabilities (16 total) present, verification succeeds
+            # With all 4 new capabilities (15 total) present, verification succeeds
             state["capabilities"] = base_caps + new_060_caps
             verified = upgrade_mod.verify(backup_dir)
             assert verified["status"] == "backend_verified"
@@ -1036,11 +1033,10 @@ def test_session_start_startup_returns_session_id_when_18790_offline(
         assert code_s == 0 and out_s == ""
 
 
-def test_mode_prompt_re_pipeline_cjk_and_skill_mentions() -> None:
-    """_MODE_PROMPT_RE matches $pipeline, CJK no-space, prefix CJK, and markdown skill mentions."""
-    # $pipeline
-    assert detect_explicit_mode_invocation("$pipeline 批量重构模块") == "pipeline"
-    assert detect_explicit_mode_invocation("/pipeline 执行DAG") == "pipeline"
+def test_mode_prompt_re_cjk_and_skill_mentions() -> None:
+    """_MODE_PROMPT_RE matches CJK no-space, prefix CJK, and markdown skill mentions (and ignores removed $pipeline)."""
+    assert detect_explicit_mode_invocation("$pipeline 批量重构模块") is None
+    assert detect_explicit_mode_invocation("/pipeline 执行DAG") is None
 
     # CJK no-space (trailing CJK)
     assert detect_explicit_mode_invocation("$swarm开始补全") == "swarm"

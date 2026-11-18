@@ -4,7 +4,7 @@ import hashlib
 import json
 import time
 import uuid
-from orchestrator.db import Database, NotFoundError, is_appserver_agent_id
+from orchestrator.db import Database, NotFoundError
 from orchestrator.inbox import InboxStore, InboxConflictError
 
 class NativeActionConflictError(InboxConflictError):
@@ -75,20 +75,6 @@ class NativeActionStore:
                 step_meta = conn.execute('SELECT revision, checkpoint_json FROM workflow_steps WHERE id=?', (source['step_id'],)).fetchone()
                 step['revision'] = step_meta['revision']
                 cp = json.loads(step_meta['checkpoint_json'] or '{}')
-                exec_kind = cp.get('execution_kind', 'native')
-                if exec_kind == 'app_server_pipeline':
-                    if pre_spawn or action_type == 'spawn_agent':
-                        raise NativeActionConflictError(
-                            'app_server_pipeline forbids /root/... spawn_agent; bind appserver://<thread_id> and use followup_task'
-                        )
-                    if not is_appserver_agent_id(worker['agent_id']):
-                        raise NativeActionConflictError(
-                            'app_server_pipeline requires appserver://<thread_id> worker binding'
-                        )
-                elif worker['agent_id'] and str(worker['agent_id']).lower().startswith('appserver:'):
-                    raise NativeActionConflictError(
-                        f'{exec_kind} step forbids appserver:// worker binding'
-                    )
                 if any((source['step_' + name] is None for name in ('packet_version', 'attempt', 'contract_revision'))):
                     raise NativeActionConflictError('Legacy business source lacks frozen context; cancel and reissue original message')
                 InboxStore._require_step_delivery(source, step, stage=stage, pre_spawn=pre_spawn)
