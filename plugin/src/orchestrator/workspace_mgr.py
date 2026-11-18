@@ -591,7 +591,12 @@ class WorkspaceManager:
             raise ValueError("worker_name must be a non-empty string")
 
         with self._lock:
-            _, resolved_root = self._resolve_project_root(run_id, project_root)
+            run, resolved_root = self._resolve_project_root(run_id, project_root)
+            execution_root = Path(run["execution_root"]).resolve(strict=False) if run["execution_root"] else None
+            if project_root is not None and resolved_root != execution_root:
+                execution_root = None
+            if execution_root is not None and not execution_root.is_dir():
+                raise FileNotFoundError(f"Execution root directory does not exist: {execution_root}")
             is_git_worktree, repo_root, git_common_dir, has_head = self._detect_git_repo(
                 resolved_root
             )
@@ -601,13 +606,11 @@ class WorkspaceManager:
 
             use_git_clone = is_git_worktree and has_head
             base_root = repo_root if use_git_clone else resolved_root
+            # Placement follows the Run; source and merge paths still use project coordinates.
             ws_dir, branch_name = self._allocate_workspace_dir_and_branch(
-                base_root, run_id, worker_name
+                execution_root or base_root, run_id, worker_name
             )
-
-            source_roots = [resolved_root]
-            if repo_root != resolved_root:
-                source_roots.append(repo_root)
+            source_roots = list(dict.fromkeys([execution_root or resolved_root, resolved_root, repo_root]))
 
             try:
                 if use_git_clone:
@@ -634,7 +637,6 @@ class WorkspaceManager:
                         snapshot_manifest={"project_root": str(base_root)},
                     )
                 else:
-                    exclude_files = frozenset() if copy_env else frozenset(ENV_FILENAMES)
                     ws_dir.mkdir(parents=True, exist_ok=True)
                     baseline_files: dict[str, str] = {}
 
@@ -649,7 +651,9 @@ class WorkspaceManager:
                         is_root = rel_dir == Path(".")
                         (ws_dir / rel_dir).mkdir(parents=True, exist_ok=True)
                         for fname in sorted(filenames):
-                            if is_root and fname in exclude_files:
+                            if not copy_env and fname in ENV_FILENAMES and (
+                                is_root or parent == execution_root
+                            ):
                                 continue
                             src_file = parent / fname
                             if src_file.is_symlink():
@@ -660,7 +664,9 @@ class WorkspaceManager:
                                 rel_posix = (rel_dir / fname).as_posix()
                                 baseline_files[rel_posix] = _sha256_file(src_file)
 
-                    self._apply_dep_mode(resolved_root, ws_dir, dep_mode, is_git=False)
+                    if copy_env and execution_root is not None and execution_root != resolved_root:
+                        self._copy_env_files(source_roots, ws_dir, is_git=False)
+                    self._apply_dep_mode(execution_root or resolved_root, ws_dir, dep_mode, is_git=False)
 
                     manifest = {
                         "project_root": str(resolved_root),
