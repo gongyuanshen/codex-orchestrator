@@ -50,6 +50,12 @@ def spawn_daemon(command: list[str], environment: dict[str, str]) -> WindowsDaem
         "runpy.run_module('orchestrator.daemon',run_name='__main__')"
     )
     args = [command[0], "-c", bootstrap, *command[3:]]
+    # Strip caller's Git/venv env vars from the shared daemon environment (case-insensitive on Windows).
+    _strip_keys_upper = {'GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'VIRTUAL_ENV'}
+    cleaned_env = {k: v for k, v in environment.items() if k.upper() not in _strip_keys_upper}
+    # Use data_dir as CWD instead of caller's cwd to prevent directory handle locks.
+    daemon_cwd = cleaned_env.get('TRI_ORCH_DATA_DIR') or os.getcwd()
+    os.makedirs(daemon_cwd, exist_ok=True)
     pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
     service = startup = process = inputs = output = None
     try:
@@ -59,11 +65,11 @@ def spawn_daemon(command: list[str], environment: dict[str, str]) -> WindowsDaem
         # BREAKAWAY releases the WMI provider's quota job, not the calling SDK's job.
         startup.CreateFlags = (subprocess.CREATE_NO_WINDOW | subprocess.CREATE_BREAKAWAY_FROM_JOB
                                | 0x00000400)  # CREATE_UNICODE_ENVIRONMENT
-        startup.EnvironmentVariables = [f"{key}={value}" for key, value in environment.items()]
+        startup.EnvironmentVariables = [f"{key}={value}" for key, value in cleaned_env.items()]
         process = service.Get("Win32_Process")
         inputs = process.Methods_("Create").InParameters.SpawnInstance_()
         inputs.CommandLine = subprocess.list2cmdline(args)
-        inputs.CurrentDirectory = os.getcwd()
+        inputs.CurrentDirectory = daemon_cwd
         inputs.ProcessStartupInformation = startup
         output = process.ExecMethod_("Create", inputs)
         if output.ReturnValue != 0:

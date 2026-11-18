@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tri-orchestrator"
-version = "0.5.0"
+version = "0.6.0"
 description = "Multi-agent orchestrator daemon, SQLite WAL message board, isolated workspace manager, and stdio MCP shim for Codex"
 requires-python = ">=3.12"
 dependencies = [
@@ -19,6 +19,9 @@ dependencies = [
 tri-orchestrator-mcp = "orchestrator.mcp_shim:main"
 tri-orchestrator-daemon = "orchestrator.daemon:main"
 tri-orchestrator-verify = "orchestrator.verify_runner:main"
+tri-orchestrator-hook = "orchestrator.hook_runner:main"
+tri-orchestrator-challenge = "orchestrator.challenge_runner:main"
+tri-orchestrator-pipeline = "orchestrator.pipeline_runner:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/orchestrator"]

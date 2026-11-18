@@ -22,13 +22,42 @@ def run_owned(argv, cwd, env, timeout, stdout, stderr, *, cancel=None):
         raise ProcessFailure('cancelled', 'cancelled before creation')
     executable = None
     program = argv[0]
-    if os.path.dirname(program):
+    raw_pathext = next((value for key, value in env.items() if key.upper() == 'PATHEXT'), '')
+    pathext_list: list[str] = []
+    seen_exts: set[str] = set()
+    for ext in (raw_pathext.split(os.pathsep) if raw_pathext else ['.COM', '.EXE', '.BAT', '.CMD']):
+        clean_ext = ext.strip().strip('"').strip()
+        if not clean_ext:
+            continue
+        if not clean_ext.startswith('.'):
+            clean_ext = '.' + clean_ext
+        lower_ext = clean_ext.lower()
+        if lower_ext not in seen_exts:
+            seen_exts.add(lower_ext)
+            pathext_list.append(clean_ext)
+    if '.exe' not in seen_exts:
+        seen_exts.add('.exe')
+        pathext_list.insert(0, '.exe')
+
+    if os.path.dirname(program) or os.path.splitdrive(program)[0]:
         candidates = [os.path.join(cwd, program)]
     else:
         search = next((value for key, value in env.items() if key.upper() == 'PATH'), '')
-        candidates = [os.path.join(cwd, directory, program) for directory in search.split(os.pathsep)] if search else []
+        candidates = []
+        if search:
+            for raw_dir in search.split(os.pathsep):
+                clean_dir = raw_dir.strip().strip('"').strip()
+                if not clean_dir:
+                    continue
+                candidates.append(os.path.join(cwd, clean_dir, program))
+
     for candidate in candidates:
-        for expanded in ([candidate] if os.path.splitext(candidate)[1] else [candidate, candidate + '.exe']):
+        cand_ext = os.path.splitext(candidate)[1].lower()
+        if cand_ext and cand_ext in seen_exts:
+            probe_list = [candidate]
+        else:
+            probe_list = [*(candidate + ext for ext in pathext_list), candidate]
+        for expanded in probe_list:
             if os.path.isfile(expanded):
                 executable = os.path.abspath(expanded)
                 break

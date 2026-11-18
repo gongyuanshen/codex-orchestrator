@@ -19,9 +19,12 @@ _MESSAGE_FIELDS = ("id", "board_seq", "run_id", "sender", "recipient", "key", "k
 _STEP_FIELDS = ("run_id", "owner", "verifier", "owner_agent_id", "verifier_agent_id",
                 "packet_version", "attempt", "contract_revision", "state")
 _STEP_SELECT = ",".join(f"s.{name} AS ctx_{name}" for name in _STEP_FIELDS) + """,
+    r_step.workflow_version AS ctx_workflow_version,
     o.agent_id AS ctx_current_owner_agent_id,v.agent_id AS ctx_current_verifier_agent_id,
+    o.pending_agent_path AS ctx_current_owner_pending_path,v.pending_agent_path AS ctx_current_verifier_pending_path,
     (SELECT MAX(p.version) FROM task_packets p WHERE p.run_id=s.run_id) AS ctx_current_packet_version"""
-_STEP_JOINS = """LEFT JOIN workers o ON o.run_id=s.run_id AND o.name=s.owner
+_STEP_JOINS = """LEFT JOIN runs r_step ON r_step.id=s.run_id
+    LEFT JOIN workers o ON o.run_id=s.run_id AND o.name=s.owner
     LEFT JOIN workers v ON v.run_id=s.run_id AND v.name=s.verifier"""
 
 class InboxConflictError(ValueError):
@@ -75,7 +78,20 @@ class InboxStore:
                 return {"message": _message(existing), "duplicate": True}
             run = self._require_active_run(run_id)
             worker = self._require_recipient(run_id, recipient)
-            if run["workflow_version"] and not worker["agent_id"]:
+            pre_spawn = False
+            if worker["agent_id"]:
+                recipient_agent_id: str | None = worker["agent_id"]
+            elif not run["workflow_version"]:
+                recipient_agent_id = None
+            elif (
+                run["workflow_version"] == 5
+                and worker.get("pending_agent_path")
+                and kind in {"task", "review"}
+                and step_id is not None
+            ):
+                recipient_agent_id = ""
+                pre_spawn = True
+            else:
                 raise InboxConflictError("Recipient requires a native agent binding before delivery")
             context = {field: None for field in
                        ("step_packet_version", "step_attempt", "step_contract_revision")}
@@ -85,12 +101,12 @@ class InboxStore:
             if step is not None:
                 context = {'step_' + name: step['ctx_' + name] for name in
                            ('packet_version', 'attempt', 'contract_revision')}
-            if self._linked_execution(run, content):
+            if pre_spawn or self._linked_execution(run, content):
                 if step is None:
                     raise InboxConflictError("Swarm execution requires a same-run workflow step_id")
                 context = {"step_" + name: step["ctx_" + name] for name in
                            ("packet_version", "attempt", "contract_revision")}
-                self._require_step_delivery(content | context, step, stage=True)
+                self._require_step_delivery(content | context, step, stage=True, pre_spawn=pre_spawn)
             # The nested board savepoint commits only with this outer transaction.
             pointer = self.board.board_post(run_id=run_id, sender=sender, summary=summary,
                 body_md=body_md, channel="inbox", mentions=[recipient], msg_type="handoff")
@@ -99,7 +115,7 @@ class InboxStore:
                 (id,board_seq,run_id,sender,recipient,key,kind,summary,body_md,recipient_agent_id,step_id,
                  step_packet_version,step_attempt,step_contract_revision)
                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (mid,pointer["seq"],run_id,sender,recipient,key,kind,summary,body_md,worker["agent_id"],step_id,
+                (mid,pointer["seq"],run_id,sender,recipient,key,kind,summary,body_md,recipient_agent_id,step_id,
                  context["step_packet_version"],context["step_attempt"],context["step_contract_revision"]))
             return {"message": self.get(mid), "duplicate": False}
 
@@ -128,6 +144,8 @@ class InboxStore:
             run = self._require_active_run(message["run_id"])
             worker = self._require_recipient(message["run_id"], recipient)
             if status != "cancelled":
+                if run["workflow_version"] and not worker["agent_id"]:
+                    raise InboxConflictError("Recipient requires a native agent binding before delivery")
                 self._require_binding(message, worker["agent_id"])
             if status in {"accepted", "completed"}:
                 if self._linked_execution(run, message):
@@ -150,7 +168,7 @@ class InboxStore:
 
     @staticmethod
     def _linked_execution(run: Any, message: dict[str, Any]) -> bool:
-        return run["workflow_version"] in {2, 3, 4} and run["mode"] == "swarm" and message["kind"] != "notice"
+        return run["workflow_version"] in {2, 3, 4, 5} and run["mode"] == "swarm" and message["kind"] != "notice"
 
     @staticmethod
     def _step_context(conn: Any, step_id: str | None) -> Any:
@@ -161,14 +179,50 @@ class InboxStore:
         return row
 
     @staticmethod
-    def _require_step_delivery(message: dict[str, Any], step: Any, *, stage: bool) -> None:
+    def _require_step_delivery(message: dict[str, Any], step: Any, *, stage: bool, pre_spawn: bool = False) -> None:
         if step["ctx_run_id"] != message["run_id"]:
             raise InboxConflictError("Inbox step must belong to the same run")
         role = {"task": "owner", "rework": "owner", "review": "verifier"}.get(message["kind"])
         recipients = {step["ctx_" + role]} if role else {step["ctx_owner"], step["ctx_verifier"]}
         if message["recipient"] not in recipients:
             raise InboxConflictError("Inbox recipient does not match the workflow step role")
-        if (not step["ctx_owner_agent_id"] or not step["ctx_verifier_agent_id"]
+        if step["ctx_workflow_version"] == 5:
+            owner_aid = step["ctx_owner_agent_id"]
+            ver_aid = step["ctx_verifier_agent_id"]
+            cur_owner_aid = step["ctx_current_owner_agent_id"]
+            cur_ver_aid = step["ctx_current_verifier_agent_id"]
+            if step["ctx_owner"] == step["ctx_verifier"] or (owner_aid and ver_aid and owner_aid == ver_aid):
+                raise InboxConflictError("Workflow step owner/verifier native binding changed; reconcile or cancel delivery")
+            if owner_aid:
+                if owner_aid != cur_owner_aid:
+                    raise InboxConflictError("Workflow step owner/verifier native binding changed; reconcile or cancel delivery")
+            else:
+                if not (
+                    pre_spawn
+                    and message["kind"] == "task"
+                    and cur_owner_aid is None
+                    and step["ctx_current_owner_pending_path"]
+                ):
+                    raise InboxConflictError("Workflow step owner/verifier native binding changed; reconcile or cancel delivery")
+            if ver_aid:
+                if ver_aid != cur_ver_aid:
+                    raise InboxConflictError("Workflow step owner/verifier native binding changed; reconcile or cancel delivery")
+            else:
+                if message["kind"] in {"task", "rework", "result"}:
+                    if cur_ver_aid is not None:
+                        raise InboxConflictError("Workflow step owner/verifier native binding changed; reconcile or cancel delivery")
+                elif message["kind"] == "review":
+                    if not (
+                        pre_spawn
+                        and cur_ver_aid is None
+                        and step["ctx_current_verifier_pending_path"]
+                        and owner_aid
+                        and owner_aid != step["ctx_current_verifier_pending_path"]
+                    ):
+                        raise InboxConflictError("Workflow step owner/verifier native binding changed; reconcile or cancel delivery")
+                else:
+                    raise InboxConflictError("Workflow step owner/verifier native binding changed; reconcile or cancel delivery")
+        elif (not step["ctx_owner_agent_id"] or not step["ctx_verifier_agent_id"]
                 or step["ctx_owner_agent_id"] == step["ctx_verifier_agent_id"]
                 or any(step["ctx_" + name + "_agent_id"] != step["ctx_current_" + name + "_agent_id"]
                        for name in ("owner", "verifier"))):

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,14 @@ def digest(value: Any) -> str:
 
 
 def git(root: Path, *args: str) -> str:
-    p = subprocess.run(['git', '-C', str(root), *args], capture_output=True, check=True)
+    flags = int(getattr(subprocess, 'CREATE_NO_WINDOW', 0)) if os.name == 'nt' else 0
+    p = subprocess.run(
+        ['git', '-C', str(root), *args],
+        capture_output=True,
+        check=True,
+        stdin=subprocess.DEVNULL,
+        creationflags=flags,
+    )
     return p.stdout.decode('utf-8').strip()
 
 

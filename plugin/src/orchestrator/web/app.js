@@ -44,6 +44,8 @@
     swarm_worker: '蜂窝执行',
     human: '人工干预',
     watchdog: '监控看门狗',
+    system: '系统看门狗',
+    workflow: '工作流引擎',
   };
 
   const CHANNEL_LABELS = {
@@ -289,7 +291,10 @@
       case 'investigator':
         return 'tint-cyan';
       case 'watchdog':
+      case 'system':
         return 'tint-danger';
+      case 'workflow':
+        return 'tint-cyan';
       default:
         return 'tint-muted';
     }
@@ -316,7 +321,10 @@
       case 'human':
         return `<svg ${base}><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>`;
       case 'watchdog':
+      case 'system':
         return `<svg ${base}><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>`;
+      case 'workflow':
+        return `<svg ${base}><path d="M6 3v12"></path><circle cx="18" cy="6" r="3"></circle><circle cx="6" cy="18" r="3"></circle><path d="M18 9a9 9 0 0 1-9 9"></path></svg>`;
       default:
         return `<svg ${base}><circle cx="12" cy="12" r="8"></circle><path d="M12 8v4l3 2"></path></svg>`;
     }
@@ -462,6 +470,30 @@
   }
 
 
+  function isAppServerAgentId(agentId) {
+    return typeof agentId === 'string' && agentId.startsWith('appserver://');
+  }
+
+  function isAppServerStep(step) {
+    if (!step || typeof step !== 'object') return false;
+    const execKind = step.execution_kind || step.checkpoint?.execution_kind || '';
+    if (execKind === 'app_server_pipeline') return true;
+    if (execKind === 'native' || execKind === 'coordinator_local') {
+      return isAppServerAgentId(step.owner_agent_id) || isAppServerAgentId(step.verifier_agent_id);
+    }
+    return isAppServerAgentId(step.owner_agent_id) || isAppServerAgentId(step.verifier_agent_id) ||
+      isAppServerAgentId(step.checkpoint?.original_bindings?.owner_agent_id) ||
+      isAppServerAgentId(step.checkpoint?.original_bindings?.verifier_agent_id);
+  }
+
+  function isAppServerWorker(worker) {
+    return Boolean(worker && isAppServerAgentId(worker.agent_id));
+  }
+
+  function renderAppServerBadge() {
+    return '<span class="pill-badge badge-appserver" title="由宿主终端 tri-orchestrator-pipeline 驱动的独立 App-Server 管线线程（appserver://），非聊天内原生 V2 子代理（/root/...）">App-Server 管线</span>';
+  }
+
   function isWorkerStalled(worker) {
     if (!worker || worker.status !== 'working' || state.run?.status !== 'active') return false;
     const threshold = Number(worker.stall_threshold_sec || 300);
@@ -586,7 +618,7 @@
     text = text.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
     text = text.replace(/~~([^~]+)~~/g, '<del>$1</del>');
 
-    text = text.replace(/(^|[\s(])(@[A-Za-z0-9_.\u4e00-\u9fa5-]+)/g, '$1<span class="inline-mention">$2</span>');
+    text = text.replace(/(?<![A-Za-z0-9_:/])@([A-Za-z0-9_](?:[A-Za-z0-9_.-]*[A-Za-z0-9_-])?)/g, '<span class="inline-mention">@$1</span>');
     text = text.replace(/(^|[\s(])#(\d+)\b/g, '$1<span class="inline-seq-ref" data-jump-seq="$2" title="跳转至消息 #$2">#$2</span>');
 
     return text.replace(/\u0000ICODE(\d+)\u0000/g, (_, idx) => codeTokens[Number(idx)] || '');
@@ -1648,6 +1680,7 @@
             <div class="member-top-line">
               <span class="member-name">@${escapeHtml(normalizeHandle(w.name))}</span>
               <span class="member-role">${escapeHtml(labelRole(role))}</span>
+              ${isAppServerWorker(w) ? renderAppServerBadge() : ''}
               <span class="pill-badge ${getWorkerStatusTone(status, false)}">登记：${escapeHtml(labelWorkerStatus(status))}</span>
               ${stalled ? '<span class="pill-badge tint-danger">心跳超时告警</span>' : ''}
             </div>
@@ -1930,6 +1963,8 @@
       coder: '在分配范围内实现代码并编写单元测试。',
       verifier: '独立检查规格与代码质量，运行验证；不修改代码。',
       swarm_worker: '在隔离工作区实现分配任务，通过消息板交付证据。',
+      system: '监控运行心跳与异常停滞，发布系统看门狗告警。',
+      workflow: '驱动结构化门禁流转与验收回执归档。',
     };
     return descriptions[role] || '职责说明未记录';
   }
@@ -1952,11 +1987,15 @@
 
   function renderWorkflowStep(step) {
     const attention = ['needs_decision', 'reconciliation_required', 'rework', 'handoff'].includes(step.state);
-    return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(step.step_key)}">${escapeHtml(step.step_key)}</span><span class="pill-badge ${attention ? 'tint-warning' : step.state === 'done' ? 'tint-success' : 'tint-muted'}">${escapeHtml(labelWorkflowState(step.state))}</span><span class="muted-caption tabular">返工 ${escapeHtml(step.attempt)} / 3</span></li>`;
+    const stateBadge = `<span class="pill-badge ${attention ? 'tint-warning' : step.state === 'done' ? 'tint-success' : 'tint-muted'}">${escapeHtml(labelWorkflowState(step.state))}</span>`;
+    const badges = isAppServerStep(step)
+      ? `<span class="workflow-step-badges">${renderAppServerBadge()}${stateBadge}</span>`
+      : stateBadge;
+    return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(step.step_key)}">${escapeHtml(step.step_key)}</span>${badges}<span class="muted-caption tabular">返工 ${escapeHtml(step.attempt)} / 3</span></li>`;
   }
 
   function renderProgressStatus() {
-    if (state.run.workflow_version !== 4) return '';
+    if (![4, 5].includes(state.run.workflow_version)) return '';
     const progress = state.progressStatus;
     const heading = '<div class="overview-section-heading"><h2>当前推进</h2></div>';
     if (progress === null) return `<section class="overview-section">${heading}<p class="muted-caption">推进状态未加载，请同步后查看。</p></section>`;
@@ -1967,7 +2006,7 @@
   }
 
   function renderResumeContext() {
-    if (state.run.workflow_version !== 4) return '';
+    if (![4, 5].includes(state.run.workflow_version)) return '';
     const context = state.resumeContext;
     const plan = state.planReadiness;
     const heading = '<div class="overview-section-heading"><h2>计划与交接</h2></div>';
@@ -1978,7 +2017,7 @@
   }
 
   function renderLocalReceipts() {
-    if (![3, 4].includes(state.run.workflow_version)) return '';
+    if (![3, 4, 5].includes(state.run.workflow_version)) return '';
     const artifacts = state.workflow.artifacts.filter((item) => item.evidence_level === 'local_collector_v1');
     const rows = artifacts.slice(0, 3).map((artifact) => {
       const records = state.workflow.verifications.filter((record) => record.artifact_id === artifact.id);
@@ -1989,7 +2028,7 @@
   }
 
   function renderReviewDimensions() {
-    if (state.run.workflow_version !== 4) return '';
+    if (![4, 5].includes(state.run.workflow_version)) return '';
     const reviews = state.workflow.steps.flatMap((step) => Object.entries(step.checkpoint?.review_dimensions || {}).map(([id, dimensions]) => ({id, dimensions})));
     const rows = reviews.map(({id, dimensions}) => `<li>${escapeHtml(id)} · 规格检查：${escapeHtml(dimensions.specification)} · 代码正确性：${escapeHtml(dimensions.code)} · 压力与反例：${escapeHtml(dimensions.stress)} · 证据检查：${escapeHtml(dimensions.evidence)}</li>`).join('');
     return `<p class="muted-caption">分项审查由原验收者记录；项目目标达成仍需最终集成门禁，不等于多角色独立审查。</p>${reviews.length ? `<details class="workflow-more" data-overview-detail="review-dimensions" ${state.overviewExpanded.has('review-dimensions') ? 'open' : ''}><summary>规格、代码、反例与证据检查（${reviews.length} 份）</summary><ul>${rows}</ul></details>` : '<p class="muted-caption">尚未记录分项审查。</p>'}`;
@@ -1997,9 +2036,9 @@
 
   function renderWorkflowSummary() {
     const version = state.run.workflow_version;
-    const versionLabel = version === 0 ? '旧流程，未启用结构化门禁' : [1, 2, 3, 4].includes(version) ? `结构化门禁 · v${version}` : '流程版本未记录';
+    const versionLabel = version === 0 ? '旧流程，未启用结构化门禁' : [1, 2, 3, 4, 5].includes(version) ? `结构化门禁 · v${version}` : '流程版本未记录';
     const heading = `<div class="overview-section-heading"><h2>流程与验收</h2><span class="pill-badge tint-muted">${versionLabel}</span></div>`;
-    if (![1, 2, 3, 4].includes(version)) return `<section class="overview-section workflow-overview">${heading}</section>`;
+    if (![1, 2, 3, 4, 5].includes(version)) return `<section class="overview-section workflow-overview">${heading}</section>`;
     if (state.workflow === null) return `<section class="overview-section workflow-overview">${heading}<p class="workflow-warning" role="status">结构化流程数据未加载，请同步后查看门禁状态。</p></section>`;
     const { steps, verifications, blockers } = state.workflow;
     // Keep urgent/current steps ahead of completed history without hiding any step.
@@ -2007,7 +2046,10 @@
     const counts = state.inbox?.counts;
     const delivery = counts ? `<div class="workflow-delivery tabular"><span>待接收 ${escapeHtml(counts.pending)}</span><span>已接收待处置 ${escapeHtml(counts.accepted)}</span><span>执行完成回执 ${escapeHtml(counts.completed)}</span><span>未处置任务 ${escapeHtml(state.inbox.blocking_count)}</span></div>` : '<p class="muted-caption">收件箱摘要未加载。</p>';
     const more = ordered.length > 3 ? `<details class="workflow-more" data-overview-detail="workflow-more" ${state.overviewExpanded.has('workflow-more') ? 'open' : ''}><summary>其余 ${ordered.length - 3} 个步骤</summary><ul class="workflow-steps">${ordered.slice(3).map(renderWorkflowStep).join('')}</ul></details>` : '';
-    const blockerLabels = blockers.map((blocker) => `${steps.find((step) => step.id === blocker.step_id).step_key}：${labelWorkflowState(blocker.state)}`);
+    const blockerLabels = blockers.map((blocker) => {
+      const stepKey = steps.find((step) => step.id === blocker.step_id)?.step_key || blocker.step_key || blocker.step_id || '未知步骤';
+      return `${stepKey}：${labelWorkflowState(blocker.state)}`;
+    });
     const blocking = blockerLabels.length ? `<details class="workflow-blockers" data-overview-detail="workflow-blockers" ${state.overviewExpanded.has('workflow-blockers') ? 'open' : ''}><summary class="workflow-warning">${escapeHtml(blockerLabels[0])}${blockers.length > 1 ? `（共 ${blockers.length} 项阻塞，展开查看）` : '（展开查看）'}</summary><ul>${blockerLabels.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}</ul></details>` : '<p class="muted-caption">流程记录暂无阻塞；最终完成仍由后端核对当前产物与验收证据。</p>';
     return `<section class="overview-section workflow-overview" aria-label="结构化流程与收件状态">${heading}${delivery}<p class="muted-caption">回执不等于独立验收 · 已记录 ${verifications.length} 次验收，是否有效由当前门禁核对。</p>${renderLocalReceipts()}${renderReviewDimensions()}${blocking}${ordered.length ? `<ul class="workflow-steps">${ordered.slice(0, 3).map(renderWorkflowStep).join('')}</ul>${more}` : '<p class="muted-caption">尚未建立工作步骤，不能据此认定任务已验收。</p>'}</section>`;
   }
@@ -2047,7 +2089,7 @@
     return `          <button type="button" class="overview-member" data-worker-id="${escapeHtml(w.id)}">
             <span class="overview-member-role">${escapeHtml(labelRole(w.role))}<small>@${escapeHtml(w.name)}</small></span>
             <span class="overview-member-work"><span>${escapeHtml(roleResponsibility(w.role))}</span><span class="overview-current-task">最近登记工作：${escapeHtml(w.current_task || '尚未记录')}</span></span>
-            <span class="overview-member-state"><span class="pill-badge tint-muted">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
+            <span class="overview-member-state">${isAppServerWorker(w) ? renderAppServerBadge() : ''}<span class="pill-badge tint-muted">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
           </button>`;
   }
 
@@ -2556,6 +2598,7 @@
         el.graphDetailBar.innerHTML = `
           <div class="graph-detail-main">
             <span class="mono" style="font-weight:600;">${escapeHtml(displayName)}</span>
+            ${isAppServerWorker(node.worker) ? renderAppServerBadge() : ''}
             <span class="pill-badge tint-muted">${escapeHtml(labelRole(node.role))}${escapeHtml(statusStr)}</span>
             <span class="muted-caption tabular">发出 ${node.sentCount} 条 · 被 @提及 ${node.recvCount} 次${escapeHtml(broadcastStr)}</span>
           </div>
@@ -2907,11 +2950,22 @@
   }
 
   function renderWorkerControl(worker) {
-    const labels = {pending: '待处理（等待协调者原生中断回执）', applied: '已执行', failed: '执行失败'};
+    const isAppServer = typeof worker?.agent_id === 'string' && worker.agent_id.startsWith('appserver://');
+    const labels = {
+      pending: isAppServer ? '待处理（等待管线运行器 turn/interrupt 中断回执）' : '待处理（等待协调者原生中断回执）',
+      applied: '已执行',
+      failed: '执行失败',
+    };
     const requests = state.controlRequests.filter((item) => String(item.worker_id) === String(worker.id));
-    return `<div class="inspector-section"><div class="kv-key">原生代理绑定</div>
-      <div class="kv-val mono">${escapeHtml(worker.agent_id || '未绑定（不可控制）')}</div>
-      <div class="actions-note">请求结束任务：协调者中断代理并停止分配任务，不终止操作系统进程；工作区文件保留。</div>
+    const bindingBadge = isAppServer
+      ? ' <span class="pill-badge badge-appserver" title="由宿主终端 tri-orchestrator-pipeline 驱动的独立 App-Server 管线线程（appserver://），非聊天内原生 V2 子代理（/root/...）">App-Server 管线</span>'
+      : '';
+    const bindingNote = isAppServer
+      ? '请求暂停 / 结束任务：tri-orchestrator-pipeline 在 <=2s 内发送 turn/interrupt 中断当前回合，工作区文件完整保留。'
+      : '请求结束任务：协调者中断代理并停止分配任务，不终止操作系统进程；工作区文件保留。';
+    return `<div class="inspector-section"><div class="kv-key">${isAppServer ? '执行线程绑定' : '原生代理绑定'}</div>
+      <div class="kv-val mono">${escapeHtml(worker.agent_id || '未绑定（不可控制）')}${bindingBadge}</div>
+      <div class="actions-note">${bindingNote}</div>
       ${requests.map((item) => `<div class="actions-note">${escapeHtml(item.requested_status === 'stopped' ? '请求暂停' : '请求结束任务')} · ${escapeHtml(labels[item.status])}<div>${escapeHtml(item.result || '')}</div></div>`).join('')}</div>`;
   }
 
@@ -2956,7 +3010,7 @@
         <div class="inspector-section">
           <div class="inspector-kv-list">
             <div class="kv-key">成员名称</div>
-            <div class="kv-val mono">${escapeHtml(workerHandle)} <span class="pill-badge ${getWorkerStatusTone(workerStatus, isWorkerStalled(worker))}">${escapeHtml(labelWorkerStatus(workerStatus))}</span></div>
+            <div class="kv-val mono">${escapeHtml(workerHandle)} ${isAppServerWorker(worker) ? renderAppServerBadge() : ''}<span class="pill-badge ${getWorkerStatusTone(workerStatus, isWorkerStalled(worker))}">${escapeHtml(labelWorkerStatus(workerStatus))}</span></div>
             <div class="kv-key">成员职责</div>
             <div class="kv-val">${escapeHtml(roleLabel)}</div>
             <div class="kv-key">当前任务</div>
@@ -3006,6 +3060,7 @@
           <div class="kv-key">成员状态</div>
           <div class="kv-val">
             <span class="mono">${escapeHtml(workerHandle)}</span>
+            ${isAppServerWorker(worker) ? renderAppServerBadge() : ''}
             <span class="pill-badge ${getWorkerStatusTone(workerStatus, isWorkerStalled(worker))}">${escapeHtml(labelWorkerStatus(workerStatus))}</span>
           </div>
           <div class="kv-key">工作区</div>
@@ -3319,7 +3374,11 @@
         });
         if (version !== state.contextVersion) return;
         acceptControlResponse(resp, workerId, nextStatus);
-        showToast('控制请求待处理', '等待协调者调用原生中断工具并返回执行回执；成员状态尚未改变。', 'warning');
+        const targetWorker = state.workers.find((w) => String(w.id) === String(workerId));
+        const pendingHint = isAppServerWorker(targetWorker)
+          ? '等待 tri-orchestrator-pipeline 在 <=2s 内触发 turn/interrupt 并返回回执；成员状态尚未改变。'
+          : '等待协调者调用原生中断工具并返回执行回执；成员状态尚未改变。';
+        showToast('控制请求待处理', pendingHint, 'warning');
       } else if (action === 'cleanup-workspace' && workspaceId) {
         try {
           const resp = await apiRequest(`/api/workspaces/${encodeURIComponent(workspaceId)}/cleanup`, {

@@ -14,6 +14,7 @@ Options:
   --codex-home PATH         Codex home directory (default: $CODEX_HOME or ~/.codex)
   --skip-uv-sync            Skip pre-warming uv sync on the cached plugin runtime
   --skip-plugin-install     Skip codex plugin marketplace/plugin registration
+  --trust-plugin-hooks      Trust all 4 plugin hooks in [hooks.state] config.toml
   -h, --help                Show this help message
 EOF
 }
@@ -23,6 +24,7 @@ PLUGIN_DIR=""
 CODEX_HOME_ARG=""
 SKIP_UV_SYNC=0
 SKIP_PLUGIN_INSTALL=0
+TRUST_PLUGIN_HOOKS=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -47,6 +49,10 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skip-plugin-install)
       SKIP_PLUGIN_INSTALL=1
+      shift
+      ;;
+    --trust-plugin-hooks)
+      TRUST_PLUGIN_HOOKS=1
       shift
       ;;
     -h|--help)
@@ -174,8 +180,16 @@ if [ ! -f "$PLUGIN_DIR/pyproject.toml" ]; then
   echo "Missing plugin pyproject.toml at $PLUGIN_DIR/pyproject.toml" >&2
   exit 1
 fi
-if [ ! -f "$PLUGIN_DIR/plugin.json" ]; then
-  echo "Missing plugin.json at $PLUGIN_DIR/plugin.json" >&2
+if [ -f "$PLUGIN_DIR/plugin.json" ]; then
+  echo "Legacy root plugin.json must not exist at $PLUGIN_DIR/plugin.json (use .codex-plugin/plugin.json)" >&2
+  exit 1
+fi
+if [ ! -f "$PLUGIN_DIR/.codex-plugin/plugin.json" ]; then
+  echo "Missing plugin manifest at $PLUGIN_DIR/.codex-plugin/plugin.json" >&2
+  exit 1
+fi
+if [ ! -f "$PLUGIN_DIR/hooks/hooks.json" ]; then
+  echo "Missing plugin hooks config at $PLUGIN_DIR/hooks/hooks.json" >&2
   exit 1
 fi
 
@@ -186,9 +200,10 @@ fi
 echo "[install] CodexHome : $CODEX_HOME_DIR"
 echo "[install] Using uv  : $UV_BIN"
 
-PLUGIN_VERSION="$(run_py - "$PLUGIN_DIR/plugin.json" <<'PY'
+PLUGIN_VERSION="$(run_py - "$PLUGIN_DIR/.codex-plugin/plugin.json" <<'PY'
 import json, pathlib, sys
 data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert data.get("hooks") == "./hooks/hooks.json", "Expected .codex-plugin/plugin.json hooks == './hooks/hooks.json'"
 print(data.get("version") or "0.1.0")
 PY
 )"
@@ -234,7 +249,7 @@ trap cleanup_stage EXIT
 CANDIDATE_CONFIG="$STAGE_DIR/config.toml"
 AGENTS_META_JSON="$STAGE_DIR/agents_meta.json"
 
-# Safely merge [agents] in config.toml and validate with tomllib
+# Safely merge [agents] and [features] in config.toml and validate with tomllib
 run_py - "$CONFIG_PATH" "$CANDIDATE_CONFIG" "$AGENTS_META_JSON" <<'PY'
 import json, pathlib, re, sys, tomllib
 
@@ -293,6 +308,44 @@ else:
     if not has_depth:
         lines.insert(insert_at, "max_depth = 2")
         meta["added_max_depth"] = True
+
+# Merge [features] section: idempotently ensure multi_agent = true and multi_agent_v2 = true
+feat_start = -1
+feat_end = len(lines)
+for i, line in enumerate(lines):
+    trim = line.strip()
+    if re.match(r"^\[features\]\s*(#.*)?$", trim):
+        feat_start = i
+        continue
+    if feat_start >= 0 and trim.startswith("["):
+        feat_end = i
+        break
+
+if feat_start < 0:
+    if lines and lines[-1].strip() != "":
+        lines.append("")
+    lines.extend(["[features]", "multi_agent = true", "multi_agent_v2 = true"])
+else:
+    has_ma = False
+    has_ma_v2 = False
+    for i in range(feat_start + 1, feat_end):
+        m_v2 = re.match(r"^(\s*multi_agent_v2\s*=\s*)([^\s#]+)(.*)$", lines[i])
+        if m_v2:
+            has_ma_v2 = True
+            if m_v2.group(2) != "true":
+                lines[i] = f"{m_v2.group(1)}true{m_v2.group(3)}"
+            continue
+        m_ma = re.match(r"^(\s*multi_agent\s*=\s*)([^\s#]+)(.*)$", lines[i])
+        if m_ma:
+            has_ma = True
+            if m_ma.group(2) != "true":
+                lines[i] = f"{m_ma.group(1)}true{m_ma.group(3)}"
+    ins_at = feat_start + 1
+    if not has_ma:
+        lines.insert(ins_at, "multi_agent = true")
+        ins_at += 1
+    if not has_ma_v2:
+        lines.insert(ins_at, "multi_agent_v2 = true")
 
 candidate = (nl.join(lines) + nl) if lines else ""
 tomllib.loads(candidate)
@@ -535,6 +588,290 @@ PY
       exit 1
     fi
     echo "[install] Pre-warmed cached runtime -> $CACHED_PLUGIN_DIR/.venv"
+  fi
+fi
+
+# hooks/list self-check and optional --trust-plugin-hooks
+probe_hooks_list_json() {
+  local probe_cwd="$1"
+  run_py - "$CODEX_BIN" "$CODEX_HOME_DIR" "$probe_cwd" "$PLUGIN_VERSION" <<'PY'
+import json, os, queue, subprocess, sys, threading, time
+
+codex_exe, codex_home, probe_cwd, plugin_version = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+env = os.environ.copy()
+env["CODEX_HOME"] = codex_home
+env["PYTHONUTF8"] = "1"
+env["PYTHONIOENCODING"] = "utf-8"
+
+proc = subprocess.Popen(
+    [codex_exe, "app-server", "--stdio"],
+    cwd=probe_cwd,
+    env=env,
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    encoding="utf-8",
+    bufsize=1,
+)
+
+stdout_q = queue.Queue()
+stderr_chunks = []
+
+def _read_out():
+    try:
+        for line in proc.stdout:
+            stdout_q.put(line)
+    finally:
+        stdout_q.put(None)
+
+def _read_err():
+    try:
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+    except Exception:
+        pass
+
+t_out = threading.Thread(target=_read_out, daemon=True)
+t_err = threading.Thread(target=_read_err, daemon=True)
+t_out.start()
+t_err.start()
+
+def _send(obj):
+    proc.stdin.write(json.dumps(obj) + "\n")
+    proc.stdin.flush()
+
+hooks_resp = None
+try:
+    _send({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "tri-orchestrator-installer-sh", "version": plugin_version},
+            "capabilities": {"experimentalApi": True},
+        },
+    })
+    sent_list = False
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        try:
+            line = stdout_q.get(timeout=0.4)
+        except queue.Empty:
+            if proc.poll() is not None and stdout_q.empty():
+                break
+            continue
+        if line is None:
+            break
+        raw = line.strip()
+        if not raw:
+            continue
+        msg = json.loads(raw)
+        if not isinstance(msg, dict):
+            continue
+        msg_id = msg.get("id")
+        if msg_id == 1 and not sent_list:
+            if "error" in msg:
+                raise RuntimeError(f"app-server initialize error: {msg['error']}")
+            _send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+            _send({"jsonrpc": "2.0", "id": 2, "method": "hooks/list", "params": {}})
+            sent_list = True
+        elif msg_id == 2:
+            if "error" in msg:
+                raise RuntimeError(f"app-server hooks/list error: {msg['error']}")
+            hooks_resp = msg.get("result") or {}
+            break
+finally:
+    try:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+    t_out.join(timeout=1.0)
+    t_err.join(timeout=1.0)
+
+if hooks_resp is None:
+    err_tail = "".join(stderr_chunks[-20:]).strip()
+    raise RuntimeError(f"Timed out or exited before receiving hooks/list response. stderr={err_tail}")
+
+all_hooks = []
+if isinstance(hooks_resp.get("data"), list):
+    for bucket in hooks_resp["data"]:
+        if isinstance(bucket, dict) and isinstance(bucket.get("hooks"), list):
+            all_hooks.extend(bucket["hooks"])
+elif isinstance(hooks_resp.get("hooks"), list):
+    all_hooks.extend(hooks_resp["hooks"])
+
+plugin_hooks = {}
+for h in all_hooks:
+    if isinstance(h, dict) and h.get("pluginId") == "tri-orchestrator@tri-orchestrator":
+        k = h.get("key") or f"{h.get('eventName')}:{len(plugin_hooks)}"
+        plugin_hooks[k] = h
+
+print(json.dumps({"hooks": list(plugin_hooks.values())}, ensure_ascii=False))
+PY
+}
+
+if [ "$SKIP_PLUGIN_INSTALL" -eq 0 ] || [ "$TRUST_PLUGIN_HOOKS" -eq 1 ]; then
+  if [ -n "$CODEX_BIN" ] && [ -x "$CODEX_BIN" ]; then
+    probe_cwd="${REPO_ROOT:-${TMPDIR:-/tmp}}"
+    hooks_list_json="$(probe_hooks_list_json "$probe_cwd")"
+    hooks_status="$(printf '%s' "$hooks_list_json" | run_py - <<'PY'
+import json, sys
+data = json.load(sys.stdin)
+hooks = data.get("hooks", [])
+events = {h.get("eventName") for h in hooks if isinstance(h, dict)}
+required = {"sessionStart", "postCompact", "userPromptSubmit", "stop"}
+missing = required - events
+if missing:
+    print(f"MISSING:{','.join(sorted(missing))}")
+    sys.exit(0)
+untrusted = [h for h in hooks if isinstance(h, dict) and h.get("trustStatus") != "trusted"]
+print(f"OK:{len(hooks)}:{len(untrusted)}")
+PY
+)"
+    if printf '%s' "$hooks_status" | grep -q '^MISSING:'; then
+      echo "Plugin hooks/list verification failed ($hooks_status) for 'tri-orchestrator@tri-orchestrator'." >&2
+      exit 1
+    fi
+
+    if [ "$TRUST_PLUGIN_HOOKS" -eq 1 ]; then
+      tmp_trusted="$STAGE_DIR/trusted_config.toml"
+      printf '%s' "$hooks_list_json" | run_py - "$CONFIG_PATH" "$tmp_trusted" <<'PY'
+import json, pathlib, re, sys, tomllib
+
+hooks_data = json.load(sys.stdin)
+hooks = hooks_data.get("hooks", [])
+config_path = pathlib.Path(sys.argv[1])
+out_path = pathlib.Path(sys.argv[2])
+toml_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+
+entries = []
+for h in sorted(hooks, key=lambda item: (item.get("displayOrder", 999), item.get("key", ""))):
+    key = h.get("key")
+    cur_hash = h.get("currentHash") or ""
+    if not key or not isinstance(key, str):
+        raise ValueError(f"Hook missing valid key: {h}")
+    parts = cur_hash.split("/", 1)
+    if len(parts) != 2 or not parts[0].startswith("sha256:") or not parts[1].startswith("sha256:"):
+        raise ValueError(f"Unexpected composite currentHash for {key}: {cur_hash!r}")
+    cmd_hash, content_hash = parts[0], parts[1]
+    line = f'{json.dumps(key)} = {{ enabled = true, trusted_hash = {json.dumps(cmd_hash)}, trusted_content_hash = {json.dumps(content_hash)} }}'
+    entries.append((key, cmd_hash, content_hash, line))
+
+nl = "\r\n" if "\r\n" in toml_text else "\n"
+lines = toml_text.splitlines() if toml_text else []
+
+cleaned = []
+skip_sub = False
+for ln in lines:
+    if re.match(r'^\s*\[\s*hooks\.state\s*\.\s*(["\'])tri-orchestrator@tri-orchestrator:[^"\']*\1\s*\]\s*(?:#.*)?$', ln):
+        skip_sub = True
+        continue
+    if skip_sub and re.match(r'^\s*\[', ln):
+        skip_sub = False
+    if not skip_sub:
+        cleaned.append(ln)
+lines = cleaned
+
+sec_start = -1
+sec_end = len(lines)
+for idx, ln in enumerate(lines):
+    if re.match(r'^\s*\[\s*hooks\.state\s*\]\s*(?:#.*)?$', ln):
+        sec_start = idx
+        continue
+    if sec_start >= 0 and re.match(r'^\s*\[', ln):
+        sec_end = idx
+        break
+
+tri_key_re = re.compile(r'^\s*(["\'])tri-orchestrator@tri-orchestrator:[^"\']*\1\s*=')
+if sec_start < 0:
+    if lines and lines[-1].strip() != "":
+        lines.append("")
+    lines.append("[hooks.state]")
+    for _, _, _, entry_line in entries:
+        lines.append(entry_line)
+else:
+    kept = []
+    i = sec_start + 1
+    while i < sec_end:
+        ln = lines[i]
+        if tri_key_re.match(ln):
+            rhs = ln.split("=", 1)[1]
+            depth = rhs.count("{") - rhs.count("}")
+            i += 1
+            while depth > 0 and i < sec_end:
+                depth += lines[i].count("{") - lines[i].count("}")
+                i += 1
+            continue
+        kept.append(ln)
+        i += 1
+    had_trailing_blank = bool(kept and kept[-1].strip() == "")
+    while kept and kept[-1].strip() == "":
+        kept.pop()
+    for _, _, _, entry_line in entries:
+        kept.append(entry_line)
+    if sec_end < len(lines) and (had_trailing_blank or lines[sec_end].strip() != ""):
+        kept.append("")
+    lines = lines[:sec_start + 1] + kept + lines[sec_end:]
+
+updated = (nl.join(lines) + nl) if lines else ""
+parsed = tomllib.loads(updated)
+state_tbl = parsed.get("hooks", {}).get("state", {})
+for key, cmd_hash, content_hash, _ in entries:
+    actual = state_tbl.get(key)
+    expected = {"enabled": True, "trusted_hash": cmd_hash, "trusted_content_hash": content_hash}
+    if actual != expected:
+        raise AssertionError(f"TOML roundtrip mismatch for {key}: {actual} != {expected}")
+out_path.write_text(updated, encoding="utf-8")
+PY
+      hooks_stage_dir="$STAGE_DIR/hooks-strict"
+      mkdir -p "$hooks_stage_dir"
+      cp -f "$tmp_trusted" "$hooks_stage_dir/config.toml"
+      strict_hooks_out="$(CODEX_HOME="$hooks_stage_dir" "$CODEX_BIN" app-server --strict-config --print-startup-config 2>&1)" || {
+        echo "codex --strict-config rejected [hooks.state] in config.toml:" >&2
+        echo "$strict_hooks_out" >&2
+        exit 1
+      }
+      if printf '%s' "$strict_hooks_out" | grep -q "Error loading config\.toml"; then
+        echo "codex --strict-config rejected [hooks.state] in config.toml:" >&2
+        echo "$strict_hooks_out" >&2
+        exit 1
+      fi
+      tmp_dest="$CONFIG_PATH.tmp.$$"
+      cp -f "$tmp_trusted" "$tmp_dest"
+      mv -f "$tmp_dest" "$CONFIG_PATH"
+
+      recheck_json="$(probe_hooks_list_json "$probe_cwd")"
+      printf '%s' "$recheck_json" | run_py - <<'PY'
+import json, sys
+hooks = json.load(sys.stdin).get("hooks", [])
+still_untrusted = [h for h in hooks if isinstance(h, dict) and h.get("trustStatus") != "trusted"]
+if len(hooks) < 4 or still_untrusted:
+    raise SystemExit(f"--trust-plugin-hooks failed to transition all 4 hooks to trustStatus='trusted': {hooks}")
+PY
+      echo "[install] Trusted all 4 plugin hooks in [hooks.state] ($CONFIG_PATH) and verified trustStatus=trusted via hooks/list."
+    else
+      untrusted_n="${hooks_status##*:}"
+      if [ "$untrusted_n" != "0" ]; then
+        echo "[install] Verified 4 plugin hooks via hooks/list (trustStatus=untrusted; [hooks.state] left untouched by default)."
+        echo "[提示] 已发现 tri-orchestrator 的全部 4 个生命周期钩子（sessionStart / postCompact / userPromptSubmit / stop），当前默认处于未信任（untrusted）状态。"
+        echo "[提示] 打开 Codex Desktop 后，请在弹出的插件钩子信任提示框中点击「信任 / Trust」（或使用 scripts/install.sh --trust-plugin-hooks 重新安装），即可激活 Stop 防提前退出门禁与 PostCompact 上下文自动恢复。"
+      else
+        echo "[install] Verified 4 plugin hooks via hooks/list (all trustStatus=trusted)."
+      fi
+    fi
+  else
+    echo "[install] codex CLI not found; skipping hooks/list self-check."
   fi
 fi
 

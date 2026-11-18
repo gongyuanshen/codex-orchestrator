@@ -69,8 +69,8 @@ def finish(s, step):
 
 def test_new_contract(flow):
     db, s, run, *_ = flow
-    assert SCHEMA_VERSION == 7
-    assert run['workflow_version'] == 4
+    assert SCHEMA_VERSION == 8
+    assert run['workflow_version'] == 5
 
 
 @pytest.mark.parametrize('left,right', [('source.txt', 'SOURCE.TXT'), ('src', 'src/a.py'),

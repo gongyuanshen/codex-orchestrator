@@ -4,7 +4,7 @@ import hashlib
 import json
 import time
 import uuid
-from orchestrator.db import Database, NotFoundError
+from orchestrator.db import Database, NotFoundError, is_appserver_agent_id
 from orchestrator.inbox import InboxStore, InboxConflictError
 
 class NativeActionConflictError(InboxConflictError):
@@ -38,8 +38,21 @@ class NativeActionStore:
         if run['status'] != 'active':
             raise NativeActionConflictError('Run is not active')
         worker = conn.execute('SELECT * FROM workers WHERE run_id=? AND name=?', (run_id, recipient)).fetchone()
-        if worker is None or not worker['agent_id']:
+        if worker is None:
             raise NativeActionConflictError('Recipient requires native binding')
+        pre_spawn = False
+        if not worker['agent_id']:
+            if (
+                run['workflow_version'] == 5
+                and source_type == 'inbox'
+                and action_type == 'spawn_agent'
+                and worker['pending_agent_path']
+            ):
+                pre_spawn = True
+            else:
+                raise NativeActionConflictError('Recipient requires native binding')
+        elif action_type == 'spawn_agent':
+            raise NativeActionConflictError('Recipient already has a native binding; use followup_task')
         step = None
         if source_type == 'inbox':
             row = conn.execute('SELECT * FROM inbox_messages WHERE id=? AND run_id=?', (source_id, run_id)).fetchone()
@@ -48,16 +61,45 @@ class NativeActionStore:
             source = dict(row)
             if source['recipient'] != recipient or (stage and source['status'] != 'pending'):
                 raise NativeActionConflictError('Inbox source recipient/status changed')
-            InboxStore._require_binding(source, worker['agent_id'])
+            if pre_spawn:
+                if source['recipient_agent_id'] not in ('', None):
+                    raise NativeActionConflictError('Pre-spawn inbox source already bound to an agent')
+                if source['kind'] not in {'task', 'review'} or not source['step_id']:
+                    raise NativeActionConflictError('spawn_agent requires a step-bound task or review inbox message')
+            else:
+                InboxStore._require_binding(source, worker['agent_id'])
             if source['kind'] != 'notice':
                 if not source['step_id']:
                     raise NativeActionConflictError('Business handoff requires an admitted workflow step')
                 step = dict(InboxStore._step_context(conn, source['step_id']))
-                step['revision'] = conn.execute('SELECT revision FROM workflow_steps WHERE id=?', (source['step_id'],)).fetchone()[0]
+                step_meta = conn.execute('SELECT revision, checkpoint_json FROM workflow_steps WHERE id=?', (source['step_id'],)).fetchone()
+                step['revision'] = step_meta['revision']
+                cp = json.loads(step_meta['checkpoint_json'] or '{}')
+                exec_kind = cp.get('execution_kind', 'native')
+                if exec_kind == 'app_server_pipeline':
+                    if pre_spawn or action_type == 'spawn_agent':
+                        raise NativeActionConflictError(
+                            'app_server_pipeline forbids /root/... spawn_agent; bind appserver://<thread_id> and use followup_task'
+                        )
+                    if not is_appserver_agent_id(worker['agent_id']):
+                        raise NativeActionConflictError(
+                            'app_server_pipeline requires appserver://<thread_id> worker binding'
+                        )
+                elif worker['agent_id'] and str(worker['agent_id']).lower().startswith('appserver:'):
+                    raise NativeActionConflictError(
+                        f'{exec_kind} step forbids appserver:// worker binding'
+                    )
                 if any((source['step_' + name] is None for name in ('packet_version', 'attempt', 'contract_revision'))):
                     raise NativeActionConflictError('Legacy business source lacks frozen context; cancel and reissue original message')
-                InboxStore._require_step_delivery(source, step, stage=stage)
-            if action_type != 'followup_task':
+                InboxStore._require_step_delivery(source, step, stage=stage, pre_spawn=pre_spawn)
+                if pre_spawn:
+                    expected_cp_path = cp.get('pending_owner_path') if source['kind'] == 'task' else cp.get('pending_verifier_path')
+                    if expected_cp_path and expected_cp_path != worker['pending_agent_path']:
+                        raise NativeActionConflictError('Worker pending_agent_path differs from step pre-spawn path')
+            if pre_spawn:
+                if action_type != 'spawn_agent':
+                    raise ValueError('Pre-spawn inbox action_type must be spawn_agent')
+            elif action_type != 'followup_task':
                 raise ValueError('Inbox action_type must be followup_task')
         elif source_type == 'control':
             row = conn.execute('SELECT * FROM worker_controls WHERE id=? AND run_id=?', (source_id, run_id)).fetchone()
@@ -89,8 +131,11 @@ class NativeActionStore:
                 raise NativeActionConflictError('Recipient has pending control')
         packet = conn.execute('SELECT MAX(version) FROM task_packets WHERE run_id=?', (run_id,)).fetchone()[0]
         snapshot = dict(source=source, step=step, agent_id=worker['agent_id'], packet_version=packet, worker_status=worker['status'], workflow_version=run['workflow_version'])
+        if pre_spawn:
+            snapshot['pending_agent_path'] = worker['pending_agent_path']
         version = [packet, source.get('step_attempt'), source.get('step_contract_revision')]
-        key = digest([source_type, str(source_id), run_id, version, recipient, worker['agent_id'], action_type])
+        binding_anchor = worker['agent_id'] if worker['agent_id'] else worker['pending_agent_path']
+        key = digest([source_type, str(source_id), run_id, version, recipient, binding_anchor, action_type])
         return (snapshot, key, digest(snapshot), digest(source))
 
     def _fence(self, conn, where, args):
@@ -124,13 +169,15 @@ class NativeActionStore:
             raise NativeActionConflictError('Native lease expired; claim is fenced for reconciliation')
         return result
 
-    def _update_transaction(self, action, run_id=None, source_type=None, source_id=None, recipient=None, action_type=None, source_digest=None, action_id=None, expected_revision=None, claim_token=None, outcome=None, evidence_ref=None, evidence_digest=None, result=None, cancel=False, _group_id=None):
+    def _update_transaction(self, action, run_id=None, source_type=None, source_id=None, recipient=None, action_type=None, source_digest=None, action_id=None, expected_revision=None, claim_token=None, outcome=None, evidence_ref=None, evidence_digest=None, result=None, agent_id=None, cancel=False, _group_id=None, _skip_expire=False):
         if action not in {'claim', 'begin', 'record', 'reconcile'}:
             raise ValueError('Unknown native action operation')
         if not isinstance(cancel, bool) or (cancel and (action != 'reconcile' or outcome not in {'not_called', 'rejected'})):
             raise ValueError('cancel requires reconcile with definite not_called/rejected evidence')
+        if agent_id is not None and (not isinstance(agent_id, str) or not agent_id.strip()):
+            raise ValueError('agent_id must be a non-empty string when provided')
         # A later rejected CAS must not roll back the expired-token fence.
-        if _group_id is None:
+        if _group_id is None and not _skip_expire:
             self.expire()
         with self.db.transaction() as conn:
             if action == 'claim':
@@ -138,10 +185,10 @@ class NativeActionStore:
                 if not all((isinstance(x, str) and x.strip() for x in (run_id, source_type, source_id, recipient, action_type, expected))):
                     raise ValueError('claim requires source identity and source_digest')
                 snapshot, key, current, content = self._source(conn, run_id, source_type, source_id, recipient, action_type)
-                if snapshot['workflow_version'] == 4 and source_type != 'control':
+                if snapshot['workflow_version'] in {4, 5} and source_type != 'control':
                     if source_type == 'inbox' and snapshot['source']['kind'] == 'notice':
                         raise NativeActionConflictError('Notice-only delivery does not warrant a native wake')
-                    if _group_id is None and self._busy(conn, run_id, recipient, snapshot['agent_id']):
+                    if _group_id is None and self._busy(conn, run_id, recipient, snapshot['agent_id'], snapshot.get('pending_agent_path')):
                         raise NativeActionConflictError('Recipient has an in-flight wake requiring completion or reconciliation')
                 if current != expected:
                     raise NativeActionConflictError('Native source digest changed')
@@ -204,6 +251,8 @@ class NativeActionStore:
                             invariant = ('agent_id', 'packet_version', 'workflow_version')
                             if any((current[k] != frozen[k] for k in invariant)):
                                 source_race = 'Source binding/version changed after begin'
+                            if frozen.get('pending_agent_path') != current.get('pending_agent_path'):
+                                source_race = 'Pending spawn path changed after begin'
                             mutable = {'status', 'receipts_json', 'result', 'resolved_at'} if row['source_type'] == 'control' else {'status', 'receipts_json'}
                             if {k: v for k, v in current['source'].items() if k not in mutable} != {k: v for k, v in frozen['source'].items() if k not in mutable}:
                                 source_race = 'Source content changed after begin'
@@ -213,14 +262,199 @@ class NativeActionStore:
                             source_race = str(exc)
                         if source_race:
                             status = 'needs_reconciliation'
+                    now_ts = time.time()
+                    if row['action_type'] == 'spawn_agent':
+                        if status == 'confirmed':
+                            expected_path = row['snapshot'].get('pending_agent_path')
+                            bound_id = self._resolve_spawn_binding(expected_path, agent_id, result)
+                            self._apply_spawn_binding_in_tx(conn, row, bound_id, now_ts)
+                        elif cancel and outcome in {'not_called', 'rejected'}:
+                            self._release_cancelled_spawn_in_tx(conn, row, result, now_ts)
+                    elif agent_id is not None and agent_id.strip() != row['snapshot'].get('agent_id'):
+                        raise NativeActionConflictError(
+                            'Explicit agent_id conflicts with bound recipient agent_id'
+                        )
                 history = row['history'] + [dict(operation=action, source_race=source_race, outcome=outcome, evidence_ref=evidence_ref, evidence_digest=evidence_digest, result=result, at=time.time())]
                 conn.execute('UPDATE native_actions SET status=?,revision=revision+1,claim_token=?,lease_expires_at=?,outcome=?,evidence_ref=?,evidence_digest=?,result=?,history_json=?,updated_at=? WHERE action_id=?', (status, row['claim_token'] if action == 'begin' else None, row['lease_expires_at'] if action == 'begin' else None, outcome, evidence_ref, evidence_digest, result, json.dumps(history, ensure_ascii=False), time.time(), action_id))
             return self.get(action_id)
 
     @staticmethod
-    def _busy(conn, run_id, recipient, agent_id):
-        rows = conn.execute("SELECT snapshot_json FROM native_actions WHERE run_id=? AND recipient=? AND source_type!='control' AND status IN ('claimed','invoking','needs_reconciliation')", (run_id, recipient))
-        return any(json.loads(row['snapshot_json'])['agent_id'] == agent_id for row in rows)
+    def _resolve_spawn_binding(expected_path, agent_id, result_text):
+        if not expected_path:
+            raise NativeActionConflictError('Missing pre-frozen pending_agent_path for spawn_agent')
+        parsed = None
+        if isinstance(result_text, str):
+            try:
+                parsed = json.loads(result_text)
+            except ValueError:
+                parsed = None
+        obs_path = None
+        obs_id = None
+        if isinstance(parsed, dict):
+            # Support direct spawn_agent response, wrapped raw_response, or list_agents response.
+            candidate_obj = parsed.get('raw_response') if isinstance(parsed.get('raw_response'), dict) else parsed
+            if isinstance(candidate_obj.get('agents'), list):
+                matches = [
+                    a for a in candidate_obj['agents']
+                    if isinstance(a, dict) and (
+                        a.get('agent_path') == expected_path
+                        or a.get('path') == expected_path
+                        or a.get('canonical_path') == expected_path
+                        or a.get('agent_id') == expected_path
+                        or a.get('id') == expected_path
+                        or a.get('task_name') == expected_path
+                        or a.get('agent_name') == expected_path
+                    )
+                ]
+                if len(matches) == 1:
+                    candidate_obj = matches[0]
+            obs_path = (
+                candidate_obj.get('agent_path')
+                or candidate_obj.get('path')
+                or candidate_obj.get('canonical_path')
+                or candidate_obj.get('target_agent_path')
+                or candidate_obj.get('task_name')
+                or candidate_obj.get('agent_name')
+            )
+            obs_id = candidate_obj.get('agent_id') or candidate_obj.get('id')
+        if obs_path is not None and obs_path != expected_path:
+            raise NativeActionConflictError(
+                f'Spawned agent path {obs_path!r} does not match pre-frozen path {expected_path!r}'
+            )
+        clean_param = agent_id.strip() if isinstance(agent_id, str) and agent_id.strip() else None
+        if clean_param is not None:
+            if obs_id is not None and clean_param not in {obs_id, expected_path}:
+                raise NativeActionConflictError('Explicit agent_id conflicts with raw_response payload')
+            if obs_path is None and clean_param != expected_path:
+                raise NativeActionConflictError(
+                    f'Spawned agent_id {clean_param!r} does not match pre-frozen path {expected_path!r}'
+                )
+            return clean_param
+        if obs_path == expected_path:
+            return obs_id.strip() if isinstance(obs_id, str) and obs_id.strip() else expected_path
+        if isinstance(obs_id, str) and obs_id.strip() == expected_path:
+            return expected_path
+        if isinstance(result_text, str) and result_text.strip() == expected_path:
+            return expected_path
+        raise NativeActionConflictError(
+            f'Spawn confirmation must verify canonical path {expected_path!r}'
+        )
+
+    @staticmethod
+    def _apply_spawn_binding_in_tx(conn, row, bound_agent_id, now):
+        run_id = row['run_id']
+        recipient = row['recipient']
+        dup = conn.execute(
+            'SELECT name FROM workers WHERE run_id=? AND name!=? AND (agent_id=? OR pending_agent_path=?) LIMIT 1',
+            (run_id, recipient, bound_agent_id, bound_agent_id),
+        ).fetchone()
+        if dup is not None:
+            raise NativeActionConflictError(
+                f'Native agent {bound_agent_id!r} is already bound to worker {dup["name"]!r}'
+            )
+        source = row['snapshot']['source']
+        kind = source['kind']
+        if kind == 'task':
+            steps = conn.execute(
+                'SELECT id, verifier_agent_id, owner_agent_id, checkpoint_json FROM workflow_steps WHERE run_id=? AND owner=?',
+                (run_id, recipient),
+            ).fetchall()
+            for step in steps:
+                if step['verifier_agent_id'] and step['verifier_agent_id'] == bound_agent_id:
+                    raise NativeActionConflictError('Author and verifier must be different native agents')
+                if step['owner_agent_id'] and step['owner_agent_id'] != bound_agent_id:
+                    raise NativeActionConflictError('Workflow step owner binding conflicts with spawned agent')
+            for step in steps:
+                if not step['owner_agent_id']:
+                    cp = json.loads(step['checkpoint_json'] or '{}')
+                    cp.pop('pending_owner_path', None)
+                    if 'original_bindings' in cp:
+                        cp['original_bindings']['owner_agent_id'] = bound_agent_id
+                    conn.execute(
+                        'UPDATE workflow_steps SET owner_agent_id=?, checkpoint_json=?, updated_at=? WHERE id=?',
+                        (bound_agent_id, json.dumps(cp, ensure_ascii=False, sort_keys=True, separators=(',', ':')), now, step['id']),
+                    )
+        elif kind == 'review':
+            steps = conn.execute(
+                'SELECT id, owner_agent_id, verifier_agent_id, checkpoint_json FROM workflow_steps WHERE run_id=? AND verifier=?',
+                (run_id, recipient),
+            ).fetchall()
+            for step in steps:
+                if step['owner_agent_id'] and step['owner_agent_id'] == bound_agent_id:
+                    raise NativeActionConflictError('Author and verifier must be different native agents')
+                if step['verifier_agent_id'] and step['verifier_agent_id'] != bound_agent_id:
+                    raise NativeActionConflictError('Workflow step verifier binding conflicts with spawned agent')
+            for step in steps:
+                cp = json.loads(step['checkpoint_json'] or '{}')
+                cp.pop('pending_verifier_path', None)
+                if 'original_bindings' in cp:
+                    cp['original_bindings']['verifier_agent_id'] = bound_agent_id
+                cp['frozen_verifier_binding'] = {'verifier': recipient, 'verifier_agent_id': bound_agent_id}
+                conn.execute(
+                    'UPDATE workflow_steps SET verifier_agent_id=?, checkpoint_json=?, updated_at=? WHERE id=?',
+                    (bound_agent_id, json.dumps(cp, ensure_ascii=False, sort_keys=True, separators=(',', ':')), now, step['id']),
+                )
+        conn.execute(
+            "UPDATE workers SET agent_id=?, pending_agent_path=NULL, status='working', last_heartbeat_at=?, stalled_alerted=0, updated_at=? WHERE run_id=? AND name=?",
+            (bound_agent_id, now, now, run_id, recipient),
+        )
+        conn.execute(
+            "UPDATE inbox_messages SET recipient_agent_id=? WHERE run_id=? AND recipient=? AND (recipient_agent_id='' OR recipient_agent_id IS NULL)",
+            (bound_agent_id, run_id, recipient),
+        )
+
+    @staticmethod
+    def _release_cancelled_spawn_in_tx(conn, row, evidence, now):
+        run_id = row['run_id']
+        recipient = row['recipient']
+        source_id = row['source_id']
+        msg = conn.execute(
+            'SELECT status, receipts_json, recipient_agent_id, kind, step_id FROM inbox_messages WHERE id=? AND run_id=?',
+            (source_id, run_id),
+        ).fetchone()
+        if msg is not None and msg['status'] == 'pending' and not msg['recipient_agent_id']:
+            receipts = json.loads(msg['receipts_json'] or '[]')
+            receipts.append({
+                'id': 'rcpt_' + uuid.uuid4().hex,
+                'message_id': source_id,
+                'recipient': recipient,
+                'status': 'cancelled',
+                'evidence': evidence,
+                'created_at': now,
+            })
+            conn.execute(
+                "UPDATE inbox_messages SET status='cancelled', receipts_json=? WHERE id=?",
+                (json.dumps(receipts, ensure_ascii=False), source_id),
+            )
+            if msg['kind'] == 'task' and msg['step_id']:
+                step = conn.execute(
+                    'SELECT id, state, owner_agent_id, verifier_agent_id, checkpoint_json FROM workflow_steps WHERE id=?',
+                    (msg['step_id'],),
+                ).fetchone()
+                if step is not None and step['state'] == 'dispatched' and not step['owner_agent_id']:
+                    cp = json.loads(step['checkpoint_json'] or '{}')
+                    cp.pop('admission', None)
+                    cp.pop('owner_last_dispatch_at', None)
+                    orig = cp.get('original_bindings')
+                    if isinstance(orig, dict) and not orig.get('owner_agent_id') and not orig.get('verifier_agent_id'):
+                        cp.pop('original_bindings', None)
+                    conn.execute(
+                        "UPDATE workflow_steps SET state='planned', checkpoint_json=?, revision=revision+1, updated_at=? WHERE id=?",
+                        (json.dumps(cp, ensure_ascii=False, sort_keys=True, separators=(',', ':')), now, step['id']),
+                    )
+
+    @staticmethod
+    def _busy(conn, run_id, recipient, agent_id, pending_agent_path=None):
+        rows = conn.execute("SELECT snapshot_json FROM native_actions WHERE run_id=? AND recipient=? AND source_type!='control' AND status IN ('claimed','invoking','needs_reconciliation')", (run_id, recipient)).fetchall()
+        if not rows:
+            return False
+        if not agent_id:
+            return True
+        return any(
+            json.loads(row['snapshot_json']).get('agent_id') == agent_id
+            or json.loads(row['snapshot_json']).get('pending_agent_path') == agent_id
+            for row in rows
+        )
 
     def _update_group(self, action, members, run_id=None, recipient=None, action_type=None,
                       group_id=None, outcome=None, evidence_ref=None, evidence_digest=None,
@@ -255,8 +489,10 @@ class NativeActionStore:
                 run = conn.execute('SELECT workflow_version FROM runs WHERE id=?', (run_id,)).fetchone()
                 if run is None:
                     raise NotFoundError(f'Run not found: {run_id}')
-                if run['workflow_version'] != 4:
+                if run['workflow_version'] not in {4, 5}:
                     raise NativeActionConflictError('Grouped handoff requires workflow4')
+                if action_type == 'spawn_agent':
+                    raise ValueError('spawn_agent actions cannot be grouped')
                 group_id = 'ng_' + uuid.uuid4().hex
                 first = self._source(conn, run_id, members[0]['source_type'], members[0]['source_id'], recipient, action_type)[0]
                 if self._busy(conn, run_id, recipient, first['agent_id']):
@@ -319,7 +555,7 @@ class NativeActionStore:
             queries = (('control', "SELECT c.id AS source_id,w.name AS recipient FROM worker_controls c JOIN workers w ON w.id=c.worker_id WHERE c.run_id=? AND c.status='pending' ORDER BY c.created_at", 'interrupt_agent'), ('inbox', "SELECT id AS source_id,recipient,kind FROM inbox_messages WHERE run_id=? AND status='pending' ORDER BY board_seq", 'followup_task'), ('human', "SELECT seq AS source_id,mentions_json,summary,body_md FROM board_messages WHERE run_id=? AND msg_type='human' ORDER BY seq", 'send_message'))
             for typ, query, act in queries:
                 for source_row in conn.execute(query, (run_id,)):
-                    if run['workflow_version'] == 4 and typ == 'inbox' and source_row['kind'] == 'notice':
+                    if run['workflow_version'] in {4, 5} and typ == 'inbox' and source_row['kind'] == 'notice':
                         continue
                     sid = str(source_row['source_id'])
                     prior = conn.execute('SELECT stable_key,status,outcome,content_digest FROM native_actions WHERE run_id=? AND source_type=? AND source_id=?', (run_id, typ, sid)).fetchall()
@@ -331,10 +567,16 @@ class NativeActionStore:
                             clarify(dict(source_type=typ, source_id=sid, seq=source_row['source_id'], summary=source_row['summary'], body_md=source_row['body_md'], reason='Recipient is ambiguous'))
                             continue
                         target = mentions[0]
+                        resolved_act = act
                     else:
                         target = source_row['recipient']
+                        resolved_act = act
+                        if typ == 'inbox' and run['workflow_version'] == 5:
+                            w_row = conn.execute('SELECT agent_id, pending_agent_path FROM workers WHERE run_id=? AND name=?', (run_id, target)).fetchone()
+                            if w_row is not None and not w_row['agent_id'] and w_row['pending_agent_path']:
+                                resolved_act = 'spawn_agent'
                     try:
-                        snapshot, key, current, content = self._source(conn, run_id, typ, sid, target, act)
+                        snapshot, key, current, content = self._source(conn, run_id, typ, sid, target, resolved_act)
                     except (InboxConflictError, ValueError, NotFoundError) as exc:
                         clarify(dict(source_type=typ, source_id=sid, recipient=target, reason=str(exc)))
                         continue
@@ -344,9 +586,11 @@ class NativeActionStore:
                     if prior and any((r['content_digest'] != content for r in prior)):
                         clarify(dict(source_type=typ, source_id=sid, reason='Same stable key has different source contents'))
                         continue
-                    item = dict(run_id=run_id, source_type=typ, source_id=sid, recipient=target, action_type=act, source_digest=current, agent_id=snapshot['agent_id'], source=snapshot['source'])
-                    if run['workflow_version'] == 4 and typ != 'control' and not self._busy(conn, run_id, target, snapshot['agent_id']):
-                        key = (target, snapshot['agent_id'], act)
+                    item = dict(run_id=run_id, source_type=typ, source_id=sid, recipient=target, action_type=resolved_act, source_digest=current, agent_id=snapshot['agent_id'], source=snapshot['source'])
+                    if snapshot.get('pending_agent_path'):
+                        item['pending_agent_path'] = snapshot['pending_agent_path']
+                    if run['workflow_version'] in {4, 5} and typ != 'control' and resolved_act != 'spawn_agent' and not self._busy(conn, run_id, target, snapshot['agent_id'], snapshot.get('pending_agent_path')):
+                        key = (target, snapshot['agent_id'], resolved_act)
                         group_keys.add(key)
                         # Busy sources must not consume another recipient's bounded projection.
                         if key not in groups and len(groups) < limit:
@@ -359,7 +603,7 @@ class NativeActionStore:
             reconcile_sql = "FROM native_actions WHERE run_id=? AND (status='needs_reconciliation' OR (status IN ('claimed','invoking') AND lease_expires_at<=?))"
             args = (run_id, time.time())
             reconciliation_count = conn.execute('SELECT count(*) ' + reconcile_sql, args).fetchone()[0]
-            rows = conn.execute('SELECT action_id,status,revision,source_type,source_id,recipient,lease_expires_at ' + reconcile_sql + ' ORDER BY updated_at LIMIT ?', (*args, limit)).fetchall()
+            rows = conn.execute('SELECT action_id,action_type,status,revision,source_type,source_id,recipient,lease_expires_at ' + reconcile_sql + ' ORDER BY updated_at LIMIT ?', (*args, limit)).fetchall()
             counts = dict.fromkeys(('claimed', 'invoking', 'confirmed', 'failed', 'needs_reconciliation', 'cancelled'), 0)
             counts.update({r['status']: r['n'] for r in conn.execute('SELECT status,count(*) n FROM native_actions WHERE run_id=? GROUP BY status', (run_id,))})
             recovery_groups = {}
@@ -374,8 +618,11 @@ class NativeActionStore:
             reconciliation = []
             for row in rows:
                 item = dict(row)
-                frozen = self.get(row['action_id'])['snapshot'].get('native_group')
+                snap_data = self.get(row['action_id'])['snapshot']
+                frozen = snap_data.get('native_group')
                 if frozen:
                     item.update(group_id=frozen['id'], frozen_member_ids=frozen['members'])
+                if snap_data.get('pending_agent_path'):
+                    item['pending_agent_path'] = snap_data['pending_agent_path']
                 reconciliation.append(item)
-        return dict(native_action_groups=list(recovery_groups.values()), native_action_groups_count=len(recovery_group_ids), native_action_groups_has_more=len(recovery_group_ids) > limit, next_action_groups=list(groups.values()), next_action_groups_count=len(group_keys) if run['workflow_version'] == 4 else 0, limit=limit, counts=counts, counts_complete=True, next_actions_count=action_count, needs_reconciliation_count=reconciliation_count, needs_clarification_count=clarification_count, next_actions=actions, needs_reconciliation=reconciliation, needs_clarification=clarification, native_actions_has_more=any((n > limit for n in (action_count, reconciliation_count, clarification_count))))
+        return dict(native_action_groups=list(recovery_groups.values()), native_action_groups_count=len(recovery_group_ids), native_action_groups_has_more=len(recovery_group_ids) > limit, next_action_groups=list(groups.values()), next_action_groups_count=len(group_keys) if run['workflow_version'] in {4, 5} else 0, limit=limit, counts=counts, counts_complete=True, next_actions_count=action_count, needs_reconciliation_count=reconciliation_count, needs_clarification_count=clarification_count, next_actions=actions, needs_reconciliation=reconciliation, needs_clarification=clarification, native_actions_has_more=any((n > limit for n in (action_count, reconciliation_count, clarification_count))))

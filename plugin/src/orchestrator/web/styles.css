@@ -44,6 +44,10 @@
   --cyan: #0c6b85;
   --cyan-tint: rgba(14, 116, 144, 0.10);
 
+  --pipeline-fg: #312e81;
+  --pipeline-bg: rgba(79, 70, 229, 0.11);
+  --pipeline-border: rgba(79, 70, 229, 0.36);
+
   --muted-tint: rgba(71, 85, 105, 0.09);
 
   --diff-add-bg: #ecfdf5;
@@ -106,6 +110,10 @@
 
   --cyan: #67e8f9;
   --cyan-tint: rgba(34, 211, 238, 0.14);
+
+  --pipeline-fg: #c7d2fe;
+  --pipeline-bg: rgba(99, 102, 241, 0.18);
+  --pipeline-border: rgba(129, 140, 248, 0.42);
 
   --muted-tint: rgba(148, 163, 184, 0.14);
 
@@ -830,6 +838,14 @@ textarea:focus-visible,
   font-size: 11px;
   font-weight: 500;
   white-space: nowrap;
+}
+
+.badge-appserver {
+  background: var(--pipeline-bg);
+  color: var(--pipeline-fg);
+  border: 1px solid var(--pipeline-border);
+  font-weight: 600;
+  letter-spacing: 0.01em;
 }
 
 .chip-tag {
@@ -2301,6 +2317,7 @@ textarea, input { caret-color: var(--link); }
 .workflow-steps { list-style: none; padding: 0; margin: 12px 0 0; }
 .workflow-step { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: start; gap: 10px; padding: 10px 0; border-bottom: 1px solid var(--border-hairline); }
 .workflow-step-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workflow-step-badges { display: inline-flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .workflow-warning { color: var(--warning); }
 .workflow-more, .workflow-blockers { margin-top: 12px; font-size: 13px; }
 .workflow-more > summary, .workflow-blockers > summary { cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

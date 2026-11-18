@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Idempotent Windows installer for the tri-orchestrator Codex plugin,
     agent role definitions, [agents] config settings, and cached plugin runtime.
@@ -9,7 +9,8 @@ param(
     [string]$PluginDir = "",
     [string]$CodexHome = "",
     [switch]$SkipUvSync,
-    [switch]$SkipPluginInstall
+    [switch]$SkipPluginInstall,
+    [switch]$TrustPluginHooks
 )
 
 Set-StrictMode -Version Latest
@@ -104,7 +105,21 @@ function Invoke-Native {
     }
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
+    # When RedirectStandardInput is true, .NET creates a StreamWriter using
+    # Console.InputEncoding.  On systems where that encoding includes a BOM
+    # preamble (UTF-8 with BOM), the preamble is auto-flushed into the pipe,
+    # corrupting binary/text protocols such as TOML parsing.  Temporarily set
+    # Console.InputEncoding to our BOM-free encoding so the StreamWriter is
+    # constructed without a preamble.
+    $savedInputEnc = $null
+    if ($null -ne $StdinText) {
+        $savedInputEnc = [Console]::InputEncoding
+        [Console]::InputEncoding = $Utf8NoBom
+    }
     [void]$proc.Start()
+    if ($null -ne $savedInputEnc) {
+        [Console]::InputEncoding = $savedInputEnc
+    }
     if ($null -ne $StdinText) {
         $inBytes = $Utf8NoBom.GetBytes($StdinText)
         $proc.StandardInput.BaseStream.Write($inBytes, 0, $inBytes.Length)
@@ -298,6 +313,71 @@ function Update-AgentsSectionInToml {
     }
 }
 
+function Update-FeaturesSectionInToml {
+    param([string]$TomlText)
+    $nl = if ($TomlText -match "`r`n") { "`r`n" } else { "`n" }
+    $lines = New-Object System.Collections.Generic.List[string]
+    if (-not [string]::IsNullOrEmpty($TomlText)) {
+        foreach ($l in ($TomlText -split "\r?\n")) {
+            [void]$lines.Add($l)
+        }
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq "") {
+            [void]$lines.RemoveAt($lines.Count - 1)
+        }
+    }
+
+    $featStart = -1
+    $featEnd = $lines.Count
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $trim = $lines[$i].Trim()
+        if ($trim -match '^\[features\]\s*(#.*)?$') {
+            $featStart = $i
+            continue
+        }
+        if ($featStart -ge 0 -and $trim -match '^\[') {
+            $featEnd = $i
+            break
+        }
+    }
+
+    if ($featStart -lt 0) {
+        if ($lines.Count -gt 0 -and $lines[$lines.Count - 1].Trim() -ne "") {
+            [void]$lines.Add("")
+        }
+        [void]$lines.Add("[features]")
+        [void]$lines.Add("multi_agent = true")
+        [void]$lines.Add("multi_agent_v2 = true")
+    } else {
+        $hasMultiAgent = $false
+        $hasMultiAgentV2 = $false
+        for ($i = $featStart + 1; $i -lt $featEnd; $i++) {
+            $line = $lines[$i]
+            if ($line -match '^(\s*multi_agent_v2\s*=\s*)([^\s#]+)(.*)$') {
+                $hasMultiAgentV2 = $true
+                if ($Matches[2] -cne "true") {
+                    $lines[$i] = "$($Matches[1])true$($Matches[3])"
+                }
+            } elseif ($line -match '^(\s*multi_agent\s*=\s*)([^\s#]+)(.*)$') {
+                $hasMultiAgent = $true
+                if ($Matches[2] -cne "true") {
+                    $lines[$i] = "$($Matches[1])true$($Matches[3])"
+                }
+            }
+        }
+        $insertAt = $featStart + 1
+        if (-not $hasMultiAgent) {
+            [void]$lines.Insert($insertAt, "multi_agent = true")
+            $insertAt++
+            $featEnd++
+        }
+        if (-not $hasMultiAgentV2) {
+            [void]$lines.Insert($insertAt, "multi_agent_v2 = true")
+        }
+    }
+
+    return (($lines.ToArray() -join $nl) + $nl)
+}
+
 function Test-VenvPointsOutsideDir {
     param([string]$PluginDirPath)
     $venvDir = Join-Path $PluginDirPath ".venv"
@@ -372,9 +452,17 @@ $pluginPyproject = Join-Path $PluginDir "pyproject.toml"
 if (-not (Test-Path $pluginPyproject -PathType Leaf)) {
     throw "Missing plugin pyproject.toml at $pluginPyproject"
 }
-$pluginManifestPath = Join-Path $PluginDir "plugin.json"
+$legacyRootManifestPath = Join-Path $PluginDir "plugin.json"
+if (Test-Path $legacyRootManifestPath -PathType Leaf) {
+    throw "Legacy root plugin.json must not exist at $legacyRootManifestPath (use .codex-plugin/plugin.json)."
+}
+$pluginManifestPath = Join-Path $PluginDir ".codex-plugin\plugin.json"
 if (-not (Test-Path $pluginManifestPath -PathType Leaf)) {
-    throw "Missing plugin.json at $pluginManifestPath"
+    throw "Missing plugin manifest at $pluginManifestPath"
+}
+$pluginHooksPath = Join-Path $PluginDir "hooks\hooks.json"
+if (-not (Test-Path $pluginHooksPath -PathType Leaf)) {
+    throw "Missing plugin hooks config at $pluginHooksPath"
 }
 
 Write-Host "[install] PluginDir : $PluginDir"
@@ -387,8 +475,12 @@ $uvExe = Resolve-UvExe
 Write-Host "[install] Using uv  : $uvExe"
 $pyRunner = Resolve-PythonRunner -UvExe $uvExe
 
-# Read plugin version without mutating any repo files
+# Read single plugin manifest (.codex-plugin/plugin.json) and validate hooks declaration without mutating any repo files
 $pluginMeta = Read-Utf8Text $pluginManifestPath | ConvertFrom-Json
+if (-not ($pluginMeta.PSObject.Properties['hooks'] -and $pluginMeta.hooks -eq "./hooks/hooks.json")) {
+    throw "Expected .codex-plugin/plugin.json to declare hooks='./hooks/hooks.json' at $pluginManifestPath"
+}
+$null = Read-Utf8Text $pluginHooksPath | ConvertFrom-Json
 $pluginVersion = if ($pluginMeta.PSObject.Properties['version'] -and $pluginMeta.version) { [string]$pluginMeta.version } else { "0.1.0" }
 
 # Validate plugin/agents/*.toml before touching ~/.codex
@@ -424,7 +516,7 @@ $configExisted = Test-Path $configPath -PathType Leaf
 $existingConfigText = if ($configExisted) { Read-Utf8Text $configPath } else { "" }
 
 $updated = Update-AgentsSectionInToml -TomlText $existingConfigText
-$candidateConfig = $updated.Content
+$candidateConfig = Update-FeaturesSectionInToml -TomlText $updated.Content
 
 $tomlParseCheck = Invoke-PythonInline -PyRunner $pyRunner -Code "import sys, tomllib; tomllib.loads(sys.stdin.read())" -StdinText $candidateConfig
 if ($tomlParseCheck.ExitCode -ne 0) {
@@ -500,7 +592,7 @@ if (-not $baselineExists) {
 Write-Host "[install] Installed $($installedAgents.Count) agent role TOMLs into $agentsDstDir"
 
 Write-Utf8NoBom -Path $configPath -Content $candidateConfig
-Write-Host "[install] Updated [agents] in $configPath (strict-config verified)"
+Write-Host "[install] Updated [agents] and [features] in $configPath (strict-config verified)"
 
 $manifestObj = [ordered]@{
     installed_at     = $timestamp
@@ -656,6 +748,322 @@ if (-not $SkipUvSync) {
             throw "Expected cached plugin python missing at $cachedPy"
         }
         Write-Host "[install] Pre-warmed cached runtime -> $cachedPluginDir\.venv"
+    }
+}
+
+function Invoke-HooksListProbe {
+    param(
+        [PSCustomObject]$PyRunner,
+        [string]$CodexExePath,
+        [string]$TargetCodexHome,
+        [string]$ProbeCwd,
+        [string]$VersionStr
+    )
+    $hooksProbePy = @'
+import json, os, queue, subprocess, sys, threading, time
+
+codex_exe, codex_home, probe_cwd, plugin_version = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+env = os.environ.copy()
+env["CODEX_HOME"] = codex_home
+env["PYTHONUTF8"] = "1"
+env["PYTHONIOENCODING"] = "utf-8"
+
+creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+proc = subprocess.Popen(
+    [codex_exe, "app-server", "--stdio"],
+    cwd=probe_cwd,
+    env=env,
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True,
+    encoding="utf-8",
+    bufsize=1,
+    creationflags=creationflags,
+)
+
+stdout_q = queue.Queue()
+stderr_chunks = []
+
+def _read_out():
+    assert proc.stdout is not None
+    try:
+        for line in proc.stdout:
+            stdout_q.put(line)
+    finally:
+        stdout_q.put(None)
+
+def _read_err():
+    assert proc.stderr is not None
+    try:
+        for line in proc.stderr:
+            stderr_chunks.append(line)
+    except Exception:
+        pass
+
+t_out = threading.Thread(target=_read_out, daemon=True)
+t_err = threading.Thread(target=_read_err, daemon=True)
+t_out.start()
+t_err.start()
+
+def _send(obj):
+    assert proc.stdin is not None
+    proc.stdin.write(json.dumps(obj) + "\n")
+    proc.stdin.flush()
+
+hooks_resp = None
+try:
+    _send({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "tri-orchestrator-installer", "version": plugin_version},
+            "capabilities": {"experimentalApi": True},
+        },
+    })
+    sent_list = False
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        try:
+            line = stdout_q.get(timeout=0.4)
+        except queue.Empty:
+            if proc.poll() is not None and stdout_q.empty():
+                break
+            continue
+        if line is None:
+            break
+        raw = line.strip()
+        if not raw:
+            continue
+        msg = json.loads(raw)
+        if not isinstance(msg, dict):
+            continue
+        msg_id = msg.get("id")
+        if msg_id == 1 and not sent_list:
+            if "error" in msg:
+                raise RuntimeError(f"app-server initialize error: {msg['error']}")
+            _send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+            _send({"jsonrpc": "2.0", "id": 2, "method": "hooks/list", "params": {}})
+            sent_list = True
+        elif msg_id == 2:
+            if "error" in msg:
+                raise RuntimeError(f"app-server hooks/list error: {msg['error']}")
+            hooks_resp = msg.get("result") or {}
+            break
+finally:
+    try:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=3.0)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+    t_out.join(timeout=1.0)
+    t_err.join(timeout=1.0)
+    try:
+        if proc.stdout:
+            proc.stdout.close()
+    except Exception:
+        pass
+    try:
+        if proc.stderr:
+            proc.stderr.close()
+    except Exception:
+        pass
+
+if hooks_resp is None:
+    err_tail = "".join(stderr_chunks[-20:]).strip()
+    raise RuntimeError(f"Timed out or exited before receiving hooks/list response. stderr={err_tail}")
+
+all_hooks = []
+warnings = []
+errors = []
+if isinstance(hooks_resp.get("data"), list):
+    for bucket in hooks_resp["data"]:
+        if isinstance(bucket, dict):
+            if isinstance(bucket.get("hooks"), list):
+                all_hooks.extend(bucket["hooks"])
+            if isinstance(bucket.get("warnings"), list):
+                warnings.extend(bucket["warnings"])
+            if isinstance(bucket.get("errors"), list):
+                errors.extend(bucket["errors"])
+elif isinstance(hooks_resp.get("hooks"), list):
+    all_hooks.extend(hooks_resp["hooks"])
+
+plugin_hooks_by_key = {}
+for h in all_hooks:
+    if isinstance(h, dict) and h.get("pluginId") == "tri-orchestrator@tri-orchestrator":
+        k = h.get("key") or f"{h.get('eventName')}:{len(plugin_hooks_by_key)}"
+        plugin_hooks_by_key[k] = h
+
+print(json.dumps({
+    "hooks": list(plugin_hooks_by_key.values()),
+    "warnings": warnings,
+    "errors": errors,
+}, ensure_ascii=False))
+'@
+    $probeRes = Invoke-PythonInline -PyRunner $PyRunner -Code $hooksProbePy -ScriptArgs @($CodexExePath, $TargetCodexHome, $ProbeCwd, $VersionStr)
+    if ($probeRes.ExitCode -ne 0) {
+        throw "codex app-server --stdio hooks/list self-check failed:`n$($probeRes.StdOut)`n$($probeRes.StdErr)"
+    }
+    return ($probeRes.StdOut | ConvertFrom-Json)
+}
+
+if ((-not $SkipPluginInstall) -or $TrustPluginHooks) {
+    $probeWorkDir = if ($RepoRoot -and (Test-Path $RepoRoot -PathType Container)) { $RepoRoot } else { $env:TEMP }
+    $hooksReport = Invoke-HooksListProbe -PyRunner $pyRunner -CodexExePath $codexExe -TargetCodexHome $CodexHome -ProbeCwd $probeWorkDir -VersionStr $pluginVersion
+    $discoveredHooks = @()
+    if ($hooksReport.PSObject.Properties['hooks'] -and $hooksReport.hooks) {
+        $discoveredHooks = @($hooksReport.hooks)
+    }
+    $requiredHookEvents = @("sessionStart", "postCompact", "userPromptSubmit", "stop")
+    $presentEvents = @($discoveredHooks | ForEach-Object { [string]$_.eventName })
+    $missingEvents = @($requiredHookEvents | Where-Object { $presentEvents -notcontains $_ })
+    if ($missingEvents.Count -gt 0) {
+        $rawSummary = ($discoveredHooks | ConvertTo-Json -Compress -Depth 5)
+        throw "Plugin hooks/list verification failed: missing lifecycle hook(s) [$($missingEvents -join ', ')] for 'tri-orchestrator@tri-orchestrator'. Discovered: $rawSummary"
+    }
+
+    if ($TrustPluginHooks) {
+        $mergeHooksPy = @'
+import json, re, sys, tomllib
+
+raw_payload = json.loads(sys.stdin.read())
+toml_text = raw_payload["toml_text"]
+hooks = raw_payload["hooks"]
+
+entries = []
+for h in sorted(hooks, key=lambda item: (item.get("displayOrder", 999), item.get("key", ""))):
+    key = h.get("key")
+    cur_hash = h.get("currentHash") or ""
+    if not key or not isinstance(key, str):
+        raise ValueError(f"Hook missing valid key: {h}")
+    parts = cur_hash.split("/", 1)
+    if len(parts) != 2 or not parts[0].startswith("sha256:") or not parts[1].startswith("sha256:"):
+        raise ValueError(f"Unexpected composite currentHash for {key}: {cur_hash!r}")
+    cmd_hash, content_hash = parts[0], parts[1]
+    line = f"{json.dumps(key)} = {{ enabled = true, trusted_hash = {json.dumps(cmd_hash)}, trusted_content_hash = {json.dumps(content_hash)} }}"
+    entries.append((key, cmd_hash, content_hash, line))
+
+nl = "\r\n" if "\r\n" in toml_text else "\n"
+lines = toml_text.splitlines() if toml_text else []
+
+cleaned_lines = []
+skip_subtable = False
+subtable_re = re.compile(r'^\s*\[\s*hooks\.state\s*\.\s*(["\'])tri-orchestrator@tri-orchestrator:[^"\']*\1\s*\]\s*(?:#.*)?$')
+any_header_re = re.compile(r'^\s*\[')
+for ln in lines:
+    if subtable_re.match(ln):
+        skip_subtable = True
+        continue
+    if skip_subtable and any_header_re.match(ln):
+        skip_subtable = False
+    if not skip_subtable:
+        cleaned_lines.append(ln)
+lines = cleaned_lines
+
+sec_start = -1
+sec_end = len(lines)
+hooks_state_re = re.compile(r'^\s*\[\s*hooks\.state\s*\]\s*(?:#.*)?$')
+for idx, ln in enumerate(lines):
+    if hooks_state_re.match(ln):
+        sec_start = idx
+        continue
+    if sec_start >= 0 and any_header_re.match(ln):
+        sec_end = idx
+        break
+
+tri_key_re = re.compile(r'^\s*(["\'])tri-orchestrator@tri-orchestrator:[^"\']*\1\s*=')
+if sec_start < 0:
+    if lines and lines[-1].strip() != "":
+        lines.append("")
+    lines.append("[hooks.state]")
+    for _, _, _, entry_line in entries:
+        lines.append(entry_line)
+else:
+    kept_body = []
+    i = sec_start + 1
+    while i < sec_end:
+        ln = lines[i]
+        if tri_key_re.match(ln):
+            rhs = ln.split("=", 1)[1]
+            depth = rhs.count("{") - rhs.count("}")
+            i += 1
+            while depth > 0 and i < sec_end:
+                depth += lines[i].count("{") - lines[i].count("}")
+                i += 1
+            continue
+        kept_body.append(ln)
+        i += 1
+    had_trailing_blank = bool(kept_body and kept_body[-1].strip() == "")
+    while kept_body and kept_body[-1].strip() == "":
+        kept_body.pop()
+    for _, _, _, entry_line in entries:
+        kept_body.append(entry_line)
+    if sec_end < len(lines) and (had_trailing_blank or lines[sec_end].strip() != ""):
+        kept_body.append("")
+    lines = lines[: sec_start + 1] + kept_body + lines[sec_end:]
+
+updated_toml = (nl.join(lines) + nl) if lines else ""
+parsed = tomllib.loads(updated_toml)
+state_tbl = parsed.get("hooks", {}).get("state", {})
+for key, cmd_hash, content_hash, _ in entries:
+    actual = state_tbl.get(key)
+    expected = {"enabled": True, "trusted_hash": cmd_hash, "trusted_content_hash": content_hash}
+    if actual != expected:
+        raise AssertionError(f"TOML roundtrip mismatch for {key}: {actual} != {expected}")
+
+sys.stdout.buffer.write(updated_toml.encode("utf-8"))
+'@
+        $currentCfgText = if (Test-Path $configPath -PathType Leaf) { Read-Utf8Text $configPath } else { "" }
+        $mergePayload = (@{
+            toml_text = $currentCfgText
+            hooks     = $discoveredHooks
+        } | ConvertTo-Json -Depth 8 -Compress)
+        $mergeRes = Invoke-PythonInline -PyRunner $pyRunner -Code $mergeHooksPy -StdinText $mergePayload
+        if ($mergeRes.ExitCode -ne 0) {
+            throw "Failed to generate [hooks.state] entries for config.toml:`n$($mergeRes.StdErr)`n$($mergeRes.StdOut)"
+        }
+        $trustedCandidateConfig = $mergeRes.StdOut
+
+        $hooksStageDir = Join-Path ([System.IO.Path]::GetTempPath()) ("tri-orch-hooks-cfg-" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $hooksStageDir -Force | Out-Null
+        try {
+            Write-Utf8NoBom -Path (Join-Path $hooksStageDir "config.toml") -Content $trustedCandidateConfig
+            $strictHooksRes = Invoke-Native -FilePath $codexExe -Arguments @("app-server", "--strict-config", "--print-startup-config") -EnvOverrides @{ CODEX_HOME = $hooksStageDir }
+            if ($strictHooksRes.ExitCode -ne 0 -or $strictHooksRes.StdErr -match "Error loading config\.toml") {
+                throw "codex --strict-config rejected [hooks.state] in config.toml:`n$($strictHooksRes.StdOut)`n$($strictHooksRes.StdErr)"
+            }
+        } finally {
+            Remove-Item -Path $hooksStageDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        Write-Utf8NoBom -Path $configPath -Content $trustedCandidateConfig
+        $recheckReport = Invoke-HooksListProbe -PyRunner $pyRunner -CodexExePath $codexExe -TargetCodexHome $CodexHome -ProbeCwd $probeWorkDir -VersionStr $pluginVersion
+        $recheckHooks = @($recheckReport.hooks)
+        $stillUntrusted = @($recheckHooks | Where-Object { $_.trustStatus -ne "trusted" })
+        if ($recheckHooks.Count -lt 4 -or $stillUntrusted.Count -gt 0) {
+            $recheckSummary = ($recheckHooks | ConvertTo-Json -Compress -Depth 5)
+            throw "-TrustPluginHooks failed to transition all 4 hooks to trustStatus='trusted': $recheckSummary"
+        }
+        Write-Host "[install] Trusted all 4 plugin hooks in [hooks.state] ($configPath) and verified trustStatus=trusted via hooks/list."
+    } else {
+        $untrustedHooks = @($discoveredHooks | Where-Object { $_.trustStatus -ne "trusted" })
+        if ($untrustedHooks.Count -gt 0) {
+            Write-Host "[install] Verified 4 plugin hooks via hooks/list (trustStatus=untrusted; [hooks.state] left untouched by default)."
+            Write-Host "[提示] 已发现 tri-orchestrator 的全部 4 个生命周期钩子（sessionStart / postCompact / userPromptSubmit / stop），当前默认处于未信任（untrusted）状态。"
+            Write-Host "[提示] 打开 Codex Desktop 后，请在弹出的插件钩子信任提示框中点击「信任 / Trust」（或使用 scripts\install.ps1 -TrustPluginHooks 重新安装），即可激活 Stop 防提前退出门禁与 PostCompact 上下文自动恢复。"
+        } else {
+            Write-Host "[install] Verified 4 plugin hooks via hooks/list (all trustStatus=trusted)."
+        }
     }
 }
 

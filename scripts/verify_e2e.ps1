@@ -252,10 +252,11 @@ json_files = sorted(
     list((root / ".agents").rglob("*.json")) +
     [p for p in (root / "plugin").rglob("*.json") if ".venv" not in p.parts]
 )
+assert not (root / "plugin" / "plugin.json").exists(), "Legacy root plugin/plugin.json must be removed"
 expected_core_json = {
     root / ".agents" / "plugins" / "marketplace.json",
-    root / "plugin" / "plugin.json",
     root / "plugin" / ".codex-plugin" / "plugin.json",
+    root / "plugin" / "hooks" / "hooks.json",
     root / "plugin" / "mcp.json",
     root / "plugin" / ".mcp.json",
 }
@@ -279,11 +280,13 @@ for label, srv in [("plugin/mcp.json", srv1), ("plugin/.mcp.json", srv2)]:
     assert "--offline" not in args_str and "--no-sync" not in args_str, f"{label} must not contain --offline or --no-sync: {args_str}"
 assert srv1.get("cwd") == "${PLUGIN_ROOT}", f"plugin/mcp.json cwd must be '${{PLUGIN_ROOT}}', got {srv1.get('cwd')!r}"
 
-p1 = json.loads((root / "plugin" / "plugin.json").read_text(encoding="utf-8"))
 p2 = json.loads((root / "plugin" / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
-assert p1["name"] == p2["name"] == "tri-orchestrator"
-assert p1["version"] == p2["version"]
-short_desc = p1["extensions"]["com.openai"]["interface"]["shortDescription"]
+assert p2["name"] == "tri-orchestrator"
+assert p2["version"] == "0.6.0"
+assert p2.get("hooks") == "./hooks/hooks.json"
+hooks_cfg = json.loads((root / "plugin" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+assert set(hooks_cfg.get("hooks", {}).keys()) == {"SessionStart", "PostCompact", "UserPromptSubmit", "Stop"}
+short_desc = p2["interface"]["shortDescription"]
 assert len(short_desc) <= 30, f"shortDescription too long ({len(short_desc)}): {short_desc}"
 
 for svg in [root / "plugin" / "assets" / "logo.svg", root / "plugin" / "assets" / "icon.svg"]:
@@ -339,7 +342,7 @@ if (-not $SkipPluginCheck) {
     }
 }
 if ([string]::IsNullOrWhiteSpace($cachedPluginDir)) {
-    $pluginMeta = [System.IO.File]::ReadAllText((Join-Path $RepoRoot "plugin\plugin.json"), $Utf8NoBom) | ConvertFrom-Json
+    $pluginMeta = [System.IO.File]::ReadAllText((Join-Path $RepoRoot "plugin\.codex-plugin\plugin.json"), $Utf8NoBom) | ConvertFrom-Json
     $pluginVersion = if ($pluginMeta.PSObject.Properties['version'] -and $pluginMeta.version) { [string]$pluginMeta.version } else { "0.1.0" }
     $cachedPluginDir = Join-Path $CodexHome "plugins\cache\tri-orchestrator\tri-orchestrator\$pluginVersion"
 }

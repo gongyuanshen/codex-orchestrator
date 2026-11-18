@@ -471,7 +471,24 @@ def create_app(
                 "sse_subscribers": state.event_bus.subscriber_count(),
                 "software_version": __version__,
                 "schema_version": SCHEMA_VERSION,
-                "capabilities": ["durable_inbox_v1", "workflow_gates_v1", "async_inbox_wait_v1", "workflow_modes_v2", "native_actions_v1", "verification_receipts_v1", "plan_admission_v1", "compact_handoff_v1", "recipient_groups_v1", "progress_classification_v1", "workflow_reviews_v1"],
+                "capabilities": [
+                    "durable_inbox_v1",
+                    "workflow_gates_v1",
+                    "async_inbox_wait_v1",
+                    "workflow_modes_v2",
+                    "native_actions_v1",
+                    "verification_receipts_v1",
+                    "plan_admission_v1",
+                    "compact_handoff_v1",
+                    "recipient_groups_v1",
+                    "progress_classification_v1",
+                    "workflow_reviews_v1",
+                    "macro_rpc_v1",
+                    "compact_board_v1",
+                    "workflow5_direct_spawn_v1",
+                    "session_hooks_v1",
+                    "pipeline_runner_v1",
+                ],
             }
         )
 

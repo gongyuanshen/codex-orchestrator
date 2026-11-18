@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import sqlite3
 import threading
@@ -14,7 +15,16 @@ from typing import Any, Iterator
 
 from orchestrator.config import Settings, get_settings
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
+
+TASK_NAME_RE = re.compile(r"^[a-z0-9_-]{1,48}$")
+PENDING_AGENT_PATH_RE = re.compile(r"^/root/[a-z0-9_-]{1,48}$")
+APPSERVER_AGENT_ID_RE = re.compile(r"^appserver://[A-Za-z0-9_.:-]{1,120}$")
+
+
+def is_appserver_agent_id(agent_id: str | None) -> bool:
+    """Return True iff agent_id matches canonical appserver://<thread_id> identity."""
+    return isinstance(agent_id, str) and bool(APPSERVER_AGENT_ID_RE.fullmatch(agent_id))
 
 VALID_RUN_MODES = frozenset({"boost", "teamwork", "swarm"})
 VALID_RUN_STATUSES = frozenset({"active", "completed", "failed", "archived"})
@@ -112,12 +122,14 @@ def _task_packet_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def _worker_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    keys = row.keys()
     return {
         "id": row["id"],
         "run_id": row["run_id"],
         "name": row["name"],
         "role": row["role"],
         "agent_id": row["agent_id"],
+        "pending_agent_path": row["pending_agent_path"] if "pending_agent_path" in keys else None,
         "status": row["status"],
         "workspace_id": row["workspace_id"],
         "current_task": row["current_task"],
@@ -225,6 +237,8 @@ CREATE TABLE IF NOT EXISTS workers (
     run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('interviewer', 'planner', 'investigator', 'coder', 'verifier', 'swarm_worker')),
+    agent_id TEXT,
+    pending_agent_path TEXT,
     status TEXT NOT NULL DEFAULT 'waiting' CHECK (status IN ('waiting', 'working', 'stopped', 'killed')),
     workspace_id TEXT,
     current_task TEXT NOT NULL DEFAULT '',
@@ -234,6 +248,14 @@ CREATE TABLE IF NOT EXISTS workers (
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE (run_id, name)
+);
+
+CREATE TABLE IF NOT EXISTS session_run_bindings (
+    session_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    project_root TEXT NOT NULL,
+    last_stop_blocked_key TEXT,
+    updated_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS board_messages (
@@ -274,6 +296,8 @@ CREATE INDEX IF NOT EXISTS idx_board_messages_run_seq
     ON board_messages (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_board_messages_run_channel_seq
     ON board_messages (run_id, channel, seq);
+CREATE INDEX IF NOT EXISTS idx_session_run_bindings_run
+    ON session_run_bindings (run_id, updated_at DESC);
 """
 
 
@@ -406,8 +430,16 @@ class Database:
                 sql = stmt.strip()
                 if sql:
                     conn.execute(sql + ";")
-            if "agent_id" not in {r["name"] for r in conn.execute("PRAGMA table_info(workers)")}:
+            worker_cols = {r["name"] for r in conn.execute("PRAGMA table_info(workers)")}
+            if "agent_id" not in worker_cols:
                 conn.execute("ALTER TABLE workers ADD COLUMN agent_id TEXT")
+            if "pending_agent_path" not in worker_cols:
+                conn.execute("ALTER TABLE workers ADD COLUMN pending_agent_path TEXT")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_workers_pending_path "
+                "ON workers(run_id, pending_agent_path) "
+                "WHERE pending_agent_path IS NOT NULL AND pending_agent_path != ''"
+            )
             conn.execute("""CREATE TABLE IF NOT EXISTS worker_controls (
                 id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
                 worker_id TEXT NOT NULL REFERENCES workers(id), agent_id TEXT NOT NULL,
@@ -561,6 +593,7 @@ class Database:
         status: str = "active",
         metadata: dict[str, Any] | str | None = None,
         run_id: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a new orchestration run, auto-registering the project when project_root is given."""
         if mode not in VALID_RUN_MODES:
@@ -573,6 +606,8 @@ class Database:
             raise ValueError("New workflow runs must start active")
         if project_id is None and project_root is None:
             raise ValueError("Either project_id or project_root must be provided")
+        if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):
+            raise ValueError("session_id must be a non-empty string when provided")
 
         meta_json = _json_dumps(metadata, "{}")
         now = time.time()
@@ -580,26 +615,37 @@ class Database:
 
         with self.transaction() as conn:
             resolved_project_id = project_id
+            resolved_root_path: str
             if resolved_project_id is None:
                 assert project_root is not None
                 proj = self.ensure_project(
                     project_root, name=project_name, is_git=is_git
                 )
                 resolved_project_id = proj["id"]
+                resolved_root_path = proj["root_path"]
             else:
-                exists = conn.execute(
-                    "SELECT 1 FROM projects WHERE id = ?;", (resolved_project_id,)
+                proj_row = conn.execute(
+                    "SELECT root_path FROM projects WHERE id = ?;", (resolved_project_id,)
                 ).fetchone()
-                if exists is None:
+                if proj_row is None:
                     raise NotFoundError(f"Project not found: {resolved_project_id}")
+                resolved_root_path = str(proj_row["root_path"])
 
             conn.execute(
                 """
                 INSERT INTO runs (id, project_id, mode, title, status, metadata_json, created_at, updated_at, workflow_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 4);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 5);
                 """,
                 (rid, resolved_project_id, mode, title, status, meta_json, now, now),
             )
+            if session_id is not None:
+                self._upsert_session_binding_in_tx(
+                    conn,
+                    session_id=session_id.strip(),
+                    run_id=rid,
+                    project_root=resolved_root_path,
+                    now=now,
+                )
             row = conn.execute("SELECT * FROM runs WHERE id = ?;", (rid,)).fetchone()
             assert row is not None
             return _run_from_row(row)
@@ -630,10 +676,10 @@ class Database:
                 raise NotFoundError(f"Run not found: {run_id}")
 
             new_status = status if status is not None else existing["status"]
-            if existing["workflow_version"] not in {0, 1, 2, 3, 4}:
+            if existing["workflow_version"] not in {0, 1, 2, 3, 4, 5}:
                 from orchestrator.workflow import WorkflowConflictError
                 raise WorkflowConflictError("Unsupported workflow version")
-            if existing["workflow_version"] in {1, 2, 3, 4}:
+            if existing["workflow_version"] in {1, 2, 3, 4, 5}:
                 from orchestrator.workflow import WorkflowConflictError, WorkflowService
                 if existing["status"] != "active" and new_status == "active":
                     raise WorkflowConflictError("Create a new continuation run instead of reopening a terminal workflow")
@@ -712,17 +758,22 @@ class Database:
             ).fetchone()
             if run_row is None:
                 raise NotFoundError(f"Run not found: {run_id}")
-            if run_row["workflow_version"] not in {0, 1, 2, 3, 4}:
+            if run_row["workflow_version"] not in {0, 1, 2, 3, 4, 5}:
                 from orchestrator.workflow import WorkflowConflictError
                 raise WorkflowConflictError("Unsupported workflow version")
-            if run_row["workflow_version"] in {1, 2, 3, 4} and run_row["status"] != "active":
+            if run_row["workflow_version"] in {1, 2, 3, 4, 5} and run_row["status"] != "active":
                 from orchestrator.workflow import WorkflowConflictError
                 raise WorkflowConflictError("Cannot change a terminal workflow task packet")
-            if run_row["workflow_version"] in {1, 2, 3, 4} and conn.execute(
+            if run_row["workflow_version"] in {1, 2, 3, 4, 5} and conn.execute(
                     "SELECT 1 FROM workflow_steps WHERE run_id=? AND state IN ('integrating','reconciliation_required')", (run_id,)).fetchone():
                 from orchestrator.workflow import WorkflowConflictError
                 raise WorkflowConflictError("Reconcile the in-flight merge before changing its task packet")
-            if run_row["workflow_version"] == 4:
+            if run_row["workflow_version"] == 5 and conn.execute(
+                    "SELECT 1 FROM native_actions WHERE run_id=? AND action_type='spawn_agent' AND status IN ('claimed','invoking','needs_reconciliation')",
+                    (run_id,)).fetchone():
+                from orchestrator.workflow import WorkflowConflictError
+                raise WorkflowConflictError("Reconcile the in-flight spawn_agent before changing its task packet")
+            if run_row["workflow_version"] in {4, 5}:
                 from orchestrator.workflow import WorkflowService
                 service = WorkflowService(self)
                 for step in service._steps(run_id):
@@ -756,12 +807,18 @@ class Database:
             )
             if run_row["workflow_version"] == 1:
                 conn.execute("UPDATE workflow_steps SET state='planned', packet_version=?, checkpoint_json='{}', revision=revision+1, contract_revision=contract_revision+1 WHERE run_id=?", (next_version, run_id))
-            elif run_row["workflow_version"] in {2, 3, 4}:
+            elif run_row["workflow_version"] in {2, 3, 4, 5}:
                 for step in conn.execute("SELECT id,state,checkpoint_json FROM workflow_steps WHERE run_id=?", (run_id,)).fetchall():
                     checkpoint = json.loads(step["checkpoint_json"])
                     retained = {"original_bindings": checkpoint["original_bindings"]} if "original_bindings" in checkpoint else {}
-                    if run_row["workflow_version"] == 4:
-                        retained.update({key: checkpoint[key] for key in ("merge_history", "handoff_history", "handoff_ack_history", "findings", "review_dimensions", "complexity", "execution_kind", "coordinator_local_boundaries", "local_revision_boundaries", "native_observations", "owner_last_dispatch_at", "last_failure_at") if key in checkpoint})
+                    if run_row["workflow_version"] in {4, 5}:
+                        retained.update({key: checkpoint[key] for key in (
+                            "merge_history", "handoff_history", "handoff_ack_history", "findings",
+                            "review_dimensions", "complexity", "execution_kind",
+                            "coordinator_local_boundaries", "local_revision_boundaries",
+                            "native_observations", "owner_last_dispatch_at", "last_failure_at",
+                            "pending_owner_path", "pending_verifier_path", "frozen_verifier_binding",
+                        ) if key in checkpoint})
                         if step['state'] == 'rework':
                             retained['admission_revision_required'] = True
                     state = step["state"] if step["state"] in {"rework", "needs_decision"} else "planned"
@@ -1064,6 +1121,29 @@ class Database:
     # Workers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def resolve_pending_agent_path(
+        *,
+        task_name: str | None = None,
+        pending_agent_path: str | None = None,
+    ) -> str | None:
+        resolved: str | None = None
+        if task_name is not None:
+            if not isinstance(task_name, str) or not TASK_NAME_RE.fullmatch(task_name):
+                raise ValueError(
+                    f"Invalid task_name {task_name!r}; must match ^[a-z0-9_-]{{1,48}}$"
+                )
+            resolved = f"/root/{task_name}"
+        if pending_agent_path is not None:
+            if not isinstance(pending_agent_path, str) or not PENDING_AGENT_PATH_RE.fullmatch(pending_agent_path):
+                raise ValueError(
+                    f"Invalid pending_agent_path {pending_agent_path!r}; must match ^/root/[a-z0-9_-]{{1,48}}$"
+                )
+            if resolved is not None and pending_agent_path != resolved:
+                raise ValueError("task_name and pending_agent_path do not match")
+            resolved = pending_agent_path
+        return resolved
+
     def upsert_worker(
         self,
         run_id: str,
@@ -1071,6 +1151,8 @@ class Database:
         *,
         role: str,
         agent_id: str | None = None,
+        task_name: str | None = None,
+        pending_agent_path: str | None = None,
         status: str = "waiting",
         workspace_id: str | None = None,
         current_task: str = "",
@@ -1078,8 +1160,20 @@ class Database:
         heartbeat_at: float | None = None,
         worker_id: str | None = None,
     ) -> dict[str, Any]:
-        if agent_id is not None and (not isinstance(agent_id, str) or not agent_id.strip()):
-            raise ValueError("agent_id must be non-empty")
+        if agent_id is not None:
+            if not isinstance(agent_id, str) or not agent_id.strip():
+                raise ValueError("agent_id must be non-empty")
+            if agent_id.lower().startswith("appserver:") and not APPSERVER_AGENT_ID_RE.fullmatch(agent_id):
+                raise ValueError(
+                    f"Invalid appserver:// agent_id {agent_id!r}; must match ^appserver://[A-Za-z0-9_.:-]{{1,120}}$"
+                )
+        resolved_pending_path = self.resolve_pending_agent_path(
+            task_name=task_name, pending_agent_path=pending_agent_path
+        )
+        if agent_id is not None and is_appserver_agent_id(agent_id) and resolved_pending_path is not None:
+            raise ValueError("appserver:// worker cannot set task_name or pending_agent_path")
+        if agent_id is not None and resolved_pending_path is not None and agent_id != resolved_pending_path:
+            raise ValueError("agent_id does not match task_name / pending_agent_path")
         if role not in VALID_WORKER_ROLES:
             raise ValueError(
                 f"Invalid worker role {role!r}; expected one of {sorted(VALID_WORKER_ROLES)}"
@@ -1099,19 +1193,162 @@ class Database:
 
         with self.transaction() as conn:
             run_row = conn.execute(
-                "SELECT 1 FROM runs WHERE id = ?;", (run_id,)
+                "SELECT workflow_version, mode FROM runs WHERE id = ?;", (run_id,)
             ).fetchone()
             if run_row is None:
                 raise NotFoundError(f"Run not found: {run_id}")
+            if resolved_pending_path is not None and run_row["workflow_version"] != 5:
+                raise ValueError("Pre-spawn task_name/pending_agent_path requires workflow5")
+            if agent_id is not None and is_appserver_agent_id(agent_id):
+                if run_row["workflow_version"] != 5 or run_row["mode"] not in VALID_RUN_MODES:
+                    raise ValueError("appserver:// agent_id requires workflow5 in boost/teamwork/swarm mode")
+            if resolved_pending_path is not None:
+                dup = conn.execute(
+                    """
+                    SELECT name FROM workers
+                    WHERE run_id = ? AND name != ?
+                      AND (pending_agent_path = ? OR agent_id = ?)
+                    LIMIT 1;
+                    """,
+                    (run_id, name, resolved_pending_path, resolved_pending_path),
+                ).fetchone()
+                if dup is not None:
+                    raise ValueError(
+                        f"Duplicate task_name / agent path {resolved_pending_path!r} in run {run_id} (already used by {dup['name']!r})"
+                    )
+
+            linked_steps = conn.execute(
+                "SELECT id, owner, verifier, owner_agent_id, verifier_agent_id, checkpoint_json FROM workflow_steps WHERE run_id = ? AND (owner = ? OR verifier = ?);",
+                (run_id, name, name),
+            ).fetchall()
+            for s in linked_steps:
+                cp_check = _json_loads(s["checkpoint_json"], {})
+                s_exec_kind = cp_check.get("execution_kind", "native")
+                if s_exec_kind == "app_server_pipeline":
+                    if resolved_pending_path is not None:
+                        raise ValueError(
+                            f"Worker {name!r} is bound to an app_server_pipeline step and forbids /root/... task_name or pending_agent_path"
+                        )
+                    if agent_id is not None and not is_appserver_agent_id(agent_id):
+                        raise ValueError(
+                            f"Worker {name!r} is bound to an app_server_pipeline step and requires appserver://<thread_id> agent_id"
+                        )
+                else:
+                    if agent_id is not None and is_appserver_agent_id(agent_id):
+                        raise ValueError(
+                            f"Worker {name!r} is bound to a {s_exec_kind!r} step and forbids appserver:// agent_id"
+                        )
 
             existing = conn.execute(
                 "SELECT * FROM workers WHERE run_id = ? AND name = ?;",
                 (run_id, name),
             ).fetchone()
 
+            lazy_appserver_backfill = False
             if existing is not None:
-                if agent_id is not None and existing["agent_id"] is not None and agent_id != existing["agent_id"]:
-                    raise ValueError("Native agent binding is immutable; register a new worker name")
+                if existing["agent_id"] is not None:
+                    if agent_id is not None and agent_id != existing["agent_id"]:
+                        raise ValueError("Native agent binding is immutable; register a new worker name")
+                    if resolved_pending_path is not None and resolved_pending_path != existing["agent_id"]:
+                        raise ValueError("Native agent binding is immutable; register a new worker name")
+                    final_agent_id: str | None = existing["agent_id"]
+                    final_pending_path: str | None = None
+                else:
+                    unsettled = conn.execute(
+                        "SELECT 1 FROM native_actions WHERE run_id = ? AND recipient = ? AND status IN ('claimed','invoking','needs_reconciliation') LIMIT 1;",
+                        (run_id, name),
+                    ).fetchone()
+                    if unsettled is not None:
+                        if agent_id is not None or (
+                            resolved_pending_path is not None
+                            and resolved_pending_path != existing["pending_agent_path"]
+                        ):
+                            from orchestrator.native_actions import NativeActionConflictError
+                            raise NativeActionConflictError(
+                                f"Worker {name!r} has an unsettled native action requiring completion or reconciliation"
+                            )
+                    if agent_id is not None:
+                        if (
+                            existing["pending_agent_path"] is not None
+                            and agent_id != existing["pending_agent_path"]
+                        ):
+                            raise ValueError(
+                                f"agent_id {agent_id!r} does not match pre-frozen path {existing['pending_agent_path']!r}"
+                            )
+                        if is_appserver_agent_id(agent_id) and linked_steps:
+                            from orchestrator.workflow import WorkflowConflictError
+
+                            for s in linked_steps:
+                                cp_bind = _json_loads(s["checkpoint_json"], {})
+                                if s["owner"] == name:
+                                    peer_ver = conn.execute(
+                                        "SELECT agent_id FROM workers WHERE run_id = ? AND name = ?;",
+                                        (run_id, s["verifier"]),
+                                    ).fetchone()
+                                    if (s["verifier_agent_id"] and s["verifier_agent_id"] == agent_id) or (
+                                        peer_ver is not None and peer_ver["agent_id"] == agent_id
+                                    ):
+                                        raise WorkflowConflictError(
+                                            "Author and verifier must be different agents; self-verification is forbidden"
+                                        )
+                                    if s["owner_agent_id"] and s["owner_agent_id"] != agent_id:
+                                        raise WorkflowConflictError(
+                                            "Executed work must retain its original author and verifier bindings"
+                                        )
+                                    orig = cp_bind.get("original_bindings")
+                                    if isinstance(orig, dict) and orig.get("owner_agent_id") and orig["owner_agent_id"] != agent_id:
+                                        raise WorkflowConflictError(
+                                            "Executed work must retain its original author and verifier bindings"
+                                        )
+                                if s["verifier"] == name:
+                                    peer_owner = conn.execute(
+                                        "SELECT agent_id FROM workers WHERE run_id = ? AND name = ?;",
+                                        (run_id, s["owner"]),
+                                    ).fetchone()
+                                    if (s["owner_agent_id"] and s["owner_agent_id"] == agent_id) or (
+                                        peer_owner is not None and peer_owner["agent_id"] == agent_id
+                                    ):
+                                        raise WorkflowConflictError(
+                                            "Author and verifier must be different agents; self-verification is forbidden"
+                                        )
+                                    if s["verifier_agent_id"] and s["verifier_agent_id"] != agent_id:
+                                        raise WorkflowConflictError(
+                                            "Executed work must retain its original author and verifier bindings"
+                                        )
+                                    frozen_v = cp_bind.get("frozen_verifier_binding")
+                                    if isinstance(frozen_v, dict) and frozen_v.get("verifier_agent_id") and frozen_v["verifier_agent_id"] != agent_id:
+                                        raise WorkflowConflictError(
+                                            "Executed work must retain its original author and verifier bindings"
+                                        )
+                                    orig = cp_bind.get("original_bindings")
+                                    if isinstance(orig, dict) and orig.get("verifier_agent_id") and orig["verifier_agent_id"] != agent_id:
+                                        raise WorkflowConflictError(
+                                            "Executed work must retain its original author and verifier bindings"
+                                        )
+                            lazy_appserver_backfill = True
+                        final_agent_id = agent_id
+                        final_pending_path = None
+                    else:
+                        if (
+                            existing["pending_agent_path"] is not None
+                            and resolved_pending_path is not None
+                            and resolved_pending_path != existing["pending_agent_path"]
+                        ):
+                            active_step = conn.execute(
+                                "SELECT 1 FROM workflow_steps WHERE run_id = ? AND (owner = ? OR verifier = ?) AND state != 'planned' LIMIT 1;",
+                                (run_id, name, name),
+                            ).fetchone()
+                            if active_step is not None:
+                                raise ValueError(
+                                    f"Cannot change pre-frozen path for worker {name!r} on an active workflow step"
+                                )
+                        final_agent_id = None
+                        final_pending_path = (
+                            resolved_pending_path
+                            if resolved_pending_path is not None
+                            else existing["pending_agent_path"]
+                        )
+
                 self._reject_pending(conn, existing["id"])
                 if existing["status"] == "killed" and status != "killed":
                     raise ValueError(
@@ -1121,13 +1358,14 @@ class Database:
                 conn.execute(
                     """
                     UPDATE workers
-                    SET agent_id = ?, role = ?, status = ?, workspace_id = ?, current_task = ?,
+                    SET agent_id = ?, pending_agent_path = ?, role = ?, status = ?, workspace_id = ?, current_task = ?,
                         last_heartbeat_at = ?, stall_threshold_sec = ?,
                         stalled_alerted = 0, updated_at = ?
                     WHERE id = ?;
                     """,
                     (
-                        agent_id if agent_id is not None else existing["agent_id"],
+                        final_agent_id,
+                        final_pending_path,
                         role,
                         status,
                         resolved_ws,
@@ -1138,6 +1376,47 @@ class Database:
                         existing["id"],
                     ),
                 )
+                if lazy_appserver_backfill and final_agent_id is not None:
+                    for s in linked_steps:
+                        cp_upd = _json_loads(s["checkpoint_json"], {})
+                        new_owner_aid = s["owner_agent_id"]
+                        new_ver_aid = s["verifier_agent_id"]
+                        changed_step = False
+                        if s["owner"] == name and not new_owner_aid:
+                            new_owner_aid = final_agent_id
+                            cp_upd.pop("pending_owner_path", None)
+                            if isinstance(cp_upd.get("original_bindings"), dict):
+                                cp_upd["original_bindings"]["owner_agent_id"] = final_agent_id
+                            changed_step = True
+                        if s["verifier"] == name and (
+                            not new_ver_aid
+                            or cp_upd.get("frozen_verifier_binding")
+                            != {"verifier": name, "verifier_agent_id": final_agent_id}
+                        ):
+                            new_ver_aid = final_agent_id
+                            cp_upd.pop("pending_verifier_path", None)
+                            if isinstance(cp_upd.get("original_bindings"), dict):
+                                cp_upd["original_bindings"]["verifier_agent_id"] = final_agent_id
+                            cp_upd["frozen_verifier_binding"] = {
+                                "verifier": name,
+                                "verifier_agent_id": final_agent_id,
+                            }
+                            changed_step = True
+                        if changed_step:
+                            conn.execute(
+                                "UPDATE workflow_steps SET owner_agent_id = ?, verifier_agent_id = ?, checkpoint_json = ?, updated_at = ? WHERE id = ?;",
+                                (
+                                    new_owner_aid,
+                                    new_ver_aid,
+                                    json.dumps(cp_upd, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                                    now,
+                                    s["id"],
+                                ),
+                            )
+                    conn.execute(
+                        "UPDATE inbox_messages SET recipient_agent_id = ? WHERE run_id = ? AND recipient = ? AND (recipient_agent_id = '' OR recipient_agent_id IS NULL);",
+                        (final_agent_id, run_id, name),
+                    )
                 row = conn.execute(
                     "SELECT * FROM workers WHERE id = ?;", (existing["id"],)
                 ).fetchone()
@@ -1158,20 +1437,23 @@ class Database:
                     resolved_ws = ws_row["id"]
 
             wid = worker_id or _new_id("wrk")
+            final_pending = None if agent_id is not None else resolved_pending_path
             conn.execute(
                 """
                 INSERT INTO workers (
-                    id, run_id, name, role, status, workspace_id, current_task,
+                    id, run_id, name, role, agent_id, pending_agent_path, status, workspace_id, current_task,
                     last_heartbeat_at, stall_threshold_sec, stalled_alerted,
                     created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?);
                 """,
                 (
                     wid,
                     run_id,
                     name,
                     role,
+                    agent_id,
+                    final_pending,
                     status,
                     resolved_ws,
                     current_task,
@@ -1181,7 +1463,6 @@ class Database:
                     now,
                 ),
             )
-            conn.execute("UPDATE workers SET agent_id = ? WHERE id = ?", (agent_id, wid))
             row = conn.execute("SELECT * FROM workers WHERE id = ?;", (wid,)).fetchone()
             assert row is not None
             return _worker_from_row(row)
@@ -1616,3 +1897,120 @@ class Database:
                 }
                 for r in rows
             ]
+
+    # ------------------------------------------------------------------
+    # Session Run Bindings (M9 Lifecycle Hooks)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _session_binding_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "session_id": row["session_id"],
+            "run_id": row["run_id"],
+            "project_root": row["project_root"],
+            "last_stop_blocked_key": row["last_stop_blocked_key"],
+            "updated_at": row["updated_at"],
+        }
+
+    def _upsert_session_binding_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        session_id: str,
+        run_id: str,
+        project_root: str,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        ts = float(now) if now is not None else time.time()
+        norm_root = self._normalize_root(project_root)
+        conn.execute(
+            """
+            INSERT INTO session_run_bindings (session_id, run_id, project_root, last_stop_blocked_key, updated_at)
+            VALUES (?, ?, ?, NULL, ?)
+            ON CONFLICT (session_id) DO UPDATE SET
+                run_id = excluded.run_id,
+                project_root = excluded.project_root,
+                last_stop_blocked_key = CASE
+                    WHEN session_run_bindings.run_id = excluded.run_id THEN session_run_bindings.last_stop_blocked_key
+                    ELSE NULL
+                END,
+                updated_at = excluded.updated_at;
+            """,
+            (session_id, run_id, norm_root, ts),
+        )
+        row = conn.execute(
+            "SELECT * FROM session_run_bindings WHERE session_id = ?;",
+            (session_id,),
+        ).fetchone()
+        assert row is not None
+        return self._session_binding_from_row(row)
+
+    def upsert_session_binding(
+        self,
+        session_id: str,
+        run_id: str,
+        project_root: str | Path | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("run_id must be a non-empty string")
+        clean_session = session_id.strip()
+        clean_run = run_id.strip()
+        with self.transaction() as conn:
+            run_row = conn.execute(
+                "SELECT project_id FROM runs WHERE id = ?;", (clean_run,)
+            ).fetchone()
+            if run_row is None:
+                raise NotFoundError(f"Run not found: {clean_run}")
+            if project_root is not None and str(project_root).strip():
+                resolved_root = self._normalize_root(project_root)
+            else:
+                proj_row = conn.execute(
+                    "SELECT root_path FROM projects WHERE id = ?;",
+                    (run_row["project_id"],),
+                ).fetchone()
+                if proj_row is None:
+                    raise NotFoundError(f"Project not found: {run_row['project_id']}")
+                resolved_root = str(proj_row["root_path"])
+            return self._upsert_session_binding_in_tx(
+                conn,
+                session_id=clean_session,
+                run_id=clean_run,
+                project_root=resolved_root,
+            )
+
+    def get_session_binding(self, session_id: str) -> dict[str, Any] | None:
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None
+        with self.read_connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM session_run_bindings WHERE session_id = ?;",
+                (session_id.strip(),),
+            ).fetchone()
+            return self._session_binding_from_row(row) if row is not None else None
+
+    def update_session_stop_blocked_key(
+        self, session_id: str, blocked_key: str | None
+    ) -> dict[str, Any]:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        clean_session = session_id.strip()
+        now = time.time()
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM session_run_bindings WHERE session_id = ?;",
+                (clean_session,),
+            ).fetchone()
+            if existing is None:
+                raise NotFoundError(f"Session binding not found: {clean_session}")
+            conn.execute(
+                "UPDATE session_run_bindings SET last_stop_blocked_key = ?, updated_at = ? WHERE session_id = ?;",
+                (blocked_key, now, clean_session),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_run_bindings WHERE session_id = ?;",
+                (clean_session,),
+            ).fetchone()
+            assert row is not None
+            return self._session_binding_from_row(row)

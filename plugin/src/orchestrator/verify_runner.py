@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -12,6 +13,121 @@ import sys
 
 from orchestrator.artifacts import digest, recapture
 from orchestrator.verify_process import ProcessFailure, run_owned
+
+ENV_PROFILE_KEYS: dict[str, tuple[str, ...]] = {
+    'none': (),
+    'windows_minimal_py': (
+        'SYSTEMROOT',
+        'SystemRoot',
+        'COMSPEC',
+        'PATHEXT',
+        'PATH',
+        'TEMP',
+        'TMP',
+        'USERPROFILE',
+        'PYTHONUTF8',
+        'PYTHONIOENCODING',
+    ),
+    'posix_minimal_py': (
+        'PATH',
+        'HOME',
+        'TMPDIR',
+        'LANG',
+        'LC_ALL',
+        'PYTHONUTF8',
+        'PYTHONIOENCODING',
+    ),
+}
+
+_OPTIONAL_PROFILE_ENV_KEYS_UPPER = frozenset({
+    'COMSPEC',
+    'PATHEXT',
+    'TEMP',
+    'TMP',
+    'USERPROFILE',
+    'HOME',
+    'TMPDIR',
+    'LANG',
+    'LC_ALL',
+    'PYTHONUTF8',
+    'PYTHONIOENCODING',
+})
+_POSIX_OPTIONAL_PROFILE_ENV_KEYS = frozenset({
+    'HOME',
+    'TMPDIR',
+    'LANG',
+    'LC_ALL',
+    'PYTHONUTF8',
+    'PYTHONIOENCODING',
+})
+
+
+def lookup_env_value(
+    key: str,
+    environ: Mapping[str, str] | None = None,
+    *,
+    case_insensitive: bool | None = None,
+) -> tuple[bool, str | None]:
+    """Look up an environment variable (exact match first; case-insensitive on Windows)."""
+    source = os.environ if environ is None else environ
+    ignore_case = (os.name == 'nt') if case_insensitive is None else bool(case_insensitive)
+    if key in source:
+        return True, source[key]
+    if ignore_case:
+        target = key.upper()
+        for env_key, env_val in source.items():
+            if env_key.upper() == target:
+                return True, env_val
+    return False, None
+
+
+def build_isolated_env(
+    env_keys: Sequence[str],
+    environ: Mapping[str, str] | None = None,
+    *,
+    case_insensitive: bool | None = None,
+    command_id: str | None = None,
+) -> dict[str, str]:
+    """Filter `environ` strictly by `env_keys` allowlist without leaking or serializing values."""
+    source = os.environ if environ is None else environ
+    ignore_case = (os.name == 'nt') if case_insensitive is None else bool(case_insensitive)
+    folded: dict[str, str] = {}
+    if ignore_case:
+        for env_key, env_val in source.items():
+            folded.setdefault(env_key.upper(), env_val)
+
+    isolated: dict[str, str] = {}
+    seen_upper: set[str] = set()
+    missing: list[str] = []
+    for key in env_keys:
+        if key in source:
+            found, value = True, source[key]
+        elif ignore_case and key.upper() in folded:
+            found, value = True, folded[key.upper()]
+        else:
+            found, value = False, None
+
+        if found and value is not None:
+            if ignore_case:
+                upper_key = key.upper()
+                if upper_key not in seen_upper:
+                    seen_upper.add(upper_key)
+                    isolated[key] = value
+            else:
+                isolated[key] = value
+        else:
+            is_optional = (
+                key.upper() in _OPTIONAL_PROFILE_ENV_KEYS_UPPER
+                if ignore_case
+                else key in _POSIX_OPTIONAL_PROFILE_ENV_KEYS
+            )
+            if not is_optional:
+                missing.append(key)
+
+    if missing:
+        prefix = f'{command_id}: ' if command_id else ''
+        raise ValueError(f'{prefix}required environment keys missing: {missing}')
+    return isolated
 
 
 def _now():
@@ -112,10 +228,10 @@ def collect(manifest_path: Path, output_dir: Path):
     validate_manifest(manifest)
     validate_evidence_path(manifest_path, manifest['artifact'])
     validate_evidence_path(output_dir, manifest['artifact'])
-    for command in manifest['commands']:
-        missing = [key for key in command['env_keys'] if key not in os.environ]
-        if missing:
-            raise ValueError(f'{command["id"]}: required environment keys missing: {missing}')
+    command_envs = [
+        build_isolated_env(command['env_keys'], os.environ, command_id=command['id'])
+        for command in manifest['commands']
+    ]
     output_dir.mkdir()  # Existing directories are never reused.
     receipt_path = output_dir / 'receipt.json'
     receipt = dict(schema_version=1, evidence_level='local_collector_v1', manifest_digest=digest(manifest), status='running', started_at=_now(), ended_at=None, artifact_before_digest=None, artifact_after_digest=None, commands=[], error=None)
@@ -135,7 +251,7 @@ def collect(manifest_path: Path, output_dir: Path):
             command_error = None
             try:
                 with out.open('xb') as stdout, err.open('xb') as stderr:
-                    current['exit_code'] = run_owned(command['argv'], command['cwd'], {key: os.environ[key] for key in command['env_keys']}, command['timeout_sec'], stdout, stderr)
+                    current['exit_code'] = run_owned(command['argv'], command['cwd'], command_envs[index], command['timeout_sec'], stdout, stderr)
                 current['status'] = 'finished'
                 current['ended_at'] = _now()
             except BaseException as exc:

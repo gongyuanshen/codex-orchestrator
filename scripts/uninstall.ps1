@@ -143,14 +143,20 @@ function Resolve-CodexExeOptional {
     return $null
 }
 
-# 1. Stop running daemon if present
+# 1. Stop running daemon if present (never touch global %LOCALAPPDATA%\tri-orchestrator when targeting a custom -CodexHome without explicit TRI_ORCH_DATA_DIR)
+$defaultCodexHome = [System.IO.Path]::GetFullPath((Join-Path $env:USERPROFILE ".codex")).TrimEnd('\')
+$resolvedTargetHome = [System.IO.Path]::GetFullPath($CodexHome).TrimEnd('\')
+$isDefaultCodexHome = ($resolvedTargetHome -ieq $defaultCodexHome)
+
 $dataDir = if (-not [string]::IsNullOrWhiteSpace($env:TRI_ORCH_DATA_DIR)) {
     $env:TRI_ORCH_DATA_DIR
-} else {
+} elseif ($isDefaultCodexHome) {
     Join-Path $env:LOCALAPPDATA "tri-orchestrator"
+} else {
+    ""
 }
-$pidFile = Join-Path $dataDir "daemon.pid.json"
-if (Test-Path $pidFile -PathType Leaf) {
+$pidFile = if ($dataDir) { Join-Path $dataDir "daemon.pid.json" } else { "" }
+if ($pidFile -and (Test-Path $pidFile -PathType Leaf)) {
     try {
         $pidInfo = Read-Utf8Text $pidFile | ConvertFrom-Json
         if ($pidInfo.PSObject.Properties['pid'] -and $pidInfo.pid) {
@@ -250,7 +256,114 @@ if (Test-Path $agentsDstDir) {
     }
 }
 
-# 5. Optional full config.toml restoration from baseline (or latest backup)
+# 5. Optional full config.toml restoration from baseline (or latest backup), plus clean removal of tri-orchestrator [hooks.state] keys
+function Remove-TriOrchestratorHooksStateFromToml {
+    param([string]$TomlText)
+    if ([string]::IsNullOrEmpty($TomlText)) {
+        return $TomlText
+    }
+    $nl = if ($TomlText -match "`r`n") { "`r`n" } else { "`n" }
+    $rawLines = $TomlText -split "\r?\n"
+    $lines = New-Object System.Collections.Generic.List[string]
+    foreach ($l in $rawLines) {
+        $lines.Add($l)
+    }
+    if ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq "") {
+        $lines.RemoveAt($lines.Count - 1)
+    }
+
+    # Remove any standalone subtable [hooks.state."tri-orchestrator@tri-orchestrator:..."]
+    $afterSub = New-Object System.Collections.Generic.List[string]
+    $skipSub = $false
+    foreach ($ln in $lines) {
+        if ($ln -match '^\s*\[\s*hooks\.state\s*\.\s*([''"])tri-orchestrator@tri-orchestrator:[^''"]*\1\s*\]\s*(#.*)?$') {
+            $skipSub = $true
+            continue
+        }
+        if ($skipSub -and $ln -match '^\s*\[') {
+            $skipSub = $false
+        }
+        if (-not $skipSub) {
+            $afterSub.Add($ln)
+        }
+    }
+    $lines = $afterSub
+
+    # Remove "tri-orchestrator@tri-orchestrator:*" keys inside [hooks.state] and drop empty [hooks.state] header
+    $secStart = -1
+    $secEnd = $lines.Count
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*\[\s*hooks\.state\s*\]\s*(#.*)?$') {
+            $secStart = $i
+            continue
+        }
+        if ($secStart -ge 0 -and $lines[$i] -match '^\s*\[') {
+            $secEnd = $i
+            break
+        }
+    }
+
+    if ($secStart -ge 0) {
+        $keptBody = New-Object System.Collections.Generic.List[string]
+        $idx = $secStart + 1
+        while ($idx -lt $secEnd) {
+            $ln = $lines[$idx]
+            if ($ln -match '^\s*([''"])tri-orchestrator@tri-orchestrator:[^''"]*\1\s*=') {
+                $eqIdx = $ln.IndexOf('=')
+                $rhs = if ($eqIdx -ge 0) { $ln.Substring($eqIdx + 1) } else { "" }
+                $opens = ([regex]::Matches($rhs, '\{')).Count
+                $closes = ([regex]::Matches($rhs, '\}')).Count
+                $depth = $opens - $closes
+                $idx++
+                while ($depth -gt 0 -and $idx -lt $secEnd) {
+                    $cur = $lines[$idx]
+                    $depth += ([regex]::Matches($cur, '\{')).Count - ([regex]::Matches($cur, '\}')).Count
+                    $idx++
+                }
+                continue
+            }
+            $keptBody.Add($ln)
+            $idx++
+        }
+
+        $hasRemainingKeys = $false
+        foreach ($b in $keptBody) {
+            $t = $b.Trim()
+            if ($t -ne "" -and -not $t.StartsWith("#")) {
+                $hasRemainingKeys = $true
+                break
+            }
+        }
+
+        $rebuilt = New-Object System.Collections.Generic.List[string]
+        for ($i = 0; $i -lt $secStart; $i++) {
+            $rebuilt.Add($lines[$i])
+        }
+        if ($hasRemainingKeys) {
+            $rebuilt.Add($lines[$secStart])
+            foreach ($b in $keptBody) {
+                $rebuilt.Add($b)
+            }
+        } else {
+            while ($rebuilt.Count -gt 0 -and $rebuilt[$rebuilt.Count - 1].Trim() -eq "" -and ($secEnd -ge $lines.Count -or $lines[$secEnd].Trim() -eq "")) {
+                $rebuilt.RemoveAt($rebuilt.Count - 1)
+            }
+        }
+        for ($i = $secEnd; $i -lt $lines.Count; $i++) {
+            $rebuilt.Add($lines[$i])
+        }
+        $lines = $rebuilt
+    }
+
+    while ($lines.Count -gt 0 -and $lines[$lines.Count - 1].Trim() -eq "") {
+        $lines.RemoveAt($lines.Count - 1)
+    }
+    if ($lines.Count -eq 0) {
+        return ""
+    }
+    return (($lines.ToArray() -join $nl) + $nl)
+}
+
 $configPath = Join-Path $CodexHome "config.toml"
 if ($RestoreConfigBackup) {
     $restoreCfgSrc = $null
@@ -276,8 +389,17 @@ if ($RestoreConfigBackup) {
     }
 }
 
+if (Test-Path $configPath -PathType Leaf) {
+    $existingCfg = Read-Utf8Text $configPath
+    $cleanedCfg = Remove-TriOrchestratorHooksStateFromToml -TomlText $existingCfg
+    if ($cleanedCfg -cne $existingCfg) {
+        Write-Utf8NoBom -Path $configPath -Content $cleanedCfg
+        Write-Host "[uninstall] Removed tri-orchestrator entries from [hooks.state] in $configPath"
+    }
+}
+
 # 6. Optional data directory cleanup
-if ($RemoveDataDir -and (Test-Path $dataDir)) {
+if ($RemoveDataDir -and $dataDir -and (Test-Path $dataDir)) {
     Remove-Item -Path $dataDir -Recurse -Force
     Write-Host "[uninstall] Removed data directory $dataDir"
 }
