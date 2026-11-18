@@ -1,6 +1,6 @@
 # 0.6.0 GitHub 发布记录
 
-日期：2026-11-18。版本：**0.6.0**。当前状态：**发布准备中**。
+日期：2026-11-18。版本：**0.6.0**。当前状态：**已发布**。
 
 ## 本次变更
 
@@ -23,4 +23,14 @@
 
 ## 发布结果
 
-提交、主分支、标签及 Release 的远端读回结果将在发布后记录于此。
+- 仓库：[gongyuanshen/codex-orchestrator](https://github.com/gongyuanshen/codex-orchestrator)，主分支 `main`。
+- 发布源码提交：[`282454f`](https://github.com/gongyuanshen/codex-orchestrator/commit/282454f20cf043fcbdaf07c1b67e0ca016dd2658)。
+- 正式版本：[v0.6.0](https://github.com/gongyuanshen/codex-orchestrator/releases/tag/v0.6.0)；非草稿、非预发布。
+- 已读回远端主分支与标签，`v0.6.0` 指向上述源码提交；标签中的唯一插件清单版本为 `0.6.0`，市场入口指向 `./plugin`。
+- 三个附件均从 GitHub 重新下载核验，字节数与 SHA-256 同本地一致，插件 ZIP 的 43 个受追踪文件均逐字节对应 Git 源码：
+
+| 附件 | 字节数 | SHA-256 |
+|---|---:|---|
+| `SHA256SUMS` | 199 | `f9d22ed6db6ee5c25c34a4b2811d29bf67ae21e2e085802da6f10c04b1e9901f` |
+| `tri-orchestrator-0.6.0.zip` | 357247 | `eaa03afea32ca439b38c9a98c7ec4c31cfeaa40a810bebb013017fef91939964` |
+| `tri_orchestrator-0.6.0-py3-none-any.whl` | 256953 | `aa70de07b25c54eefc41419bbe38570082d32d3a6fd041e6aa978ef9985ba26e` |
