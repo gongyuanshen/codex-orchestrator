@@ -19,12 +19,6 @@ SCHEMA_VERSION = 8
 
 TASK_NAME_RE = re.compile(r"^[a-z0-9_-]{1,48}$")
 PENDING_AGENT_PATH_RE = re.compile(r"^/root/[a-z0-9_-]{1,48}$")
-APPSERVER_AGENT_ID_RE = re.compile(r"^appserver://[A-Za-z0-9_.:-]{1,120}$")
-
-
-def is_appserver_agent_id(agent_id: str | None) -> bool:
-    """Return True iff agent_id matches canonical appserver://<thread_id> identity."""
-    return isinstance(agent_id, str) and bool(APPSERVER_AGENT_ID_RE.fullmatch(agent_id))
 
 VALID_RUN_MODES = frozenset({"boost", "teamwork", "swarm"})
 VALID_RUN_STATUSES = frozenset({"active", "completed", "failed", "archived"})
@@ -1163,15 +1157,9 @@ class Database:
         if agent_id is not None:
             if not isinstance(agent_id, str) or not agent_id.strip():
                 raise ValueError("agent_id must be non-empty")
-            if agent_id.lower().startswith("appserver:") and not APPSERVER_AGENT_ID_RE.fullmatch(agent_id):
-                raise ValueError(
-                    f"Invalid appserver:// agent_id {agent_id!r}; must match ^appserver://[A-Za-z0-9_.:-]{{1,120}}$"
-                )
         resolved_pending_path = self.resolve_pending_agent_path(
             task_name=task_name, pending_agent_path=pending_agent_path
         )
-        if agent_id is not None and is_appserver_agent_id(agent_id) and resolved_pending_path is not None:
-            raise ValueError("appserver:// worker cannot set task_name or pending_agent_path")
         if agent_id is not None and resolved_pending_path is not None and agent_id != resolved_pending_path:
             raise ValueError("agent_id does not match task_name / pending_agent_path")
         if role not in VALID_WORKER_ROLES:
@@ -1199,9 +1187,6 @@ class Database:
                 raise NotFoundError(f"Run not found: {run_id}")
             if resolved_pending_path is not None and run_row["workflow_version"] != 5:
                 raise ValueError("Pre-spawn task_name/pending_agent_path requires workflow5")
-            if agent_id is not None and is_appserver_agent_id(agent_id):
-                if run_row["workflow_version"] != 5 or run_row["mode"] not in VALID_RUN_MODES:
-                    raise ValueError("appserver:// agent_id requires workflow5 in boost/teamwork/swarm mode")
             if resolved_pending_path is not None:
                 dup = conn.execute(
                     """
@@ -1217,34 +1202,11 @@ class Database:
                         f"Duplicate task_name / agent path {resolved_pending_path!r} in run {run_id} (already used by {dup['name']!r})"
                     )
 
-            linked_steps = conn.execute(
-                "SELECT id, owner, verifier, owner_agent_id, verifier_agent_id, checkpoint_json FROM workflow_steps WHERE run_id = ? AND (owner = ? OR verifier = ?);",
-                (run_id, name, name),
-            ).fetchall()
-            for s in linked_steps:
-                cp_check = _json_loads(s["checkpoint_json"], {})
-                s_exec_kind = cp_check.get("execution_kind", "native")
-                if s_exec_kind == "app_server_pipeline":
-                    if resolved_pending_path is not None:
-                        raise ValueError(
-                            f"Worker {name!r} is bound to an app_server_pipeline step and forbids /root/... task_name or pending_agent_path"
-                        )
-                    if agent_id is not None and not is_appserver_agent_id(agent_id):
-                        raise ValueError(
-                            f"Worker {name!r} is bound to an app_server_pipeline step and requires appserver://<thread_id> agent_id"
-                        )
-                else:
-                    if agent_id is not None and is_appserver_agent_id(agent_id):
-                        raise ValueError(
-                            f"Worker {name!r} is bound to a {s_exec_kind!r} step and forbids appserver:// agent_id"
-                        )
-
             existing = conn.execute(
                 "SELECT * FROM workers WHERE run_id = ? AND name = ?;",
                 (run_id, name),
             ).fetchone()
 
-            lazy_appserver_backfill = False
             if existing is not None:
                 if existing["agent_id"] is not None:
                     if agent_id is not None and agent_id != existing["agent_id"]:
@@ -1275,57 +1237,6 @@ class Database:
                             raise ValueError(
                                 f"agent_id {agent_id!r} does not match pre-frozen path {existing['pending_agent_path']!r}"
                             )
-                        if is_appserver_agent_id(agent_id) and linked_steps:
-                            from orchestrator.workflow import WorkflowConflictError
-
-                            for s in linked_steps:
-                                cp_bind = _json_loads(s["checkpoint_json"], {})
-                                if s["owner"] == name:
-                                    peer_ver = conn.execute(
-                                        "SELECT agent_id FROM workers WHERE run_id = ? AND name = ?;",
-                                        (run_id, s["verifier"]),
-                                    ).fetchone()
-                                    if (s["verifier_agent_id"] and s["verifier_agent_id"] == agent_id) or (
-                                        peer_ver is not None and peer_ver["agent_id"] == agent_id
-                                    ):
-                                        raise WorkflowConflictError(
-                                            "Author and verifier must be different agents; self-verification is forbidden"
-                                        )
-                                    if s["owner_agent_id"] and s["owner_agent_id"] != agent_id:
-                                        raise WorkflowConflictError(
-                                            "Executed work must retain its original author and verifier bindings"
-                                        )
-                                    orig = cp_bind.get("original_bindings")
-                                    if isinstance(orig, dict) and orig.get("owner_agent_id") and orig["owner_agent_id"] != agent_id:
-                                        raise WorkflowConflictError(
-                                            "Executed work must retain its original author and verifier bindings"
-                                        )
-                                if s["verifier"] == name:
-                                    peer_owner = conn.execute(
-                                        "SELECT agent_id FROM workers WHERE run_id = ? AND name = ?;",
-                                        (run_id, s["owner"]),
-                                    ).fetchone()
-                                    if (s["owner_agent_id"] and s["owner_agent_id"] == agent_id) or (
-                                        peer_owner is not None and peer_owner["agent_id"] == agent_id
-                                    ):
-                                        raise WorkflowConflictError(
-                                            "Author and verifier must be different agents; self-verification is forbidden"
-                                        )
-                                    if s["verifier_agent_id"] and s["verifier_agent_id"] != agent_id:
-                                        raise WorkflowConflictError(
-                                            "Executed work must retain its original author and verifier bindings"
-                                        )
-                                    frozen_v = cp_bind.get("frozen_verifier_binding")
-                                    if isinstance(frozen_v, dict) and frozen_v.get("verifier_agent_id") and frozen_v["verifier_agent_id"] != agent_id:
-                                        raise WorkflowConflictError(
-                                            "Executed work must retain its original author and verifier bindings"
-                                        )
-                                    orig = cp_bind.get("original_bindings")
-                                    if isinstance(orig, dict) and orig.get("verifier_agent_id") and orig["verifier_agent_id"] != agent_id:
-                                        raise WorkflowConflictError(
-                                            "Executed work must retain its original author and verifier bindings"
-                                        )
-                            lazy_appserver_backfill = True
                         final_agent_id = agent_id
                         final_pending_path = None
                     else:
@@ -1376,47 +1287,6 @@ class Database:
                         existing["id"],
                     ),
                 )
-                if lazy_appserver_backfill and final_agent_id is not None:
-                    for s in linked_steps:
-                        cp_upd = _json_loads(s["checkpoint_json"], {})
-                        new_owner_aid = s["owner_agent_id"]
-                        new_ver_aid = s["verifier_agent_id"]
-                        changed_step = False
-                        if s["owner"] == name and not new_owner_aid:
-                            new_owner_aid = final_agent_id
-                            cp_upd.pop("pending_owner_path", None)
-                            if isinstance(cp_upd.get("original_bindings"), dict):
-                                cp_upd["original_bindings"]["owner_agent_id"] = final_agent_id
-                            changed_step = True
-                        if s["verifier"] == name and (
-                            not new_ver_aid
-                            or cp_upd.get("frozen_verifier_binding")
-                            != {"verifier": name, "verifier_agent_id": final_agent_id}
-                        ):
-                            new_ver_aid = final_agent_id
-                            cp_upd.pop("pending_verifier_path", None)
-                            if isinstance(cp_upd.get("original_bindings"), dict):
-                                cp_upd["original_bindings"]["verifier_agent_id"] = final_agent_id
-                            cp_upd["frozen_verifier_binding"] = {
-                                "verifier": name,
-                                "verifier_agent_id": final_agent_id,
-                            }
-                            changed_step = True
-                        if changed_step:
-                            conn.execute(
-                                "UPDATE workflow_steps SET owner_agent_id = ?, verifier_agent_id = ?, checkpoint_json = ?, updated_at = ? WHERE id = ?;",
-                                (
-                                    new_owner_aid,
-                                    new_ver_aid,
-                                    json.dumps(cp_upd, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-                                    now,
-                                    s["id"],
-                                ),
-                            )
-                    conn.execute(
-                        "UPDATE inbox_messages SET recipient_agent_id = ? WHERE run_id = ? AND recipient = ? AND (recipient_agent_id = '' OR recipient_agent_id IS NULL);",
-                        (final_agent_id, run_id, name),
-                    )
                 row = conn.execute(
                     "SELECT * FROM workers WHERE id = ?;", (existing["id"],)
                 ).fetchone()

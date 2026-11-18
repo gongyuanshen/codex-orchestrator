@@ -198,12 +198,13 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     assert manifest["mcpServers"] == "./.mcp.json"
     assert len(manifest["interface"]["shortDescription"]) <= 30
 
-    # Verify all 4 skills mentioned in description/longDescription
+    # Verify all 3 skills mentioned in description/longDescription and pipeline removed
     desc = manifest.get("description", "")
     long_desc = manifest["interface"].get("longDescription", "")
-    for skill_name in ("$boost", "$teamwork", "$swarm", "$pipeline"):
+    for skill_name in ("$boost", "$teamwork", "$swarm"):
         assert skill_name in desc or skill_name in long_desc, f"{skill_name} must be mentioned in plugin.json description"
-    assert "pipeline" in manifest.get("keywords", []), "pipeline must be in keywords"
+    assert "$pipeline" not in desc and "$pipeline" not in long_desc
+    assert "pipeline" not in manifest.get("keywords", [])
 
     marketplace = json.loads(
         (REPO_ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8")
@@ -221,18 +222,18 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
         "Stop",
     }
 
-    # 2. All 6 CLI scripts registered in plugin/pyproject.toml and installed into repo .venv
+    # 2. All 5 CLI scripts registered in plugin/pyproject.toml and installed into repo .venv
     pyproject = tomllib.loads((PLUGIN_DIR / "pyproject.toml").read_text(encoding="utf-8"))
     scripts = pyproject["project"]["scripts"]
-    assert len(scripts) == 6
-    assert scripts["tri-orchestrator-pipeline"] == "orchestrator.pipeline_runner:main"
+    assert len(scripts) == 5
+    assert "tri-orchestrator-pipeline" not in scripts
     if os.name == "nt":
-        venv_script = REPO_ROOT / ".venv" / "Scripts" / "tri-orchestrator-pipeline.exe"
+        venv_script = REPO_ROOT / ".venv" / "Scripts" / "tri-orchestrator-challenge.exe"
     else:
-        venv_script = REPO_ROOT / ".venv" / "bin" / "tri-orchestrator-pipeline"
+        venv_script = REPO_ROOT / ".venv" / "bin" / "tri-orchestrator-challenge"
     assert venv_script.is_file(), f"Expected console script installed at {venv_script}"
 
-    # 3. Scripts reference .codex-plugin/plugin.json and upgrade.py requires 16 capabilities
+    # 3. Scripts reference .codex-plugin/plugin.json and upgrade.py omits removed pipeline capability
     for script_path in (INSTALL_PS1, INSTALL_SH, VERIFY_E2E_PS1, UPGRADE_PY):
         txt = script_path.read_text(encoding="utf-8")
         assert ".codex-plugin" in txt, f"{script_path} must reference .codex-plugin/plugin.json"
@@ -247,7 +248,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
         "name": "tri-orchestrator",
         "version": "0.6.0",
     }
-    assert "pipeline_runner_v1" in UPGRADE_PY.read_text(encoding="utf-8")
+    assert "pipeline_runner_v1" not in UPGRADE_PY.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell installer tests run on Windows")
@@ -380,7 +381,7 @@ def test_real_install_hooks_list_trust_and_uninstall_e2e(tmp_path: Path) -> None
         / "Scripts"
     )
     assert (cached_venv_scripts / "tri-orchestrator-hook.exe").is_file()
-    assert (cached_venv_scripts / "tri-orchestrator-pipeline.exe").is_file()
+    assert not (cached_venv_scripts / "tri-orchestrator-pipeline.exe").exists()
 
     hooks_after_default = _query_appserver_hooks_list(codex_exe, codex_home, probe_cwd)
     assert {h["eventName"] for h in hooks_after_default} == {

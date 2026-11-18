@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.artifacts import capture_content, capture_evidence, digest, evidence_current, recapture
-from orchestrator.db import APPSERVER_AGENT_ID_RE, Database, NotFoundError, is_appserver_agent_id
+from orchestrator.db import Database, NotFoundError
 from orchestrator.admission import ownership_scopes, overlap, contains
 
-EXECUTION_KINDS = frozenset({'native', 'coordinator_local', 'app_server_pipeline'})
+EXECUTION_KINDS = frozenset({'native', 'coordinator_local'})
 
 MAX_REWORKS = 3
 STEP_ACTIONS = frozenset({'dispatch', 'accept', 'submit', 'challenge', 'start_rework',
@@ -295,28 +295,16 @@ class WorkflowService:
         workers = {worker['name']: worker for worker in self.db.list_workers(run_id=run_id)}
         binding_issues = []
         for step in steps:
-            exec_kind = step['checkpoint'].get('execution_kind', 'native')
             for role in ('owner', 'verifier'):
                 worker = workers.get(step[role])
                 expected_aid = step[role + '_agent_id']
                 if wf_ver == 5 and expected_aid == '':
-                    if (
-                        not worker
-                        or worker['agent_id'] is not None
-                        or worker['status'] in {'stopped', 'killed'}
-                        or (exec_kind == 'app_server_pipeline' and worker.get('pending_agent_path') is not None)
-                        or (exec_kind == 'app_server_pipeline' and role == 'owner' and step['state'] != 'planned')
-                    ):
+                    if not worker or worker['agent_id'] is not None or worker['status'] in {'stopped', 'killed'}:
                         binding_issues.append({'step_id': step['id'], 'agent_id': expected_aid,
                             'role': role, 'decision_required': True})
                     continue
                 observation = step['checkpoint'].get('native_observations', {}).get(expected_aid)
-                invalid_kind_aid = (
-                    (exec_kind == 'app_server_pipeline' and not is_appserver_agent_id(expected_aid))
-                    or (exec_kind != 'app_server_pipeline' and str(expected_aid).lower().startswith('appserver:'))
-                )
                 if (not worker or worker['agent_id'] != expected_aid or worker['status'] in {'stopped', 'killed'}
-                        or invalid_kind_aid
                         or observation and observation['state'] == 'ended'):
                     binding_issues.append({'step_id': step['id'], 'agent_id': expected_aid,
                         'role': role, 'decision_required': True})
@@ -378,43 +366,6 @@ class WorkflowService:
                 f"Step is fenced by in-flight/uncertain spawn_agent ({fenced['action_id']}: {fenced['status']}); reconcile first"
             )
 
-    def _maybe_bind_lazy_appserver_worker(
-        self, step: dict, role: str, candidate_agent_id: str | None
-    ) -> dict:
-        exec_kind = step['checkpoint'].get('execution_kind', 'native')
-        if candidate_agent_id is None:
-            return step
-        if not isinstance(candidate_agent_id, str) or not candidate_agent_id.strip():
-            raise ValueError(f'{role}_agent_id must be a non-empty string when provided')
-        clean_aid = candidate_agent_id.strip()
-        if exec_kind == 'app_server_pipeline':
-            if not is_appserver_agent_id(clean_aid):
-                raise WorkflowConflictError(
-                    f'app_server_pipeline requires appserver://<thread_id> for {role}, got {clean_aid!r}'
-                )
-            worker = self.db.get_worker_by_name(step['run_id'], step[role])
-            if worker is None:
-                raise NotFoundError(f"Worker not found: {step[role]}")
-            if worker['agent_id'] is None:
-                self.db.upsert_worker(
-                    step['run_id'],
-                    step[role],
-                    role=worker['role'],
-                    agent_id=clean_aid,
-                    status=worker['status'],
-                )
-                return self.get_step(step['id'])
-            if worker['agent_id'] != clean_aid or (
-                step[role + '_agent_id'] and step[role + '_agent_id'] != clean_aid
-            ):
-                raise WorkflowConflictError('Executed work must retain its original author and verifier bindings')
-            return step
-        if is_appserver_agent_id(clean_aid) or clean_aid.lower().startswith('appserver:'):
-            raise WorkflowConflictError(f'{exec_kind} step forbids appserver:// agent_id')
-        if role == 'verifier' and step['verifier_agent_id'] and clean_aid != step['verifier_agent_id']:
-            raise WorkflowConflictError('Workflow owner/verifier binding changed; explicitly revise the step')
-        return step
-
     def _bindings(
         self,
         step: dict,
@@ -425,7 +376,6 @@ class WorkflowService:
     ) -> None:
         run = self.db.get_run(step['run_id'])
         wf_ver = run['workflow_version'] if run else 0
-        exec_kind = step['checkpoint'].get('execution_kind', 'native')
         if wf_ver != 5:
             owner = self._worker(step['run_id'], step['owner'])
             verifier = self._worker(step['run_id'], step['verifier'])
@@ -447,14 +397,6 @@ class WorkflowService:
             raise NotFoundError(f"Worker not found: {step['verifier']}")
         if owner['name'] == verifier['name']:
             raise WorkflowConflictError('Author and verifier must be different native agents')
-        if exec_kind == 'app_server_pipeline':
-            if owner.get('pending_agent_path') or verifier.get('pending_agent_path'):
-                raise WorkflowConflictError('app_server_pipeline forbids /root/... pre-spawn pending_agent_path')
-        else:
-            if (owner['agent_id'] and str(owner['agent_id']).lower().startswith('appserver:')) or (
-                verifier['agent_id'] and str(verifier['agent_id']).lower().startswith('appserver:')
-            ):
-                raise WorkflowConflictError(f'{exec_kind} step forbids appserver:// agent_id')
         with self.db.read_connection() as conn:
             fenced = conn.execute(
                 "SELECT action_id FROM native_actions WHERE run_id=? AND recipient IN (?,?) AND status='needs_reconciliation' LIMIT 1",
@@ -476,15 +418,9 @@ class WorkflowService:
                 raise WorkflowConflictError('Workflow owner pre-spawn path changed; explicitly revise the step')
         else:
             if not owner['agent_id'] or not step['owner_agent_id']:
-                if exec_kind == 'app_server_pipeline':
-                    raise WorkflowConflictError(
-                        f"Worker {step['owner']} requires an appserver://<thread_id> binding before dispatch"
-                    )
                 raise WorkflowConflictError(f"Worker {step['owner']} has no actual native agent binding")
             if owner['agent_id'] != step['owner_agent_id']:
                 raise WorkflowConflictError('Workflow owner/verifier binding changed; explicitly revise the step')
-            if exec_kind == 'app_server_pipeline' and not is_appserver_agent_id(owner['agent_id']):
-                raise WorkflowConflictError('app_server_pipeline owner must use appserver://<thread_id> binding')
 
         if allow_lazy_verifier and not step['verifier_agent_id']:
             if verifier['agent_id'] is not None:
@@ -494,8 +430,6 @@ class WorkflowService:
                 raise WorkflowConflictError(f"Worker {step['verifier']} has no actual native agent binding")
             if verifier['agent_id'] != step['verifier_agent_id']:
                 raise WorkflowConflictError('Workflow owner/verifier binding changed; explicitly revise the step')
-            if exec_kind == 'app_server_pipeline' and not is_appserver_agent_id(verifier['agent_id']):
-                raise WorkflowConflictError('app_server_pipeline verifier must use appserver://<thread_id> binding')
 
         owner_anchor = owner['agent_id'] or owner.get('pending_agent_path')
         verifier_anchor = verifier['agent_id'] or verifier.get('pending_agent_path')
@@ -590,7 +524,7 @@ class WorkflowService:
         if complexity not in {'normal', 'high'}:
             raise ValueError('Complexity must be normal or high')
         if execution_kind not in EXECUTION_KINDS:
-            raise ValueError('execution_kind must be native, coordinator_local, or app_server_pipeline')
+            raise ValueError('execution_kind must be native or coordinator_local')
         dependencies = [] if dependencies is None else dependencies
         if not isinstance(dependencies, list) or any(not isinstance(x, str) for x in dependencies) or len(set(dependencies)) != len(dependencies):
             raise ValueError('Dependencies must be unique step IDs')
@@ -598,8 +532,6 @@ class WorkflowService:
             run = self._run(run_id)
             if execution_kind == 'coordinator_local' and (run['workflow_version'] not in {4, 5} or run['mode'] != 'boost' or workspace_id is not None):
                 raise WorkflowConflictError('Coordinator-local execution requires workflow4 Boost without a workspace')
-            if execution_kind == 'app_server_pipeline' and (run['workflow_version'] != 5 or run['mode'] not in {'boost', 'teamwork', 'swarm'}):
-                raise WorkflowConflictError('app_server_pipeline execution requires workflow5 in boost/teamwork/swarm mode')
             packet = self.db.get_task_packet(run_id)
             if packet is None:
                 raise WorkflowConflictError('Freeze a task packet before creating workflow steps')
@@ -619,31 +551,11 @@ class WorkflowService:
                 gate = self.db.get_worker_by_name(run_id, verifier)
                 if gate is None:
                     raise NotFoundError(f'Worker not found: {verifier}')
-                if execution_kind == 'app_server_pipeline':
-                    if author.get('pending_agent_path') or gate.get('pending_agent_path'):
-                        raise WorkflowConflictError(
-                            'app_server_pipeline forbids /root/... pre-spawn pending_agent_path or task_name'
-                        )
-                    if author['agent_id'] is not None and not is_appserver_agent_id(author['agent_id']):
-                        raise WorkflowConflictError(
-                            f"app_server_pipeline requires appserver://<thread_id> for owner {owner!r}, got {author['agent_id']!r}"
-                        )
-                    if gate['agent_id'] is not None and not is_appserver_agent_id(gate['agent_id']):
-                        raise WorkflowConflictError(
-                            f"app_server_pipeline requires appserver://<thread_id> for verifier {verifier!r}, got {gate['agent_id']!r}"
-                        )
-                else:
-                    if (author['agent_id'] and str(author['agent_id']).lower().startswith('appserver:')) or (
-                        gate['agent_id'] and str(gate['agent_id']).lower().startswith('appserver:')
-                    ):
-                        raise WorkflowConflictError(
-                            f'{execution_kind} step forbids appserver:// agent_id'
-                        )
-                    if execution_kind == 'coordinator_local':
-                        if not author['agent_id']:
-                            raise WorkflowConflictError(f'Worker {owner} has no actual native agent binding')
-                    elif not author['agent_id'] and not author.get('pending_agent_path'):
-                        raise WorkflowConflictError(f'Worker {owner} requires an agent_id or pre-spawn task_name')
+                if execution_kind == 'coordinator_local':
+                    if not author['agent_id']:
+                        raise WorkflowConflictError(f'Worker {owner} has no actual native agent binding')
+                elif not author['agent_id'] and not author.get('pending_agent_path'):
+                    raise WorkflowConflictError(f'Worker {owner} requires an agent_id or pre-spawn task_name')
                 author_anchor = author['agent_id'] or author.get('pending_agent_path')
                 gate_anchor = gate['agent_id'] or gate.get('pending_agent_path')
                 if author_anchor and gate_anchor and author_anchor == gate_anchor:
@@ -653,13 +565,6 @@ class WorkflowService:
                 for peer in self._steps(run_id):
                     if old and peer['id'] == old['id']:
                         continue
-                    peer_exec = peer['checkpoint'].get('execution_kind', 'native')
-                    if (execution_kind == 'app_server_pipeline') != (peer_exec == 'app_server_pipeline'):
-                        shared_workers = {owner, verifier} & {peer['owner'], peer['verifier']}
-                        if shared_workers:
-                            raise WorkflowConflictError(
-                                f"Cannot mix worker(s) {sorted(shared_workers)} across {peer_exec!r} and {execution_kind!r} steps in the same run"
-                            )
                     frozen_v = peer['checkpoint'].get('frozen_verifier_binding')
                     if frozen_v and frozen_v.get('verifier') == verifier and gate_aid != frozen_v.get('verifier_agent_id'):
                         raise WorkflowConflictError('Executed work must retain its original author and verifier bindings')
@@ -720,7 +625,7 @@ class WorkflowService:
             now = time.time()
             # Revise explicitly, retaining retry budget and old immutable verification records.
             if handoff_required is None:
-                handoff_required = bool(run['mode'] == 'teamwork' and kind == 'milestone' and execution_kind != 'app_server_pipeline')
+                handoff_required = bool(run['mode'] == 'teamwork' and kind == 'milestone')
             values = (kind, owner, verifier, author_aid, gate_aid, workspace_id,
                       packet['version'], _json(dependencies), _json(criteria), int(handoff_required), now)
             if old:
@@ -801,11 +706,6 @@ class WorkflowService:
                 raise WorkflowConflictError('Workflow revision conflict')
             if action != 'local_revision_boundary':
                 self._packet(step)
-            if run['workflow_version'] == 5 and step['checkpoint'].get('execution_kind', 'native') == 'app_server_pipeline':
-                if action == 'dispatch' and agent_id is not None and not step['owner_agent_id']:
-                    step = self._maybe_bind_lazy_appserver_worker(step, 'owner', agent_id)
-                elif action == 'challenge' and agent_id is not None and not step['verifier_agent_id']:
-                    step = self._maybe_bind_lazy_appserver_worker(step, 'verifier', agent_id)
             allow_pre_spawn = action == 'dispatch' and step['checkpoint'].get('execution_kind', 'native') == 'native'
             allow_lazy_ver = action in {'dispatch', 'accept', 'submit', 'local_revision_boundary', 'observe'}
             self._bindings(
@@ -978,8 +878,7 @@ class WorkflowService:
             raise WorkflowConflictError(f'Action {action} is not permitted from {state}')
 
     def capture(self, step_id: str, scope: str = 'candidate', paths: list[str] | None = None,
-                verification_commands: list[dict] | None = None, env_profile: str = 'none',
-                verifier_agent_id: str | None = None) -> dict:
+                verification_commands: list[dict] | None = None, env_profile: str = 'none') -> dict:
         if scope not in {'candidate', 'integrated'}:
             raise ValueError('Artifact scope must be candidate or integrated')
         if env_profile not in ENV_PROFILES:
@@ -1006,8 +905,6 @@ class WorkflowService:
             step = self.get_step(step_id)
             run = self._run(step['run_id'])
             self._packet(step)
-            if verifier_agent_id is not None:
-                step = self._maybe_bind_lazy_appserver_worker(step, 'verifier', verifier_agent_id)
             self._bindings(step)
             project = self.db.get_project(run['project_id'])
             root, mode, baseline = Path(project['root_path']), 'snapshot', {}
@@ -1134,11 +1031,6 @@ class WorkflowService:
             if agent_id in {step['owner_agent_id'], step['verifier_agent_id']} or not any(
                     w['agent_id'] == agent_id for w in self.db.list_workers(run_id=step['run_id'])):
                 raise WorkflowConflictError('Challenger must be a registered independent native agent')
-            exec_kind = step['checkpoint'].get('execution_kind', 'native')
-            if exec_kind == 'app_server_pipeline' and not is_appserver_agent_id(agent_id):
-                raise WorkflowConflictError('app_server_pipeline challenger must use an appserver://<thread_id> agent_id')
-            if exec_kind != 'app_server_pipeline' and str(agent_id).lower().startswith('appserver:'):
-                raise WorkflowConflictError(f'{exec_kind} challenger forbids appserver:// agent_id')
             if step['state'] not in {'candidate_review', 'integrated_review', 'done', 'handoff', 'ready_to_merge'}:
                 raise WorkflowConflictError('Challenger finding requires a delivered candidate or integrated artifact')
             finding = {'id': _id('finding'), 'criterion': criterion, 'evidence': evidence,
@@ -1155,7 +1047,7 @@ class WorkflowService:
     def record(self, step_id: str, artifact_id: str, verifier: str, verdict: str,
                 criteria_results: list[dict], evidence_files: list[str], key: str, receipt_files: list[str] | None = None,
                 review_dimensions: dict | None = None, resolved_finding_ids: list[str] | None = None,
-                dismissed_finding_ids: list[str] | None = None, verifier_agent_id: str | None = None) -> dict:
+                dismissed_finding_ids: list[str] | None = None) -> dict:
         if verdict not in {'PASS', 'FAIL'} or not isinstance(key, str) or not key.strip():
             raise ValueError('Verification requires PASS/FAIL and a nonempty stable key')
         request = {'artifact_id': artifact_id, 'verifier': verifier, 'verdict': verdict,
@@ -1178,8 +1070,6 @@ class WorkflowService:
             step = self.get_step(step_id)
             run = self._run(step['run_id'])
             self._packet(step)
-            if verifier_agent_id is not None:
-                step = self._maybe_bind_lazy_appserver_worker(step, 'verifier', verifier_agent_id)
             self._bindings(step)
             if verifier != step['verifier']:
                 raise WorkflowConflictError('Only the bound independent verifier can record this gate')

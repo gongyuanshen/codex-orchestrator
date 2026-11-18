@@ -9,7 +9,7 @@ Design & Safety Red-Lines (M9 / Section 3.4.2):
    (`additionalProperties: false`):
    - `SessionStart`: `startup` injects concise local `session_id` (`<= 220 chars`) or bound `resume_context`; `compact`/`resume` injects `hookSpecificOutput` (`hookEventName="SessionStart"`, `additionalContext <= 800 chars`)
    - `PostCompact`: `{"systemMessage": "<resume_context <= 800 chars>"}`
-   - `UserPromptSubmit`: `hookSpecificOutput` (`hookEventName="UserPromptSubmit"`, `additionalContext <= 800 chars`) ONLY on explicit `$boost`/`/boost`/`$teamwork`/`/teamwork`/`$swarm`/`/swarm`/`$pipeline`/`/pipeline` root prompts (including cold-boot before `18790` starts)
+   - `UserPromptSubmit`: `hookSpecificOutput` (`hookEventName="UserPromptSubmit"`, `additionalContext <= 800 chars`) ONLY on explicit `$boost`/`/boost`/`$teamwork`/`/teamwork`/`$swarm`/`/swarm` root prompts (including cold-boot before `18790` starts)
    - `Stop`: `{"decision": "block", "reason": "..."}` ONLY when all 3 hard safety guardrails pass.
 """
 
@@ -77,7 +77,7 @@ _RPC_STOP_HARD_VETO_STATUSES = frozenset({
 MAX_STARTUP_SESSION_CONTEXT_CHARS = 220
 
 _MODE_PROMPT_RE = re.compile(
-    r"(?:^|[\s(\[{\"'「『【:：]|[^\x00-\x7F])([$/](?:boost|teamwork|swarm|pipeline))(?=$|[^A-Za-z0-9_-])",
+    r"(?:^|[\s(\[{\"'「『【:：]|[^\x00-\x7F])([$/](?:boost|teamwork|swarm))(?=$|[^A-Za-z0-9_-])",
     re.IGNORECASE,
 )
 
@@ -127,7 +127,7 @@ def clamp_timeout(timeout_sec: float | None = None, env: Mapping[str, str] | Non
 
 
 def detect_explicit_mode_invocation(prompt: str) -> str | None:
-    """Return normalized mode name ('boost' | 'teamwork' | 'swarm' | 'pipeline') if explicitly invoked in prompt."""
+    """Return normalized mode name ('boost' | 'teamwork' | 'swarm') if explicitly invoked in prompt."""
     if not isinstance(prompt, str) or not prompt.strip():
         return None
     match = _MODE_PROMPT_RE.search(prompt)

@@ -69,7 +69,7 @@ def test_all_skills_yaml_frontmatter_never_truncates_on_hash_comments():
 
 def test_all_roles_and_modes_load_all_supported_strict_contracts():
     skill_paths = sorted((ROOT / "skills").glob("*/SKILL.md"))
-    assert {path.parent.name for path in skill_paths} == {"boost", "teamwork", "swarm", "pipeline"}
+    assert {path.parent.name for path in skill_paths} == {"boost", "teamwork", "swarm"}
     for path in list((ROOT / "agents").glob("*.toml")) + skill_paths:
         text = path.read_text(encoding="utf-8")
         assert "workflow_version=1/2/3/4/5" in text, path
@@ -87,32 +87,17 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
     assert "workflow1" in shared and "workflow2" in shared
 
 
-def test_pipeline_skill_and_interactive_modes_agree_on_execution_kind_boundary():
-    pipeline = (ROOT / "skills/pipeline/SKILL.md").read_text(encoding="utf-8")
-    assert 'execution_kind="app_server_pipeline"' in pipeline
-    assert "appserver://<thread_id>" in pipeline
-    assert "tri-orchestrator-pipeline" in pipeline
-    for interactive_mode in ("$boost", "$teamwork", "$swarm"):
-        assert interactive_mode in pipeline
-
-    shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
-    assert 'execution_kind="app_server_pipeline"' in shared
-    assert "appserver://<thread_id>" in shared
-    assert "$pipeline" in shared
-
+def test_interactive_modes_and_agents_enforce_native_and_local_execution_kinds():
     for native_mode in ("boost", "teamwork", "swarm"):
         native_text = (ROOT / "skills" / native_mode / "SKILL.md").read_text(encoding="utf-8")
         assert 'execution_kind="native"' in native_text
-        assert 'execution_kind="app_server_pipeline"' in native_text
-        assert "appserver://<thread_id>" in native_text
-        assert "$pipeline" in native_text
-        assert "reserved exclusively for `$pipeline`" in native_text
+        assert "app_server_pipeline" not in native_text
+        assert "$pipeline" not in native_text
 
     for toml_path in sorted((ROOT / "agents").glob("*.toml")):
         instructions = tomllib.loads(toml_path.read_text(encoding="utf-8"))["developer_instructions"]
-        assert 'execution_kind="app_server_pipeline"' in instructions, toml_path
-        assert "appserver://<thread_id>" in instructions, toml_path
-        assert "used exclusively by `$pipeline`" in instructions, toml_path
+        assert "app_server_pipeline" not in instructions, toml_path
+        assert "$pipeline" not in instructions, toml_path
 
 
 def test_mode_specific_stage_and_bounded_native_wakeup_contracts():

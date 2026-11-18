@@ -347,7 +347,7 @@ class TestMacrosAndCliDiscoveryEndToEnd:
     def test_cli_discovery_and_full_boost_macro_lifecycle_with_rework_and_closeout(self, env, tmp_path: Path):
         project, _, db, board, _, dispatcher = env
         cli_map = _discover_cli_executables()
-        assert set(cli_map.keys()) == {"verify", "challenge", "pipeline"}
+        assert set(cli_map.keys()) == {"verify", "challenge"}
 
         run = dispatcher.dispatch(
             "run_create",
@@ -937,39 +937,11 @@ class TestMacrosAndCliDiscoveryEndToEnd:
         )
         assert stop_after["should_block_stop"] is False
 
-    def test_teamwork_milestone_pipeline_and_explicit_false_do_not_deadlock(self, env):
+    def test_teamwork_milestone_explicit_false_does_not_deadlock(self, env):
         project, _, db, board, _, dispatcher = env
-        run = dispatcher.dispatch(
-            "run_create",
-            {"mode": "teamwork", "title": "Teamwork Milestone Modes", "project_root": str(project)},
-        )
-        run_id = run["id"]
-        dispatcher.dispatch(
-            "task_packet_save",
-            {
-                "run_id": run_id,
-                "title": "Teamwork Milestones",
-                "goal": "Check handoff_required defaults",
-                "file_ownership": {"pipe_a": ["main.py"], "nat_a": ["lib.py"]},
-                "acceptance_criteria": ["AC-1", "AC-2"],
-            },
-        )
-        board.worker_register(run_id, "pipe_a", "coder", agent_id="appserver://thr_pipe_a")
-        board.worker_register(run_id, "pipe_v", "verifier", agent_id="appserver://thr_pipe_v")
-
         flow = WorkflowService(db)
-        pipe_step = flow.step_save(
-            run_id,
-            "m-pipe",
-            "pipe_a",
-            "pipe_v",
-            kind="milestone",
-            criteria=["AC-1"],
-            execution_kind="app_server_pipeline",
-        )
-        assert bool(pipe_step["handoff_required"]) is False
 
-        # Separate teamwork run for native explicit False vs default True
+        # Teamwork run for native explicit False vs default True
         run2 = dispatcher.dispatch(
             "run_create",
             {"mode": "teamwork", "title": "Teamwork Native Milestone", "project_root": str(project)},
