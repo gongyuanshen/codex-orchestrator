@@ -194,6 +194,8 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
         _git(root, "init")
         _git(root, "add", "artifacts")
         _git(root, "-c", "user.email=test@example.test", "-c", "user.name=Test", "commit", "-m", "seed")
+    (root / ".env").write_text("SOURCE=parent\n", encoding="utf-8")
+    (execution / ".env").write_text("SOURCE=slice\n", encoding="utf-8")
     _codex_project(monkeypatch, root)
     run = _run(rpc, execution, "workspace")
     run_id = run["id"]
@@ -211,20 +213,22 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
     assert db.list_workspaces(run_id=run_id) == []
 
     direct = rpc("workspace_create", run_id=run_id, worker_name="direct", dep_mode="none", copy_env=False)
+    assert not list(Path(direct["path"]).rglob(".env"))
     rpc(
         "task_packet_save", run_id=run_id, title="Fixture", goal="Verify dispatch location",
         file_ownership={"dispatched": ["app.py"]}, acceptance_criteria=["location"],
     )
     prep = rpc(
         "workflow_prepare_dispatch", run_id=run_id, create_workspace=True, dep_mode="none",
-        copy_env=False, owner="dispatched", task_name="dispatched", verifier="verifier",
+        copy_env=True, owner="dispatched", task_name="dispatched", verifier="verifier",
         step_key="dispatch", instruction="Test location",
     )
     workspace = prep["workspace"]
     assert Path(direct["path"]).parent == Path(workspace["path"]).parent == execution / WORKSPACES_DIRNAME
     assert workspace["mode"] == ("git_clone" if git else "snapshot")
-    relative = (execution.relative_to(root) if git else Path()) / "app.py"
+    relative = execution.relative_to(root) / "app.py"
     assert (Path(workspace["path"]) / relative).read_text(encoding="utf-8") == "VALUE = 1\n"
+    assert (Path(workspace["path"]) / ".env").read_text(encoding="utf-8") == "SOURCE=slice\n"
 
     outside = root.parent / "elsewhere" / WORKSPACES_DIRNAME / "unrelated"
     outside.mkdir(parents=True)
@@ -236,10 +240,13 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
     # records the authorized base rather than trusting any path named .swarm-workspaces.
     explicit_source = root.parent / "separate-source"
     explicit_source.mkdir()
+    (explicit_source / "only.txt").write_text("override", encoding="utf-8")
     explicit = rpc(
         "workspace_create", run_id=run_id, worker_name="explicit", project_root=str(explicit_source),
         dep_mode="none", copy_env=False,
     )
+    assert explicit["snapshot_manifest"]["project_root"] == str(explicit_source)
+    assert (Path(explicit["path"]) / "only.txt").read_text(encoding="utf-8") == "override"
     opens = []
     monkeypatch.setattr("orchestrator.daemon._launch_explorer", opens.append)
     app = create_app(db.settings, db=db, start_watchdog=False, manage_pid_file=False)
@@ -260,7 +267,9 @@ def test_t3_nested_snapshot_uses_canonical_paths_through_workflow5_closeout(env,
     edited = execution / "app.py"
     root_file = root / "app.py"
     sibling = execution.parent / "sibling.py"
-    for path, text in [(edited, "old"), (root_file, "root"), (sibling, "sibling")]:
+    execution_env = execution / ".env"
+    unchanged = {root_file: "root", sibling: "sibling", execution_env: "SCOPE=slice"}
+    for path, text in {edited: "old", **unchanged}.items():
         path.write_text(text, encoding="utf-8")
 
     run = _run(rpc, execution, "merge-nested")
@@ -336,8 +345,7 @@ def test_t3_nested_snapshot_uses_canonical_paths_through_workflow5_closeout(env,
     assert merged["files_changed"] == [relative]
     assert candidate == workspace / relative
     assert edited.read_text(encoding="utf-8") == "new"
-    assert root_file.read_text(encoding="utf-8") == "root"
-    assert sibling.read_text(encoding="utf-8") == "sibling"
+    assert {path: path.read_text(encoding="utf-8") for path in unchanged} == unchanged
     verify("integrated", root, edited)
     assert rpc("workflow_closeout_run", run_id=run_id)["run"]["status"] == "completed"
     assert db.get_workspace(author["workspace"]["id"])["status"] == "cleaned" and not workspace.exists()
