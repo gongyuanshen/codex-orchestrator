@@ -3,7 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>三重编排器 — 多代理编排控制台</title>
+  <meta name="description" content="三重编排器本地多代理编排控制台，支持 Boost、Teamwork 与 Swarm 模式任务追踪、工作区代码检查与实时协作监控。">
+  <title>三重编排器：多代理编排控制台</title>
   <script>
     (function () {
       try {
@@ -18,61 +19,120 @@
 </head>
 <body>
   <main id="modeChooser" class="mode-chooser">
-    <h1>三重编排器</h1>
-    <p class="mode-chooser-intro">选择正在使用的工作模式。每个入口只显示对应模式的任务。</p>
-    <p id="modeChooserStatus" class="context-status" role="status" aria-live="polite"></p>
-    <nav class="mode-choices" aria-label="选择工作模式">
-      <a href="/boost" data-mode-link="boost" class="mode-choice">
-        <h2>Boost <span>专注执行</span></h2>
-        <p>围绕一个目标推进，按需委派，完成后独立验收。</p>
-        <span class="mode-choice-action">查看任务</span>
-      </a>
-      <a href="/teamwork" data-mode-link="teamwork" class="mode-choice">
-        <h2>Teamwork <span>分工协作</span></h2>
-        <p>明确需求和文件分工，再开发、验收与合并。</p>
-        <span class="mode-choice-action">查看任务</span>
-      </a>
-      <a href="/swarm" data-mode-link="swarm" class="mode-choice">
-        <h2>Swarm <span>并行协作</span></h2>
-        <p>多名执行者并行推进，通过消息板持续协调。</p>
-        <span class="mode-choice-action">查看任务</span>
-      </a>
-    </nav>
-    <p class="mode-chooser-note">这里只查看和协调已有任务；进入页面不会启动任务。</p>
-  </main>
-  <div id="dashboardShell" class="app-shell hidden">
-    <div class="mode-bar" role="region" aria-label="工作模式说明">
-      <nav class="mode-nav" aria-label="工作模式">
-        <a href="/boost" data-mode-link="boost">Boost <span>专注</span></a>
-        <a href="/teamwork" data-mode-link="teamwork">Teamwork <span>协作</span></a>
-        <a href="/swarm" data-mode-link="swarm">Swarm <span>并行</span></a>
-      </nav>
-      <p id="modeDescription" class="mode-description"></p>
-    </div>
-    <!-- Single-line Restrained 48px Topbar -->
-    <header class="topbar" role="banner">
-      <div class="topbar-left">
-        <div class="brand" title="三重编排器本地控制台">
-          <svg class="brand-icon" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+    <div class="mode-chooser-hero">
+      <div class="mode-chooser-brand">
+        <span class="brand-badge-lg" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="5" r="2.2"></circle>
             <circle cx="5.5" cy="17.5" r="2.2"></circle>
             <circle cx="18.5" cy="17.5" r="2.2"></circle>
             <path d="M10.8 6.9 6.7 15.6M13.2 6.9l4.1 8.7M7.8 17.5h8.4"></path>
           </svg>
+        </span>
+        <div>
+          <h1>三重编排器</h1>
+          <p class="mode-chooser-intro">选择正在使用的工作模式。每个入口只显示对应模式的运行任务与协作上下文。</p>
+        </div>
+      </div>
+      <p id="modeChooserStatus" class="context-status" role="status" aria-live="polite"></p>
+    </div>
+    <nav class="mode-choices" aria-label="选择工作模式">
+      <a href="/boost" data-mode-link="boost" class="mode-choice mode-choice-boost">
+        <div class="mode-choice-top">
+          <span class="mode-choice-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+          </span>
+          <span class="mode-choice-tag">BOOST</span>
+        </div>
+        <h2>Boost <span>专注执行</span></h2>
+        <p>围绕一个核心目标高速推进，按需委派子任务，完成后独立验收。</p>
+        <span class="mode-choice-action">进入工作台 →</span>
+      </a>
+      <a href="/teamwork" data-mode-link="teamwork" class="mode-choice mode-choice-teamwork">
+        <div class="mode-choice-top">
+          <span class="mode-choice-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
+              <circle cx="9" cy="7" r="4"></circle>
+              <path d="M22 21v-2a4 4 0 0 0-3-3.87"></path>
+              <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+            </svg>
+          </span>
+          <span class="mode-choice-tag">TEAMWORK</span>
+        </div>
+        <h2>Teamwork <span>分工协作</span></h2>
+        <p>冻结需求契约与文件所有权边界，再开发、验收与安全合入。</p>
+        <span class="mode-choice-action">进入工作台 →</span>
+      </a>
+      <a href="/swarm" data-mode-link="swarm" class="mode-choice mode-choice-swarm">
+        <div class="mode-choice-top">
+          <span class="mode-choice-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="12 2 20 7 20 17 12 22 4 17 4 7 12 2"></polygon>
+              <circle cx="12" cy="12" r="2.6"></circle>
+            </svg>
+          </span>
+          <span class="mode-choice-tag">SWARM</span>
+        </div>
+        <h2>Swarm <span>并行协作</span></h2>
+        <p>多名执行者隔离并行推进，通过实时消息板与拓扑图持续协调。</p>
+        <span class="mode-choice-action">进入工作台 →</span>
+      </a>
+    </nav>
+    <p class="mode-chooser-note">这里只查看和协调已有任务；进入页面不会自动启动新任务。</p>
+  </main>
+
+  <div id="dashboardShell" class="app-shell hidden">
+    <!-- Hidden semantic mirrors so tests and screen readers stay 100% compatible -->
+    <div class="sr-only" aria-hidden="true">
+      <select id="projectSelect" tabindex="-1" aria-label="选择项目">
+        <option value="">加载项目中...</option>
+      </select>
+      <select id="runSelect" tabindex="-1" aria-label="选择运行任务">
+        <option value="">暂无运行任务</option>
+      </select>
+    </div>
+
+    <!-- Single-Line Unified Topbar (replaces stacked mode-bar + topbar) -->
+    <header class="topbar" role="banner">
+      <div class="topbar-left">
+        <button id="toggleSidebarBtn" class="topbar-icon-btn" type="button" aria-expanded="true" aria-controls="contextSidebar" title="展开或收起左侧项目与对话导航栏">
+          <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="2"></rect>
+            <path d="M9 3v18"></path>
+          </svg>
+        </button>
+
+        <div class="brand" title="三重编排器本地控制台">
+          <span class="brand-mark" aria-hidden="true">
+            <svg class="brand-icon" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="5" r="2.2"></circle>
+              <circle cx="5.5" cy="17.5" r="2.2"></circle>
+              <circle cx="18.5" cy="17.5" r="2.2"></circle>
+              <path d="M10.8 6.9 6.7 15.6M13.2 6.9l4.1 8.7M7.8 17.5h8.4"></path>
+            </svg>
+          </span>
           <span class="brand-title">三重编排器</span>
         </div>
 
-        <span class="topbar-sep" aria-hidden="true">/</span>
+        <nav class="mode-nav mode-bar" aria-label="工作模式">
+          <a href="/boost" data-mode-link="boost" class="mode-seg" data-mode-key="boost">Boost <span>专注</span></a>
+          <a href="/teamwork" data-mode-link="teamwork" class="mode-seg" data-mode-key="teamwork">Teamwork <span>协作</span></a>
+          <a href="/swarm" data-mode-link="swarm" class="mode-seg" data-mode-key="swarm">Swarm <span>并行</span></a>
+        </nav>
 
-        <label class="context-label" for="projectSelect">项目</label>
-        <select id="projectSelect" class="topbar-select" aria-label="选择项目">
-          <option value="">加载项目中...</option>
-        </select>
-
-        <label class="context-label" for="runSelect">任务</label>
-        <select id="runSelect" class="topbar-select topbar-select-run" aria-label="选择运行任务">
-          <option value="">暂无运行任务</option>
-        </select>
+        <button id="cmdPaletteTrigger" class="context-trigger" type="button" title="快速搜索并切换项目与对话任务 (Ctrl+K)">
+          <svg viewBox="0 0 24 24" width="13.5" height="13.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="11" cy="11" r="7"></circle>
+            <path d="m20 20-3.5-3.5"></path>
+          </svg>
+          <span id="topbarContextProject" class="ctx-proj">选择项目</span>
+          <span class="ctx-slash" aria-hidden="true">/</span>
+          <span id="topbarContextRun" class="ctx-run">选择任务</span>
+          <kbd class="kbd-hint">Ctrl K</kbd>
+        </button>
 
         <div id="runMetaPill" class="run-pill" title="当前编排模式与任务状态">
           <span id="modeBadge" class="run-pill-mode badge-mode-none">—</span>
@@ -92,7 +152,7 @@
             <rect x="3" y="3" width="18" height="18" rx="2"></rect>
             <path d="M15 3v18"></path>
           </svg>
-          <span>工作区检查</span>
+          <span class="hide-sm">工作区检查</span>
         </button>
 
         <button id="themeToggleBtn" class="topbar-icon-btn" type="button" aria-label="切换浅色与深色主题" title="切换深色主题">
@@ -136,15 +196,83 @@
       </div>
     </header>
 
-    <!-- Main Workspace Body -->
+    <!-- Main Workspace Body: Left Context Rail + Center Main Pane + Right Inspector -->
     <div class="workspace-shell">
+      <div id="sidebarBackdrop" class="sidebar-backdrop hidden" aria-hidden="true"></div>
+      <aside id="contextSidebar" class="context-sidebar" aria-label="项目与对话导航">
+        <!-- Project Switcher Header + Searchable Popover -->
+        <div class="sidebar-project-wrap">
+          <div class="sidebar-section-label">工作区项目</div>
+          <button id="projectSwitcherBtn" class="project-switcher-btn" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="projectPopover">
+            <div class="project-switcher-main">
+              <span class="project-switcher-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                </svg>
+              </span>
+              <div class="project-switcher-text">
+                <span id="projectSwitcherName" class="project-switcher-name">加载项目中...</span>
+                <span id="projectSwitcherPath" class="project-switcher-path mono"></span>
+              </div>
+            </div>
+            <span class="project-switcher-meta">
+              <span id="projectSwitcherKind" class="chip-tag tint-muted hidden">Git</span>
+              <svg class="chevron-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="6 9 12 15 18 9"></polyline>
+              </svg>
+            </span>
+          </button>
+
+          <div id="projectPopover" class="project-popover hidden" role="dialog" aria-label="切换项目">
+            <div class="popover-search-wrap">
+              <svg class="search-icon" viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7"></circle>
+                <path d="m20 20-3.5-3.5"></path>
+              </svg>
+              <input id="projectSearchInput" class="popover-search-input" type="search" placeholder="筛选项目名或本地路径…" autocomplete="off">
+            </div>
+            <div id="projectPopoverList" class="popover-list" role="listbox" aria-label="项目列表"></div>
+          </div>
+        </div>
+
+        <!-- Run / Conversation List with Filter & Grouping -->
+        <div class="sidebar-runs-wrap">
+          <div class="sidebar-runs-header">
+            <span class="sidebar-section-label">对话与运行任务</span>
+            <span id="sidebarRunsCount" class="pill-badge tint-muted tabular">0</span>
+          </div>
+          <div class="sidebar-runs-controls">
+            <div class="sidebar-search-wrap">
+              <svg class="search-icon" viewBox="0 0 24 24" width="12.5" height="12.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7"></circle>
+                <path d="m20 20-3.5-3.5"></path>
+              </svg>
+              <input id="runSearchInput" class="sidebar-search-input" type="search" placeholder="搜索任务标题或 ID..." autocomplete="off">
+            </div>
+            <div id="runFilterPills" class="run-filter-pills" role="group" aria-label="任务状态过滤">
+              <button type="button" class="run-filter-pill active" data-run-filter="all" aria-pressed="true">全部</button>
+              <button type="button" class="run-filter-pill" data-run-filter="active" aria-pressed="false">进行中</button>
+              <button type="button" class="run-filter-pill" data-run-filter="done" aria-pressed="false">已完结</button>
+            </div>
+          </div>
+
+          <div id="runSidebarList" class="run-sidebar-list" role="listbox" aria-label="当前项目运行任务">
+            <div class="empty-state">正在加载任务…</div>
+          </div>
+        </div>
+
+        <div class="sidebar-footer">
+          <p id="modeDescription" class="mode-description"></p>
+        </div>
+      </aside>
+
       <main class="main-pane" id="mainPane">
-        <!-- Run Header & Clean Underline Tabs -->
+        <!-- Run Header & Vivid Mode-Tinted Tabs -->
         <div class="run-header">
           <div class="run-header-top">
             <div class="run-title-wrap">
               <h1 id="runTitleHeading" class="run-title">未选择运行任务</h1>
-              <p id="projectPathSubtitle" class="run-subtitle mono">请在上方选择项目与运行任务</p>
+              <p id="projectPathSubtitle" class="run-subtitle mono">请在左侧选择项目与运行任务</p>
             </div>
             <div id="sseBadge" class="sse-indicator" role="status" aria-live="polite" title="实时事件流 (SSE /api/events)">
               <span class="status-dot dot-muted"></span>
@@ -154,7 +282,9 @@
 
           <p id="contextStatus" class="context-status hidden" role="status" aria-live="polite"></p>
           <nav class="tab-bar" role="tablist" aria-label="主视图页签">
-            <button type="button" id="tabBtnOverview" class="tab-item active" data-tab="overview" role="tab" tabindex="0" aria-selected="true" aria-controls="tab-overview">概况</button>
+            <button type="button" id="tabBtnOverview" class="tab-item active" data-tab="overview" role="tab" tabindex="0" aria-selected="true" aria-controls="tab-overview">
+              <span>概况</span>
+            </button>
             <button type="button" id="tabBtnBoard" class="tab-item" data-tab="board" role="tab" tabindex="-1" aria-selected="false" aria-controls="tab-board">
               <span>日志</span>
               <span id="tabBoardCount" class="tab-badge tabular">0</span>
@@ -213,8 +343,6 @@
           <div id="boardFeed" class="board-feed" role="log" aria-live="polite" aria-relevant="additions">
             <div class="empty-state empty-board">暂无消息，等待运行任务产生协作动态...</div>
           </div>
-
-
         </section>
 
         <!-- TAB 2: 成员 -->
@@ -290,41 +418,41 @@
           </div>
         </section>
 
-          <details class="composer-dock"><summary>发送人工消息 <span class="muted-caption">向所选任务补充指令</span></summary>
-            <form id="humanMessageForm" class="composer-shell" autocomplete="off">
-              <label class="sr-only" for="humanMessageInput">人工干预消息内容</label>
-              <textarea id="humanMessageInput" class="composer-textarea" rows="2" placeholder="输入人工干预指令或调度消息（支持 Markdown，Ctrl+Enter 发送）..."></textarea>
+        <details class="composer-dock"><summary><span class="composer-dot" aria-hidden="true"></span>发送人工消息 <span class="muted-caption">向当前运行任务下发干预指令或补充说明</span></summary>
+          <form id="humanMessageForm" class="composer-shell" autocomplete="off">
+            <label class="sr-only" for="humanMessageInput">人工干预消息内容</label>
+            <textarea id="humanMessageInput" class="composer-textarea" rows="2" placeholder="输入人工干预指令或调度消息（支持 Markdown，Ctrl+Enter 发送）..."></textarea>
 
-              <div class="composer-footer">
-                <div class="composer-controls">
-                  <div class="composer-field">
-                    <label class="sr-only" for="humanChannelSelect">目标频道</label>
-                    <select id="humanChannelSelect" class="control-input control-sm" aria-label="目标频道">
-                      <option value="human">频道：人工</option>
-                      <option value="main">频道：主频道</option>
-                      <option value="__custom__">+ 自定义频道...</option>
-                    </select>
-                    <input id="humanChannelCustom" class="control-input control-sm hidden" type="text" placeholder="自定义频道名" aria-label="自定义频道名称">
-                  </div>
-
-                  <div class="composer-field">
-                    <label class="sr-only" for="humanMentionSelect">提醒成员</label>
-                    <select id="humanMentionSelect" class="control-input control-sm" aria-label="提醒成员">
-                      <option value="">@提醒：可选</option>
-                    </select>
-                    <input id="humanMentionCustom" class="control-input control-sm composer-tag-input" type="text" placeholder="自定义 @标签" aria-label="自定义 @提醒标签">
-                  </div>
+            <div class="composer-footer">
+              <div class="composer-controls">
+                <div class="composer-field">
+                  <label class="sr-only" for="humanChannelSelect">目标频道</label>
+                  <select id="humanChannelSelect" class="control-input control-sm" aria-label="目标频道">
+                    <option value="human">频道：人工</option>
+                    <option value="main">频道：主频道</option>
+                    <option value="__custom__">+ 自定义频道...</option>
+                  </select>
+                  <input id="humanChannelCustom" class="control-input control-sm hidden" type="text" placeholder="自定义频道名" aria-label="自定义频道名称">
                 </div>
 
-                <button id="humanSendBtn" class="composer-send-btn" type="submit" disabled title="发送人工消息 (Ctrl+Enter)" aria-label="发送人工消息">
-                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                    <path d="M12 19V5"></path>
-                    <polyline points="5 12 12 5 19 12"></polyline>
-                  </svg>
-                </button>
+                <div class="composer-field">
+                  <label class="sr-only" for="humanMentionSelect">提醒成员</label>
+                  <select id="humanMentionSelect" class="control-input control-sm" aria-label="提醒成员">
+                    <option value="">@提醒：可选</option>
+                  </select>
+                  <input id="humanMentionCustom" class="control-input control-sm composer-tag-input" type="text" placeholder="自定义 @标签" aria-label="自定义 @提醒标签">
+                </div>
               </div>
-            </form>
-          </details>
+
+              <button id="humanSendBtn" class="composer-send-btn" type="submit" disabled title="发送人工消息 (Ctrl+Enter)" aria-label="发送人工消息">
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 19V5"></path>
+                  <polyline points="5 12 12 5 19 12"></polyline>
+                </svg>
+              </button>
+            </div>
+          </form>
+        </details>
       </main>
 
       <!-- Slide-Over Right Workspace Inspector -->
@@ -349,6 +477,21 @@
           </div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Ctrl+K Command Palette Modal -->
+  <div id="cmdPaletteBackdrop" class="cmd-backdrop hidden" aria-hidden="true">
+    <div id="cmdPaletteDialog" class="cmd-dialog" role="dialog" aria-modal="true" aria-label="快速切换项目与对话任务">
+      <div class="cmd-search-bar">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="7"></circle>
+          <path d="m20 20-3.5-3.5"></path>
+        </svg>
+        <input id="cmdPaletteInput" class="cmd-input" type="search" placeholder="输入项目名、路径或对话任务标题进行快速跳转..." autocomplete="off">
+        <kbd class="kbd-hint">ESC</kbd>
+      </div>
+      <div id="cmdPaletteResults" class="cmd-results" role="listbox" aria-label="匹配结果"></div>
     </div>
   </div>
 

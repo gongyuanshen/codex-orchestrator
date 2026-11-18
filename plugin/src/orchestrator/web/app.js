@@ -88,6 +88,14 @@
     activeTab: 'overview',
     inspectorOpen: false,
     inspectorReturnFocus: null,
+    sidebarOpen: typeof window !== 'undefined' ? window.innerWidth > 1080 : true,
+    projectPopoverOpen: false,
+    projectSearchQuery: '',
+    runSearchQuery: '',
+    runStatusFilter: 'all',
+    cmdPaletteOpen: false,
+    cmdPaletteQuery: '',
+    cmdPaletteIndex: 0,
 
     contextVersion: 0,
     snapshotVersion: 0,
@@ -153,6 +161,27 @@
     modeLinks: document.querySelectorAll('[data-mode-link]'),
     projectSelect: document.getElementById('projectSelect'),
     runSelect: document.getElementById('runSelect'),
+    toggleSidebarBtn: document.getElementById('toggleSidebarBtn'),
+    contextSidebar: document.getElementById('contextSidebar'),
+    sidebarBackdrop: document.getElementById('sidebarBackdrop'),
+    projectSwitcherBtn: document.getElementById('projectSwitcherBtn'),
+    projectSwitcherName: document.getElementById('projectSwitcherName'),
+    projectSwitcherPath: document.getElementById('projectSwitcherPath'),
+    projectSwitcherKind: document.getElementById('projectSwitcherKind'),
+    projectPopover: document.getElementById('projectPopover'),
+    projectSearchInput: document.getElementById('projectSearchInput'),
+    projectPopoverList: document.getElementById('projectPopoverList'),
+    sidebarRunsCount: document.getElementById('sidebarRunsCount'),
+    runSearchInput: document.getElementById('runSearchInput'),
+    runFilterPills: Array.from(document.querySelectorAll('.run-filter-pill')),
+    runSidebarList: document.getElementById('runSidebarList'),
+    cmdPaletteTrigger: document.getElementById('cmdPaletteTrigger'),
+    topbarContextProject: document.getElementById('topbarContextProject'),
+    topbarContextRun: document.getElementById('topbarContextRun'),
+    cmdPaletteBackdrop: document.getElementById('cmdPaletteBackdrop'),
+    cmdPaletteDialog: document.getElementById('cmdPaletteDialog'),
+    cmdPaletteInput: document.getElementById('cmdPaletteInput'),
+    cmdPaletteResults: document.getElementById('cmdPaletteResults'),
     runMetaPill: document.getElementById('runMetaPill'),
     modeBadge: document.getElementById('modeBadge'),
     runStatusBadge: document.getElementById('runStatusBadge'),
@@ -361,6 +390,22 @@
     if (key === 'diff') return 'tint-violet';
     if (key === 'handoff') return 'tint-warning';
     if (key === 'human') return 'tint-primary';
+    return 'tint-muted';
+  }
+
+  function getRunStatusTone(status) {
+    const key = String(status || '').toLowerCase();
+    if (key === 'active') return 'tint-success';
+    if (key === 'completed') return 'tint-primary';
+    if (key === 'failed') return 'tint-danger';
+    return 'tint-muted';
+  }
+
+  function getModeTone(mode) {
+    const key = String(mode || '').toLowerCase();
+    if (key === 'boost') return 'tint-boost';
+    if (key === 'teamwork') return 'tint-teamwork';
+    if (key === 'swarm') return 'tint-swarm';
     return 'tint-muted';
   }
 
@@ -1343,14 +1388,211 @@
     showToast('成员心跳告警', `@${label} 心跳已超过停滞阈值，请检查工作状态。`, 'warning', 7000);
   }
 
-  // ---------- 顶部栏与页签渲染 ----------
+  // ---------- 顶部栏、侧边栏选择器与命令面板 ----------
+
+  function setSidebarOpen(open) {
+    state.sidebarOpen = Boolean(open);
+    const isMobile = window.innerWidth <= 1080;
+    el.contextSidebar.classList.toggle('is-collapsed', !state.sidebarOpen);
+    el.toggleSidebarBtn.setAttribute('aria-expanded', state.sidebarOpen ? 'true' : 'false');
+    el.sidebarBackdrop.classList.toggle('hidden', !(state.sidebarOpen && isMobile));
+  }
+
+  function setProjectPopoverOpen(open) {
+    state.projectPopoverOpen = Boolean(open);
+    el.projectPopover.classList.toggle('hidden', !state.projectPopoverOpen);
+    el.projectSwitcherBtn.setAttribute('aria-expanded', state.projectPopoverOpen ? 'true' : 'false');
+    if (state.projectPopoverOpen) {
+      state.projectSearchQuery = '';
+      el.projectSearchInput.value = '';
+      renderProjectPopover();
+      el.projectSearchInput.focus();
+    }
+  }
+
+  function renderProjectPopover() {
+    const q = state.projectSearchQuery.trim().toLowerCase();
+    const list = state.projects.filter((p) => {
+      if (!q) return true;
+      return `${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q);
+    });
+    if (list.length === 0) {
+      el.projectPopoverList.innerHTML = `<div class="empty-state">${state.projects.length === 0 ? '暂无已注册项目' : '未匹配到相关项目'}</div>`;
+      return;
+    }
+    el.projectPopoverList.innerHTML = list
+      .map((p) => {
+        const selected = String(p.id) === String(state.selectedProjectId);
+        const kind = p.is_git ? 'Git' : '目录';
+        return `
+          <button type="button" class="popover-item ${selected ? 'is-selected' : ''}" role="option" aria-selected="${selected ? 'true' : 'false'}" data-select-project="${escapeHtml(p.id)}">
+            <div class="popover-item-top">
+              <span class="popover-item-title">${escapeHtml(p.name || p.root_path)}</span>
+              <span class="chip-tag ${p.is_git ? 'tint-primary' : 'tint-muted'}">${escapeHtml(kind)}</span>
+            </div>
+            <span class="popover-item-path mono">${escapeHtml(p.root_path || '')}</span>
+          </button>
+        `;
+      })
+      .join('');
+  }
+
+  function formatRelativeTimeShort(raw) {
+    const ms = parseTimestampMs(raw);
+    if (ms === null) return '';
+    const sec = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+    if (sec < 60) return '刚刚';
+    if (sec < 3600) return `${Math.floor(sec / 60)}分钟前`;
+    if (sec < 86400) return `${Math.floor(sec / 3600)}小时前`;
+    const d = new Date(ms);
+    return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  function renderRunSidebar() {
+    const q = state.runSearchQuery.trim().toLowerCase();
+    const filter = state.runStatusFilter;
+    el.sidebarRunsCount.textContent = String(state.runs.length);
+
+    if (state.runs.length === 0) {
+      const msg = state.loadState === 'loading' ? '正在加载任务…' : state.loadState === 'error' ? '任务未加载' : `当前项目暂无 ${MODE_NAMES[PAGE_MODE] || ''} 任务`;
+      el.runSidebarList.innerHTML = `<div class="empty-state">${escapeHtml(msg)}</div>`;
+      return;
+    }
+
+    const filtered = state.runs.filter((r) => {
+      const status = String(r.status || '').toLowerCase();
+      if (filter === 'active' && status !== 'active') return false;
+      if (filter === 'done' && status === 'active') return false;
+      if (q) {
+        const hay = `${r.title || ''} ${r.id || ''} ${labelRunStatus(r.status)}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      el.runSidebarList.innerHTML = '<div class="empty-state">没有匹配的对话或任务</div>';
+      return;
+    }
+
+    const activeRuns = filtered.filter((r) => String(r.status || '').toLowerCase() === 'active');
+    const otherRuns = filtered.filter((r) => String(r.status || '').toLowerCase() !== 'active');
+
+    const renderItem = (r) => {
+      const selected = String(r.id) === String(state.selectedRunId);
+      const status = String(r.status || 'unknown').toLowerCase();
+      const title = r.title || `任务 ${shortId(r.id)}`;
+      const updated = formatRelativeTimeShort(r.updated_at || r.created_at);
+      return `
+        <button type="button" class="run-sidebar-item ${selected ? 'is-selected' : ''}" role="option" aria-selected="${selected ? 'true' : 'false'}" data-select-run="${escapeHtml(r.id)}">
+          <div class="run-sidebar-item-top">
+            <span class="run-sidebar-title">${escapeHtml(title)}</span>
+            ${status === 'active' ? '<span class="status-dot dot-ok" aria-hidden="true"></span>' : ''}
+          </div>
+          <div class="run-sidebar-meta">
+            <span class="chip-tag ${getRunStatusTone(status)}">${escapeHtml(labelRunStatus(status))}</span>
+            <span class="mono tabular">${escapeHtml(updated || shortId(r.id))}</span>
+          </div>
+        </button>
+      `;
+    };
+
+    const groups = [];
+    if (activeRuns.length > 0) {
+      groups.push(`<div class="run-group"><div class="run-group-label"><span>进行中</span><span class="tabular">${activeRuns.length}</span></div>${activeRuns.map(renderItem).join('')}</div>`);
+    }
+    if (otherRuns.length > 0) {
+      groups.push(`<div class="run-group"><div class="run-group-label"><span>历史任务</span><span class="tabular">${otherRuns.length}</span></div>${otherRuns.map(renderItem).join('')}</div>`);
+    }
+    el.runSidebarList.innerHTML = groups.join('');
+  }
+
+  function getCommandPaletteEntries() {
+    const q = state.cmdPaletteQuery.trim().toLowerCase();
+    const items = [];
+    for (const r of state.runs) {
+      const title = r.title || `任务 ${shortId(r.id)}`;
+      const status = labelRunStatus(r.status);
+      if (!q || `${title} ${r.id} ${status}`.toLowerCase().includes(q)) {
+        items.push({ kind: 'run', id: r.id, title, sub: `${status} · ${shortId(r.id)}`, tone: getRunStatusTone(r.status), badge: status, active: String(r.id) === String(state.selectedRunId) });
+      }
+    }
+    for (const p of state.projects) {
+      const name = p.name || p.root_path;
+      if (!q || `${name} ${p.root_path || ''}`.toLowerCase().includes(q)) {
+        items.push({ kind: 'project', id: p.id, title: name, sub: p.root_path || '', tone: p.is_git ? 'tint-primary' : 'tint-muted', badge: p.is_git ? 'Git' : '目录', active: String(p.id) === String(state.selectedProjectId) });
+      }
+    }
+    return items;
+  }
+
+  function renderCommandPalette() {
+    const items = getCommandPaletteEntries();
+    if (items.length === 0) {
+      el.cmdPaletteResults.innerHTML = '<div class="empty-state">无匹配的项目或运行任务</div>';
+      return;
+    }
+    if (state.cmdPaletteIndex >= items.length) state.cmdPaletteIndex = 0;
+    const runs = items.filter((i) => i.kind === 'run');
+    const projects = items.filter((i) => i.kind === 'project');
+    let idx = 0;
+    const renderBtn = (item) => {
+      const currentIdx = idx++;
+      return `
+        <button type="button" class="cmd-item ${currentIdx === state.cmdPaletteIndex ? 'is-active' : ''}" role="option" aria-selected="${currentIdx === state.cmdPaletteIndex ? 'true' : 'false'}" data-cmd-kind="${escapeHtml(item.kind)}" data-cmd-id="${escapeHtml(item.id)}">
+          <div class="cmd-item-main">
+            <span class="cmd-item-title">${escapeHtml(item.title)}</span>
+            <span class="cmd-item-sub mono">${escapeHtml(item.sub)}</span>
+          </div>
+          <span class="chip-tag ${item.tone}">${escapeHtml(item.active ? `${item.badge} · 当前` : item.badge)}</span>
+        </button>
+      `;
+    };
+    const parts = [];
+    if (runs.length) parts.push(`<div><div class="cmd-group-label">当前项目对话 / 运行任务</div>${runs.map(renderBtn).join('')}</div>`);
+    if (projects.length) parts.push(`<div><div class="cmd-group-label">切换工作区项目</div>${projects.map(renderBtn).join('')}</div>`);
+    el.cmdPaletteResults.innerHTML = parts.join('');
+  }
+
+  function openCommandPalette() {
+    setProjectPopoverOpen(false);
+    state.cmdPaletteOpen = true;
+    state.cmdPaletteQuery = '';
+    state.cmdPaletteIndex = 0;
+    el.cmdPaletteInput.value = '';
+    el.cmdPaletteBackdrop.classList.remove('hidden');
+    renderCommandPalette();
+    el.cmdPaletteInput.focus();
+  }
+
+  function closeCommandPalette(returnFocus = true) {
+    if (!state.cmdPaletteOpen) return;
+    state.cmdPaletteOpen = false;
+    el.cmdPaletteBackdrop.classList.add('hidden');
+    if (returnFocus) el.cmdPaletteTrigger.focus();
+  }
+
+  async function executeCommandEntry(kind, id) {
+    closeCommandPalette(false);
+    if (kind === 'project') {
+      await loadRuns(id || null);
+    } else if (kind === 'run' && id) {
+      await selectRun(id);
+    }
+  }
 
   function renderProjectSelector() {
     el.projectSelect.disabled = state.projects.length === 0;
     if (state.projects.length === 0) {
-      el.projectSelect.innerHTML = `<option value="">${state.loadState === 'error' ? '项目未加载' : '暂无已注册项目'}</option>`;
+      const emptyLabel = state.loadState === 'error' ? '项目未加载' : '暂无已注册项目';
+      el.projectSelect.innerHTML = `<option value="">${emptyLabel}</option>`;
       el.projectPathSubtitle.textContent = '未选择项目';
       el.projectPathSubtitle.title = '';
+      el.projectSwitcherName.textContent = emptyLabel;
+      el.projectSwitcherPath.textContent = '';
+      el.projectSwitcherKind.classList.add('hidden');
+      el.topbarContextProject.textContent = emptyLabel;
+      renderProjectPopover();
       return;
     }
 
@@ -1366,6 +1608,17 @@
 
     el.projectPathSubtitle.textContent = current ? current.root_path : '未选择项目';
     el.projectPathSubtitle.title = current ? current.root_path : '';
+    const displayName = current ? (current.name || current.root_path) : '请选择项目';
+    el.projectSwitcherName.textContent = displayName;
+    el.projectSwitcherPath.textContent = current ? current.root_path : '';
+    el.topbarContextProject.textContent = displayName;
+    if (current) {
+      el.projectSwitcherKind.textContent = current.is_git ? 'Git' : '目录';
+      el.projectSwitcherKind.className = `chip-tag ${current.is_git ? 'tint-primary' : 'tint-muted'}`;
+    } else {
+      el.projectSwitcherKind.classList.add('hidden');
+    }
+    renderProjectPopover();
   }
 
   function renderRunSelector() {
@@ -1373,6 +1626,8 @@
     if (state.runs.length === 0) {
       const label = state.loadState === 'loading' ? '正在加载任务…' : state.loadState === 'error' ? '任务未加载' : `该项目暂无 ${MODE_NAMES[PAGE_MODE]} 任务`;
       el.runSelect.innerHTML = `<option value="">${escapeHtml(label)}</option>`;
+      el.topbarContextRun.textContent = label;
+      renderRunSidebar();
       return;
     }
 
@@ -1384,10 +1639,18 @@
         return `<option value="${escapeHtml(r.id)}" ${selected}>[${escapeHtml(statusLabel)}] ${escapeHtml(title)}</option>`;
       })
       .join('');
+
+    const currentRun = state.runs.find((r) => String(r.id) === String(state.selectedRunId));
+    el.topbarContextRun.textContent = currentRun ? (currentRun.title || `任务 ${shortId(currentRun.id)}`) : '选择任务';
+    renderRunSidebar();
   }
 
   function updateTopRunControls() {
     const run = state.run || state.runs.find((r) => String(r.id) === String(state.selectedRunId));
+    const effectiveMode = String(run?.mode || PAGE_MODE || '').toLowerCase();
+    if (effectiveMode && el.dashboardShell?.setAttribute) {
+      el.dashboardShell.setAttribute('data-mode', effectiveMode);
+    }
     el.contextStatus.textContent = state.loadState === 'error' ? `加载失败：${state.loadError}。可切换项目或入口，也可点击「立即同步」重试。` : state.loadState === 'loading' ? '正在加载所选任务…' : '';
     el.contextStatus.classList.toggle('hidden', !el.contextStatus.textContent);
     el.contextStatus.classList.toggle('is-error', state.loadState === 'error');
@@ -1417,6 +1680,7 @@
     const runTitle = run.title || `任务 ${shortId(run.id)}`;
     el.runTitleHeading.textContent = runTitle;
     el.runTitleHeading.title = `${runTitle} (${run.id})`;
+    el.topbarContextRun.textContent = runTitle;
 
     const ready = state.loadState === 'ready';
     el.exportMenuBtn.disabled = !ready;
@@ -2000,9 +2264,11 @@
     const heading = '<div class="overview-section-heading"><h2>当前推进</h2></div>';
     if (progress === null) return `<section class="overview-section">${heading}<p class="muted-caption">推进状态未加载，请同步后查看。</p></section>`;
     const labels = {ready: '有可推进事项', completed: '步骤已完成', inactive: '任务非活动', normal_wait: '正常等待', dependency_wait: '等待前序步骤', user_decision: '等待用户决策', needs_reconciliation: '需要核对', host_unknown: '需要观察宿主状态', no_progress: '无可执行推进'};
+    const toneMap = {ready: 'tint-success', completed: 'tint-primary', inactive: 'tint-muted', normal_wait: 'tint-cyan', dependency_wait: 'tint-violet', user_decision: 'tint-warning', needs_reconciliation: 'tint-danger', host_unknown: 'tint-warning', no_progress: 'tint-muted'};
     const label = labels[progress.classification] || `未识别推进状态：${progress.classification}`;
+    const tone = toneMap[progress.classification] || 'tint-muted';
     const blockers = progress.blockers.map((item) => `<li>${escapeHtml(item.reason)}</li>`).join('');
-    return `<section class="overview-section" aria-label="当前推进与协调待办">${heading}<p>${escapeHtml(label)}${progress.coordinator_required ? ' · 等待协调者处理' : ''}</p><p class="muted-caption">依据登记事实判断，不代表宿主实时状态；心跳过期只要求观察，不会自动唤醒成员。</p>${blockers ? `<details class="workflow-blockers" data-overview-detail="progress-blockers" ${state.overviewExpanded.has('progress-blockers') ? 'open' : ''}><summary>查看 ${progress.blockers.length} 项阻塞依据</summary><ul>${blockers}</ul></details>` : ''}</section>`;
+    return `<section class="overview-section" aria-label="当前推进与协调待办"><div class="overview-section-heading"><h2>当前推进</h2><span class="pill-badge ${tone}">${escapeHtml(label)}${progress.coordinator_required ? ' · 等待协调者处理' : ''}</span></div><p class="overview-footnote">依据登记事实判断，不代表宿主实时状态；心跳过期只要求观察，不会自动唤醒成员。</p>${blockers ? `<details class="workflow-blockers" data-overview-detail="progress-blockers" ${state.overviewExpanded.has('progress-blockers') ? 'open' : ''}><summary>查看 ${progress.blockers.length} 项阻塞依据</summary><ul>${blockers}</ul></details>` : ''}</section>`;
   }
 
   function renderResumeContext() {
@@ -2011,9 +2277,9 @@
     const plan = state.planReadiness;
     const heading = '<div class="overview-section-heading"><h2>计划与交接</h2></div>';
     if (context === null || plan === null) return `<section class="overview-section">${heading}<p class="muted-caption">交接投影未加载，请同步后查看。</p></section>`;
-    const handoffs = context.handoffs.map((item) => `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(item.digest)}">${escapeHtml(item.digest)}</span><span class="pill-badge ${item.current ? 'tint-muted' : 'tint-warning'}">${item.current ? (item.acknowledged ? '交接包已确认' : '交接包待确认') : '交接包已过期'}</span><span class="muted-caption">${escapeHtml(item.recipient_agent_id)}</span></li>`).join('');
+    const handoffs = context.handoffs.map((item) => `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(item.digest)}">${escapeHtml(item.digest)}</span><span class="pill-badge ${item.current ? 'tint-primary' : 'tint-warning'}">${item.current ? (item.acknowledged ? '交接包已确认' : '交接包待确认') : '交接包已过期'}</span><span class="muted-caption">${escapeHtml(item.recipient_agent_id)}</span></li>`).join('');
     const references = [...context.artifact_refs, ...context.verification_refs].map((item) => `<li>${escapeHtml(item.id)}</li>`).join('');
-    return `<section class="overview-section" aria-label="计划准备度和交接包">${heading}<div class="workflow-delivery tabular"><span>未覆盖验收项 ${plan.uncovered_criteria.length}</span><span>范围冲突 ${plan.ownership_conflicts.length}</span><span>未处置业务消息 ${context.unresolved.inbox.length}</span><span>待处理控制 ${context.unresolved.controls.length}</span><span>未决转交 ${context.unresolved.native_actions.length}</span></div><p class="muted-caption">准备度提示不阻止创建合法草案；原协调者仍掌握旧子代理生命周期，接手不等于继承原生身份。</p><details class="workflow-more" data-overview-detail="resume-context" ${state.overviewExpanded.has('resume-context') ? 'open' : ''}><summary>交接包、证据引用与不得执行的操作</summary><p class="muted-caption">冻结任务包 ${escapeHtml(context.frozen_packet_id)} · 当前事实摘要 ${escapeHtml(context.facts_digest)}</p>${handoffs ? `<ul class="workflow-steps">${handoffs}</ul>` : '<p class="muted-caption">尚未建立交接包。</p>'}<ul>${plan.uncovered_criteria.map((item) => `<li>未覆盖：${escapeHtml(item)}</li>`).join('')}${plan.ownership_conflicts.map((item) => `<li>范围冲突：${escapeHtml(item.step_id)} / ${escapeHtml(item.other_step_id)} · ${escapeHtml(item.paths.join(' / '))}</li>`).join('')}${references}${context.forbidden_actions.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></details></section>`;
+    return `<section class="overview-section" aria-label="计划准备度和交接包">${heading}<div class="workflow-delivery tabular"><span class="metric-chip ${plan.uncovered_criteria.length > 0 ? 'is-warn' : ''}">未覆盖验收项 ${plan.uncovered_criteria.length}</span><span class="metric-chip ${plan.ownership_conflicts.length > 0 ? 'is-danger' : ''}">范围冲突 ${plan.ownership_conflicts.length}</span><span class="metric-chip ${context.unresolved.inbox.length > 0 ? 'is-warn' : ''}">未处置业务消息 ${context.unresolved.inbox.length}</span><span class="metric-chip ${context.unresolved.controls.length > 0 ? 'is-active' : ''}">待处理控制 ${context.unresolved.controls.length}</span><span class="metric-chip ${context.unresolved.native_actions.length > 0 ? 'is-warn' : ''}">未决转交 ${context.unresolved.native_actions.length}</span></div><p class="overview-footnote">准备度提示不阻止创建合法草案；原协调者仍掌握旧子代理生命周期，接手不等于继承原生身份。</p><details class="workflow-more" data-overview-detail="resume-context" ${state.overviewExpanded.has('resume-context') ? 'open' : ''}><summary>交接包、证据引用与不得执行的操作</summary><p class="muted-caption">冻结任务包 ${escapeHtml(context.frozen_packet_id)} · 当前事实摘要 ${escapeHtml(context.facts_digest)}</p>${handoffs ? `<ul class="workflow-steps">${handoffs}</ul>` : '<p class="muted-caption">尚未建立交接包。</p>'}<ul>${plan.uncovered_criteria.map((item) => `<li>未覆盖：${escapeHtml(item)}</li>`).join('')}${plan.ownership_conflicts.map((item) => `<li>范围冲突：${escapeHtml(item.step_id)} / ${escapeHtml(item.other_step_id)} · ${escapeHtml(item.paths.join(' / '))}</li>`).join('')}${references}${context.forbidden_actions.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul></details></section>`;
   }
 
   function renderLocalReceipts() {
@@ -2022,36 +2288,36 @@
     const rows = artifacts.slice(0, 3).map((artifact) => {
       const records = state.workflow.verifications.filter((record) => record.artifact_id === artifact.id);
       const evidenceCount = records.reduce((total, record) => total + record.evidence_manifest.length, 0);
-      return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(artifact.id)}">${escapeHtml(artifact.id)}</span><span class="pill-badge tint-muted">${escapeHtml(artifact.scope)} · ${escapeHtml(artifact.verification_command_count)} 条冻结命令</span><span class="muted-caption">${records.length} 次验收登记 · 登记证据文件 ${evidenceCount}</span></li>`;
+      return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(artifact.id)}">${escapeHtml(artifact.id)}</span><span class="pill-badge tint-cyan">${escapeHtml(artifact.scope)} · ${escapeHtml(artifact.verification_command_count)} 条冻结命令</span><span class="muted-caption">${records.length} 次验收登记 · 登记证据文件 ${evidenceCount}</span></li>`;
     }).join('');
-    return `<p class="muted-caption">本地采集 · local_collector_v1：不是宿主身份认证；冻结清单不表示采集已完成，登记证据也不表示当前有效。门禁使用时重新核对。</p>${artifacts.length ? `<details class="workflow-more" data-overview-detail="local-receipts" ${state.overviewExpanded.has('local-receipts') ? 'open' : ''}><summary>已冻结 ${artifacts.length} 份采集清单（展开查看登记摘要）</summary><ul class="workflow-steps">${rows}</ul>${artifacts.length > 3 ? `<p class="muted-caption">另有 ${artifacts.length - 3} 份清单；概况仅展示前 3 份，不加载原始日志。</p>` : ''}</details>` : '<p class="muted-caption">尚未登记本地采集清单。</p>'}`;
+    return `<p class="overview-footnote">本地采集 · local_collector_v1：不是宿主身份认证；冻结清单不表示采集已完成，登记证据也不表示当前有效。门禁使用时重新核对。</p>${artifacts.length ? `<details class="workflow-more" data-overview-detail="local-receipts" ${state.overviewExpanded.has('local-receipts') ? 'open' : ''}><summary>已冻结 ${artifacts.length} 份采集清单（展开查看登记摘要）</summary><ul class="workflow-steps">${rows}</ul>${artifacts.length > 3 ? `<p class="muted-caption">另有 ${artifacts.length - 3} 份清单；概况仅展示前 3 份，不加载原始日志。</p>` : ''}</details>` : '<p class="muted-caption">尚未登记本地采集清单。</p>'}`;
   }
 
   function renderReviewDimensions() {
     if (![4, 5].includes(state.run.workflow_version)) return '';
     const reviews = state.workflow.steps.flatMap((step) => Object.entries(step.checkpoint?.review_dimensions || {}).map(([id, dimensions]) => ({id, dimensions})));
     const rows = reviews.map(({id, dimensions}) => `<li>${escapeHtml(id)} · 规格检查：${escapeHtml(dimensions.specification)} · 代码正确性：${escapeHtml(dimensions.code)} · 压力与反例：${escapeHtml(dimensions.stress)} · 证据检查：${escapeHtml(dimensions.evidence)}</li>`).join('');
-    return `<p class="muted-caption">分项审查由原验收者记录；项目目标达成仍需最终集成门禁，不等于多角色独立审查。</p>${reviews.length ? `<details class="workflow-more" data-overview-detail="review-dimensions" ${state.overviewExpanded.has('review-dimensions') ? 'open' : ''}><summary>规格、代码、反例与证据检查（${reviews.length} 份）</summary><ul>${rows}</ul></details>` : '<p class="muted-caption">尚未记录分项审查。</p>'}`;
+    return `<p class="overview-footnote">分项审查由原验收者记录；项目目标达成仍需最终集成门禁，不等于多角色独立审查。</p>${reviews.length ? `<details class="workflow-more" data-overview-detail="review-dimensions" ${state.overviewExpanded.has('review-dimensions') ? 'open' : ''}><summary>规格、代码、反例与证据检查（${reviews.length} 份）</summary><ul>${rows}</ul></details>` : '<p class="muted-caption">尚未记录分项审查。</p>'}`;
   }
 
   function renderWorkflowSummary() {
     const version = state.run.workflow_version;
     const versionLabel = version === 0 ? '旧流程，未启用结构化门禁' : [1, 2, 3, 4, 5].includes(version) ? `结构化门禁 · v${version}` : '流程版本未记录';
-    const heading = `<div class="overview-section-heading"><h2>流程与验收</h2><span class="pill-badge tint-muted">${versionLabel}</span></div>`;
+    const heading = `<div class="overview-section-heading"><h2>流程与验收</h2><span class="pill-badge ${[1, 2, 3, 4, 5].includes(version) ? 'tint-primary' : 'tint-muted'}">${versionLabel}</span></div>`;
     if (![1, 2, 3, 4, 5].includes(version)) return `<section class="overview-section workflow-overview">${heading}</section>`;
     if (state.workflow === null) return `<section class="overview-section workflow-overview">${heading}<p class="workflow-warning" role="status">结构化流程数据未加载，请同步后查看门禁状态。</p></section>`;
     const { steps, verifications, blockers } = state.workflow;
     // Keep urgent/current steps ahead of completed history without hiding any step.
     const ordered = [...steps].sort((a, b) => Number(a.state === 'done') - Number(b.state === 'done'));
     const counts = state.inbox?.counts;
-    const delivery = counts ? `<div class="workflow-delivery tabular"><span>待接收 ${escapeHtml(counts.pending)}</span><span>已接收待处置 ${escapeHtml(counts.accepted)}</span><span>执行完成回执 ${escapeHtml(counts.completed)}</span><span>未处置任务 ${escapeHtml(state.inbox.blocking_count)}</span></div>` : '<p class="muted-caption">收件箱摘要未加载。</p>';
+    const delivery = counts ? `<div class="workflow-delivery tabular"><span class="metric-chip ${counts.pending > 0 ? 'is-warn' : ''}">待接收 ${escapeHtml(counts.pending)}</span><span class="metric-chip ${counts.accepted > 0 ? 'is-active' : ''}">已接收待处置 ${escapeHtml(counts.accepted)}</span><span class="metric-chip ${counts.completed > 0 ? 'is-ok' : ''}">执行完成回执 ${escapeHtml(counts.completed)}</span><span class="metric-chip ${state.inbox.blocking_count > 0 ? 'is-danger' : ''}">未处置任务 ${escapeHtml(state.inbox.blocking_count)}</span></div>` : '<p class="muted-caption">收件箱摘要未加载。</p>';
     const more = ordered.length > 3 ? `<details class="workflow-more" data-overview-detail="workflow-more" ${state.overviewExpanded.has('workflow-more') ? 'open' : ''}><summary>其余 ${ordered.length - 3} 个步骤</summary><ul class="workflow-steps">${ordered.slice(3).map(renderWorkflowStep).join('')}</ul></details>` : '';
     const blockerLabels = blockers.map((blocker) => {
       const stepKey = steps.find((step) => step.id === blocker.step_id)?.step_key || blocker.step_key || blocker.step_id || '未知步骤';
       return `${stepKey}：${labelWorkflowState(blocker.state)}`;
     });
-    const blocking = blockerLabels.length ? `<details class="workflow-blockers" data-overview-detail="workflow-blockers" ${state.overviewExpanded.has('workflow-blockers') ? 'open' : ''}><summary class="workflow-warning">${escapeHtml(blockerLabels[0])}${blockers.length > 1 ? `（共 ${blockers.length} 项阻塞，展开查看）` : '（展开查看）'}</summary><ul>${blockerLabels.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}</ul></details>` : '<p class="muted-caption">流程记录暂无阻塞；最终完成仍由后端核对当前产物与验收证据。</p>';
-    return `<section class="overview-section workflow-overview" aria-label="结构化流程与收件状态">${heading}${delivery}<p class="muted-caption">回执不等于独立验收 · 已记录 ${verifications.length} 次验收，是否有效由当前门禁核对。</p>${renderLocalReceipts()}${renderReviewDimensions()}${blocking}${ordered.length ? `<ul class="workflow-steps">${ordered.slice(0, 3).map(renderWorkflowStep).join('')}</ul>${more}` : '<p class="muted-caption">尚未建立工作步骤，不能据此认定任务已验收。</p>'}</section>`;
+    const blocking = blockerLabels.length ? `<details class="workflow-blockers" data-overview-detail="workflow-blockers" ${state.overviewExpanded.has('workflow-blockers') ? 'open' : ''}><summary class="workflow-warning">${escapeHtml(blockerLabels[0])}${blockers.length > 1 ? `（共 ${blockers.length} 项阻塞，展开查看）` : '（展开查看）'}</summary><ul>${blockerLabels.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}</ul></details>` : '<p class="overview-footnote">流程记录暂无阻塞；最终完成仍由后端核对当前产物与验收证据。</p>';
+    return `<section class="overview-section workflow-overview" aria-label="结构化流程与收件状态">${heading}${delivery}<p class="overview-footnote">回执不等于独立验收 · 已记录 ${verifications.length} 次验收，是否有效由当前门禁核对。</p>${renderLocalReceipts()}${renderReviewDimensions()}${blocking}${ordered.length ? `<ul class="workflow-steps">${ordered.slice(0, 3).map(renderWorkflowStep).join('')}</ul>${more}` : '<p class="muted-caption">尚未建立工作步骤，不能据此认定任务已验收。</p>'}</section>`;
   }
 
   function hostObservation(worker) {
@@ -2086,10 +2352,11 @@
   }
 
   function renderOverviewMember(w) {
+    const statusTone = getWorkerStatusTone(w.status, isWorkerStalled(w));
     return `          <button type="button" class="overview-member" data-worker-id="${escapeHtml(w.id)}">
-            <span class="overview-member-role">${escapeHtml(labelRole(w.role))}<small>@${escapeHtml(w.name)}</small></span>
+            <span class="overview-member-role">${renderRoleBadge(w.role, false)}<span>${escapeHtml(labelRole(w.role))}<small>@${escapeHtml(w.name)}</small></span></span>
             <span class="overview-member-work"><span>${escapeHtml(roleResponsibility(w.role))}</span><span class="overview-current-task">最近登记工作：${escapeHtml(w.current_task || '尚未记录')}</span></span>
-            <span class="overview-member-state">${isAppServerWorker(w) ? renderAppServerBadge() : ''}<span class="pill-badge tint-muted">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
+            <span class="overview-member-state">${isAppServerWorker(w) ? renderAppServerBadge() : ''}<span class="pill-badge ${statusTone}">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
           </button>`;
   }
 
@@ -2107,15 +2374,53 @@
     const ledger = rows.map(({ item, label }) => {
       const description = item.reason || item.source?.summary || item.action_type || item.status || '';
       const identity = `${item.source_type} · ${item.source_id}${item.action_id ? ` · ${item.action_id}` : ''}${item.seq != null ? ` · #${item.seq}` : ''}`;
-      return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(description)}">${escapeHtml(item.recipient || '收件人待澄清')} · ${escapeHtml(description)}</span><span class="pill-badge ${label === '等待转交' ? 'tint-muted' : 'tint-warning'}">${label}</span><span class="muted-caption">${escapeHtml(identity)}</span></li>`;
+      return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(description)}">${escapeHtml(item.recipient || '收件人待澄清')} · ${escapeHtml(description)}</span><span class="pill-badge ${label === '等待转交' ? 'tint-primary' : 'tint-warning'}">${label}</span><span class="muted-caption">${escapeHtml(identity)}</span></li>`;
     }).join('');
     return `<section class="overview-section workflow-overview" aria-label="原生转交登记与待核对项">
       <div class="overview-section-heading">${heading}</div>
-      <div class="workflow-delivery tabular"><span>等待转交 ${lowerBound}${escapeHtml(projection.next_actions_count)}</span><span>已转交 ${escapeHtml(counts.confirmed)}</span><span>需核对 ${lowerBound}${escapeHtml(projection.needs_reconciliation_count)}</span><span>待澄清 ${lowerBound}${escapeHtml(projection.needs_clarification_count)}</span></div>
-      <p class="muted-caption">领取中 ${escapeHtml(counts.claimed)} · 调用中 ${escapeHtml(counts.invoking)} · 转交失败 ${escapeHtml(counts.failed)} · 已取消 ${escapeHtml(counts.cancelled)}</p>
-      <p class="muted-caption">转交登记不代表宿主实时状态；已转交不等于业务完成或独立验收。需核对项不会自动重放。</p>
+      <div class="workflow-delivery tabular"><span class="metric-chip ${projection.next_actions_count > 0 ? 'is-active' : ''}">等待转交 ${lowerBound}${escapeHtml(projection.next_actions_count)}</span><span class="metric-chip ${counts.confirmed > 0 ? 'is-ok' : ''}">已转交 ${escapeHtml(counts.confirmed)}</span><span class="metric-chip ${projection.needs_reconciliation_count > 0 ? 'is-warn' : ''}">需核对 ${lowerBound}${escapeHtml(projection.needs_reconciliation_count)}</span><span class="metric-chip ${projection.needs_clarification_count > 0 ? 'is-danger' : ''}">待澄清 ${lowerBound}${escapeHtml(projection.needs_clarification_count)}</span></div>
+      <p class="overview-footnote">领取中 ${escapeHtml(counts.claimed)} · 调用中 ${escapeHtml(counts.invoking)} · 转交失败 ${escapeHtml(counts.failed)} · 已取消 ${escapeHtml(counts.cancelled)}</p>
+      <p class="overview-footnote">转交登记不代表宿主实时状态；已转交不等于业务完成或独立验收。需核对项不会自动重放。</p>
       <details class="workflow-more" data-overview-detail="native-ledger" ${state.overviewExpanded.has('native-ledger') ? 'open' : ''}><summary>转交账本与待办明细（本次 ${rows.length} 项${projection.native_actions_has_more ? '，有更多记录' : ''}）</summary><p class="muted-caption">每类最多 ${escapeHtml(projection.limit)} 项；${projection.counts_complete ? '待办计数完整。' : '待办计数为当前查询下界，不代表完整总数。'}转交状态计数来自账本。</p>${rows.length ? `<ul class="workflow-steps">${ledger}</ul>` : '<p class="muted-caption">当前没有等待转交、需核对或待澄清项。</p>'}</details>
     </section>`;
+  }
+
+  function renderOverviewKpiStrip(run, current, retired) {
+    const workflowBlockers = state.workflow?.blockers?.length || 0;
+    const progressBlockers = state.progressStatus?.blockers?.length || 0;
+    const inboxBlocking = state.inbox?.blocking_count || 0;
+    const totalAttention = workflowBlockers + progressBlockers + inboxBlocking;
+    const stalledCount = state.workers.filter(isWorkerStalled).length;
+    const workingCount = current.filter((w) => w.status === 'working').length;
+    const waitingCount = current.filter((w) => w.status === 'waiting').length;
+    const verificationsCount = state.workflow?.verifications?.length || 0;
+    const stepCount = state.workflow?.steps?.length || 0;
+    const doneStepCount = (state.workflow?.steps || []).filter((s) => s.state === 'done').length;
+
+    const attentionCardClass = stalledCount > 0 || totalAttention > 2 ? 'is-danger' : totalAttention > 0 ? 'is-alert' : 'is-healthy';
+    return `
+      <div class="overview-kpi-strip tabular">
+        <div class="kpi-card">
+          <div class="kpi-label"><span>运行模式与状态</span><span class="chip-tag ${getModeTone(run.mode)}">${escapeHtml(labelMode(run.mode))}</span></div>
+          <div class="kpi-value">${escapeHtml(labelRunStatus(run.status))}</div>
+          <div class="kpi-sub">${stepCount > 0 ? `步骤 ${doneStepCount} / ${stepCount} 完成` : ([1, 2, 3, 4, 5].includes(run.workflow_version) ? '尚未建立步骤' : '未启用结构化门禁')}</div>
+        </div>
+        <div class="kpi-card ${attentionCardClass}">
+          <div class="kpi-label"><span>阻塞与待处理</span><span class="chip-tag ${totalAttention > 0 ? 'tint-warning' : 'tint-success'}">${totalAttention > 0 ? '需关注' : '畅通'}</span></div>
+          <div class="kpi-value">${totalAttention} 项</div>
+          <div class="kpi-sub">门禁阻塞 ${workflowBlockers} · 未处置任务 ${inboxBlocking}</div>
+        </div>
+        <div class="kpi-card ${stalledCount > 0 ? 'is-danger' : ''}">
+          <div class="kpi-label"><span>活跃代理 / 成员</span><span class="chip-tag ${stalledCount > 0 ? 'tint-danger' : 'tint-primary'}">${stalledCount > 0 ? `${stalledCount} 停滞` : '心跳正常'}</span></div>
+          <div class="kpi-value">${workingCount} 执行 · ${waitingCount} 待命</div>
+          <div class="kpi-sub">共 ${state.workers.length} 名登记（已暂停/终止 ${retired.length}）</div>
+        </div>
+        <div class="kpi-card">
+          <div class="kpi-label"><span>协作消息与验收</span><span class="chip-tag tint-cyan">实时板</span></div>
+          <div class="kpi-value">${state.messages.length} 条动态</div>
+          <div class="kpi-sub">已记录验收 ${verificationsCount} 次</div>
+        </div>
+      </div>`;
   }
 
   function renderOverview() {
@@ -2139,14 +2444,15 @@
       counts.set(label, (counts.get(label) || 0) + 1);
     }
     el.overviewContent.innerHTML = `
+      ${renderOverviewKpiStrip(run, current, retired)}
       <section class="overview-section overview-task">
-        <h2>任务概况 <span class="pill-badge tint-muted">${escapeHtml(labelRunStatus(run.status))}</span></h2>
+        <h2>任务概况 <span class="pill-badge ${getModeTone(run.mode)}">${escapeHtml(labelMode(run.mode))}</span> <span class="pill-badge ${getRunStatusTone(run.status)}">${escapeHtml(labelRunStatus(run.status))}</span></h2>
         <details class="overview-goal-details" data-overview-detail="goal" ${state.overviewExpanded.has('goal') ? 'open' : ''}>
           <summary><span class="overview-goal-preview">${escapeHtml(state.taskPacket?.goal || '任务包尚未记录核心目标。')}</span><span class="goal-expand-label">展开 / 收起完整目标</span></summary>
           <p class="overview-goal">${escapeHtml(state.taskPacket?.goal || '任务包尚未记录核心目标。')}</p>
         </details>
         <p class="overview-meta">${escapeHtml(labelMode(run.mode))} · ${state.workers.length} 名已登记成员 · ${escapeHtml(Array.from(counts, ([label, n]) => `${n} 名${label}`).join('，') || '尚无成员状态')}</p>
-        <p class="muted-caption">状态与工作内容来自登记记录；不代表代理当前在线或执行进度。</p>
+        <p class="overview-footnote">状态与工作内容来自登记记录；不代表代理当前在线或执行进度。</p>
       </section>
       ${renderWorkflowSummary()}
       ${renderProgressStatus()}
@@ -2154,14 +2460,13 @@
       ${renderNativeActions()}
       <div class="overview-columns">
       <section class="overview-section">
-        <div class="overview-section-heading"><h2>成员分工</h2><button type="button" class="btn btn-ghost btn-xs" data-view="members">查看任务包与全部成员</button></div>
+        <div class="overview-section-heading"><h2>成员分工</h2><button type="button" class="btn btn-accent btn-xs" data-view="members">查看任务包与全部成员</button></div>
         <div class="overview-members">${current.length ? current.map(renderOverviewMember).join('') : '<p class="muted-caption">没有登记为执行中或待命的成员。</p>'}</div>
         ${retired.length ? `<details class="retired-members" data-overview-detail="retired" ${state.overviewExpanded.has('retired') ? 'open' : ''}><summary>已暂停 / 终止成员（${retired.length}）</summary>${retired.map(renderOverviewMember).join('')}</details>` : ''}
-      
       </section>
       <section class="overview-section">
-        <div class="overview-section-heading"><h2>最近动态</h2><button type="button" class="btn btn-ghost btn-xs" data-view="board">查看全部 ${state.messages.length} 条日志</button></div>
-        <p class="muted-caption">最近 ${recent.length} 条公告，按发布时间倒序。点击查看全文。</p>
+        <div class="overview-section-heading"><h2>最近动态</h2><button type="button" class="btn btn-accent btn-xs" data-view="board">查看全部 ${state.messages.length} 条日志</button></div>
+        <p class="overview-footnote">最近 ${recent.length} 条公告，按发布时间倒序。点击查看全文。</p>
         <div class="overview-updates">${recent.length ? recent.map((msg) => `<button type="button" class="overview-update" data-open-seq="${escapeHtml(msg.seq)}"><span>${escapeHtml(messageSummary(msg))}</span><small>${escapeHtml(labelRole(inferSenderRole(msg)))} · @${escapeHtml(msg.sender)} · #${escapeHtml(msg.seq)} · ${escapeHtml(formatLocalTime(msg.created_at))}</small></button>`).join('') : '<p class="muted-caption">尚无协作动态。</p>'}</div>
       </section>
       </div>`;
@@ -3526,6 +3831,94 @@
       }
     });
 
+    el.toggleSidebarBtn.addEventListener('click', () => {
+      setSidebarOpen(!state.sidebarOpen);
+    });
+
+    el.sidebarBackdrop.addEventListener('click', () => {
+      setSidebarOpen(false);
+    });
+
+    el.projectSwitcherBtn.addEventListener('click', (evt) => {
+      evt.stopPropagation();
+      setProjectPopoverOpen(!state.projectPopoverOpen);
+    });
+
+    el.projectSearchInput.addEventListener('input', () => {
+      state.projectSearchQuery = el.projectSearchInput.value || '';
+      renderProjectPopover();
+    });
+
+    el.projectPopoverList.addEventListener('click', async (evt) => {
+      const item = evt.target.closest('[data-select-project]');
+      if (!item) return;
+      const projectId = item.getAttribute('data-select-project');
+      setProjectPopoverOpen(false);
+      await loadRuns(projectId || null);
+    });
+
+    el.runSearchInput.addEventListener('input', () => {
+      state.runSearchQuery = el.runSearchInput.value || '';
+      renderRunSidebar();
+    });
+
+    for (const pill of el.runFilterPills) {
+      pill.addEventListener('click', () => {
+        state.runStatusFilter = pill.getAttribute('data-run-filter') || 'all';
+        for (const p of el.runFilterPills) {
+          const active = p === pill;
+          p.classList.toggle('active', active);
+          p.setAttribute('aria-pressed', active ? 'true' : 'false');
+        }
+        renderRunSidebar();
+      });
+    }
+
+    el.runSidebarList.addEventListener('click', async (evt) => {
+      const item = evt.target.closest('[data-select-run]');
+      if (!item) return;
+      const nextRunId = item.getAttribute('data-select-run');
+      if (window.innerWidth <= 1080) setSidebarOpen(false);
+      if (nextRunId) await selectRun(nextRunId);
+    });
+
+    el.cmdPaletteTrigger.addEventListener('click', () => {
+      openCommandPalette();
+    });
+
+    el.cmdPaletteBackdrop.addEventListener('click', (evt) => {
+      if (evt.target === el.cmdPaletteBackdrop) closeCommandPalette(true);
+    });
+
+    el.cmdPaletteInput.addEventListener('input', () => {
+      state.cmdPaletteQuery = el.cmdPaletteInput.value || '';
+      state.cmdPaletteIndex = 0;
+      renderCommandPalette();
+    });
+
+    el.cmdPaletteInput.addEventListener('keydown', async (evt) => {
+      const entries = getCommandPaletteEntries();
+      if (evt.key === 'ArrowDown' && entries.length > 0) {
+        evt.preventDefault();
+        state.cmdPaletteIndex = (state.cmdPaletteIndex + 1) % entries.length;
+        renderCommandPalette();
+      } else if (evt.key === 'ArrowUp' && entries.length > 0) {
+        evt.preventDefault();
+        state.cmdPaletteIndex = (state.cmdPaletteIndex - 1 + entries.length) % entries.length;
+        renderCommandPalette();
+      } else if (evt.key === 'Enter' && entries.length > 0) {
+        evt.preventDefault();
+        const chosen = entries[state.cmdPaletteIndex] || entries[0];
+        if (chosen) await executeCommandEntry(chosen.kind, chosen.id);
+      }
+    });
+
+    el.cmdPaletteResults.addEventListener('click', async (evt) => {
+      const btn = evt.target.closest('[data-cmd-kind]');
+      if (!btn) return;
+      await executeCommandEntry(btn.getAttribute('data-cmd-kind'), btn.getAttribute('data-cmd-id'));
+    });
+
     el.refreshSnapshotBtn.addEventListener('click', async () => {
       checkHealth();
       await loadProjects();
@@ -3561,11 +3954,27 @@
       if (!el.exportDropdown.contains(evt.target)) {
         closeExportMenu();
       }
+      if (state.projectPopoverOpen && !el.projectPopover.contains(evt.target) && !el.projectSwitcherBtn.contains(evt.target)) {
+        setProjectPopoverOpen(false);
+      }
     });
 
     document.addEventListener('keydown', (evt) => {
+      if ((evt.ctrlKey || evt.metaKey) && String(evt.key || '').toLowerCase() === 'k') {
+        evt.preventDefault();
+        if (state.cmdPaletteOpen) closeCommandPalette(true);
+        else openCommandPalette();
+        return;
+      }
       if (evt.key === 'Escape') {
-        if (!el.exportMenu.classList.contains('hidden')) {
+        if (state.cmdPaletteOpen) {
+          evt.preventDefault();
+          closeCommandPalette(true);
+        } else if (state.projectPopoverOpen) {
+          evt.preventDefault();
+          setProjectPopoverOpen(false);
+          el.projectSwitcherBtn.focus();
+        } else if (!el.exportMenu.classList.contains('hidden')) {
           evt.preventDefault();
           closeExportMenu(true);
         } else if (state.inspectorOpen) {
@@ -3580,7 +3989,12 @@
         items[index < 0 ? (evt.shiftKey ? items.length - 1 : 0) : (index + (evt.shiftKey ? -1 : 1) + items.length) % items.length].focus();
       }
     });
-    window.addEventListener('resize', syncInspectorMode);
+    window.addEventListener('resize', () => {
+      syncInspectorMode();
+      if (window.innerWidth > 1080) {
+        el.sidebarBackdrop.classList.add('hidden');
+      }
+    });
 
     el.workersList.addEventListener('click', async (evt) => {
       const row = evt.target.closest('.member-row');
@@ -3777,7 +4191,11 @@
       return;
     }
     document.title = `${MODE_NAMES[PAGE_MODE]} — 三重编排器`;
+    if (el.dashboardShell?.setAttribute) {
+      el.dashboardShell.setAttribute('data-mode', PAGE_MODE);
+    }
     el.modeDescription.textContent = MODE_DESCRIPTIONS[PAGE_MODE];
+    setSidebarOpen(window.innerWidth > 1080);
     bindEvents();
     checkHealth();
     try {
