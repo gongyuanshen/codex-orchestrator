@@ -854,14 +854,14 @@ def test_live_daemon_session_bind_and_single_shot_stop_e2e(tmp_path: Path) -> No
         bridge_thread.join(timeout=5)
 
 
-def test_upgrade_script_verifies_schema8_capabilities(tmp_path: Path) -> None:
+def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
     upgrade_path = REPO_ROOT / "scripts" / "upgrade.py"
     spec = importlib.util.spec_from_file_location("m9_upgrade_check", upgrade_path)
     assert spec is not None and spec.loader is not None
     upgrade_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(upgrade_mod)
 
-    assert upgrade_mod.supported_schema(PLUGIN_DIR) == 8
+    assert upgrade_mod.supported_schema(PLUGIN_DIR) == 9
     assert upgrade_mod.package_identity(PLUGIN_DIR) == {
         "name": "tri-orchestrator",
         "version": "0.6.0",
@@ -901,7 +901,7 @@ def test_upgrade_script_verifies_schema8_capabilities(tmp_path: Path) -> None:
                 "ok": True,
                 "pid": os.getpid(),
                 "software_version": "0.6.0",
-                "schema_version": 8,
+                "schema_version": 9,
                 "data_dir": str(data_dir.resolve()),
                 "port": self.server.server_port,  # type: ignore[attr-defined]
                 "capabilities": state["capabilities"],
@@ -922,7 +922,7 @@ def test_upgrade_script_verifies_schema8_capabilities(tmp_path: Path) -> None:
                     "data_dir": str(data_dir.resolve()),
                     "port": srv.server_port,
                     "source_identity": {"name": "tri-orchestrator", "version": "0.6.0"},
-                    "supported_schema": 8,
+                    "supported_schema": 9,
                 }
             ),
             encoding="utf-8",
@@ -930,7 +930,7 @@ def test_upgrade_script_verifies_schema8_capabilities(tmp_path: Path) -> None:
         th = threading.Thread(target=srv.serve_forever, daemon=True)
         th.start()
         try:
-            # Missing 0.6.0 capabilities must fail verification on schema 8
+            # Missing 0.6.0 capabilities must fail verification on schema 9
             with pytest.raises(upgrade_mod.UpgradeError, match="mismatch"):
                 upgrade_mod.verify(backup_dir)
 

@@ -728,7 +728,7 @@ def test_disconnect_fencing_blocks_409_and_reconciles_both_found_and_not_found_p
     asyncio.run(scenario())
 
 
-def test_schema7_to_schema8_migration_preserves_workflow0_to_4_semantics(tmp_path: Path):
+def test_schema7_to_schema9_migration_preserves_workflow0_to_4_semantics(tmp_path: Path):
     db_file = tmp_path / "legacy_schema7.db"
     proj_dir = tmp_path / "legacy_proj"
     proj_dir.mkdir()
@@ -777,7 +777,7 @@ def test_schema7_to_schema8_migration_preserves_workflow0_to_4_semantics(tmp_pat
     settings = Settings(data_dir=tmp_path / "migrated_state")
     db = Database(db_file, settings=settings)
     try:
-        assert db.migrate() == SCHEMA_VERSION == 8
+        assert db.migrate() == SCHEMA_VERSION == 9
         for wf_v in range(5):
             r = db.get_run(f"run_wf{wf_v}")
             assert r["workflow_version"] == wf_v
