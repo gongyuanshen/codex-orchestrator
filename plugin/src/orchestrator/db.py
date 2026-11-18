@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import posixpath
 import re
 import socket
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -15,7 +18,7 @@ from typing import Any, Iterator
 
 from orchestrator.config import Settings, get_settings
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 TASK_NAME_RE = re.compile(r"^[a-z0-9_-]{1,48}$")
 PENDING_AGENT_PATH_RE = re.compile(r"^/root/[a-z0-9_-]{1,48}$")
@@ -74,6 +77,39 @@ def _is_port_bindable(port: int, host: str = "127.0.0.1") -> bool:
         sock.close()
 
 
+def classify_project_kind(root_path: str | Path) -> str:
+    """Classify project paths without changing the stored path."""
+    path = posixpath.normpath(str(root_path).replace("\\", "/")).casefold()
+    parts = tuple(path.split("/"))
+    if any(parts[i:i + 2] == (".codex", "backups") for i in range(len(parts))):
+        return "temp"
+    if any(parts[i:i + 2] == ("docs", "verification") and "fixture" in parts[i + 2:]
+           for i in range(len(parts))):
+        return "fixture"
+    if any(parts[i:i + 3] == ("appdata", "local", "temp")
+           or parts[i:i + 2] == ("windows", "temp") for i in range(len(parts))):
+        return "temp"
+    temp_root = posixpath.normpath(tempfile.gettempdir().replace("\\", "/")).casefold()
+    return "temp" if path == temp_root or path.startswith(temp_root.rstrip("/") + "/") else "workspace"
+
+
+def _refresh_canonical_projects(conn: sqlite3.Connection, subtree: Path | None = None) -> None:
+    projects = [(Path(os.path.abspath(r["root_path"])), r) for r in conn.execute(
+        "SELECT id, root_path, is_git, canonical_project_id FROM projects ORDER BY rowid ASC"
+    )]
+    roots: dict[Path, str] = {}
+    for path, project in sorted(projects, key=lambda entry: len(entry[0].parts)):
+        canonical_id = project["canonical_project_id"]
+        if subtree is None or path.is_relative_to(subtree):
+            canonical_id = next((roots[parent] for parent in path.parents if parent in roots), None)
+            if canonical_id and (project["is_git"] or (path / ".git").exists()):
+                canonical_id = None
+            if project["canonical_project_id"] != canonical_id:
+                conn.execute("UPDATE projects SET canonical_project_id = ? WHERE id = ?",
+                             (canonical_id, project["id"]))
+        roots.setdefault(path, canonical_id or project["id"])
+
+
 def _project_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -81,6 +117,10 @@ def _project_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "name": row["name"],
         "is_git": bool(row["is_git"]),
         "created_at": row["created_at"],
+        "codex_project_id": row["codex_project_id"],
+        "codex_project_name": row["codex_project_name"],
+        "project_kind": row["project_kind"],
+        "canonical_project_id": row["canonical_project_id"],
     }
 
 
@@ -94,6 +134,11 @@ def _run_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "metadata": _json_loads(row["metadata_json"], {}),
         "metadata_json": row["metadata_json"],
         "workflow_version": row["workflow_version"],
+        "session_id": row["session_id"],
+        "turn_id": row["turn_id"],
+        "session_seq": row["session_seq"],
+        "trigger_prompt": row["trigger_prompt"],
+        "execution_root": row["execution_root"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -171,6 +216,22 @@ def _workspace_from_row(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+_SESSION_BINDINGS_SQL = """
+CREATE TABLE IF NOT EXISTS session_run_bindings (
+    session_id TEXT,
+    run_id TEXT NOT NULL,
+    project_root TEXT NOT NULL,
+    last_stop_blocked_key TEXT,
+    updated_at REAL NOT NULL,
+    is_primary INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (session_id, run_id)
+)
+"""
+_SESSION_BINDINGS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_session_run_bindings_run
+    ON session_run_bindings (run_id, updated_at DESC)
+"""
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -182,7 +243,11 @@ CREATE TABLE IF NOT EXISTS projects (
     root_path TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     is_git INTEGER NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    codex_project_id TEXT,
+    codex_project_name TEXT,
+    project_kind TEXT NOT NULL DEFAULT 'workspace' CHECK (project_kind IN ('workspace', 'fixture', 'temp')),
+    canonical_project_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -193,7 +258,12 @@ CREATE TABLE IF NOT EXISTS runs (
     status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed', 'failed', 'archived')),
     metadata_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    session_id TEXT,
+    turn_id TEXT,
+    session_seq INTEGER NOT NULL DEFAULT 0,
+    trigger_prompt TEXT NOT NULL DEFAULT '',
+    execution_root TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS task_packets (
@@ -244,13 +314,20 @@ CREATE TABLE IF NOT EXISTS workers (
     UNIQUE (run_id, name)
 );
 
-CREATE TABLE IF NOT EXISTS session_run_bindings (
-    session_id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    project_root TEXT NOT NULL,
-    last_stop_blocked_key TEXT,
-    updated_at REAL NOT NULL
+""" + _SESSION_BINDINGS_SQL + """;
+
+CREATE TABLE IF NOT EXISTS session_turns (
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    cwd TEXT NOT NULL,
+    prompt_preview TEXT NOT NULL,
+    active_run_id TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (session_id, turn_id)
 );
+CREATE INDEX IF NOT EXISTS idx_session_turns_session_updated
+    ON session_turns (session_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS board_messages (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -290,9 +367,64 @@ CREATE INDEX IF NOT EXISTS idx_board_messages_run_seq
     ON board_messages (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_board_messages_run_channel_seq
     ON board_messages (run_id, channel, seq);
-CREATE INDEX IF NOT EXISTS idx_session_run_bindings_run
-    ON session_run_bindings (run_id, updated_at DESC);
-"""
+""" + _SESSION_BINDINGS_INDEX_SQL + ";"
+
+
+def _migrate_session_metadata(conn: sqlite3.Connection, version: int) -> None:
+    for table, additions in (
+        ("projects", {
+            "codex_project_id": "TEXT",
+            "codex_project_name": "TEXT",
+            "project_kind": "TEXT NOT NULL DEFAULT 'workspace' CHECK (project_kind IN ('workspace', 'fixture', 'temp'))",
+            "canonical_project_id": "TEXT",
+        }),
+        ("runs", {
+            "session_id": "TEXT",
+            "turn_id": "TEXT",
+            "session_seq": "INTEGER NOT NULL DEFAULT 0",
+            "trigger_prompt": "TEXT NOT NULL DEFAULT ''",
+            "execution_root": "TEXT NOT NULL DEFAULT ''",
+        }),
+    ):
+        columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in additions.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+    bindings = {r["name"]: r["pk"] for r in conn.execute("PRAGMA table_info(session_run_bindings)")}
+    if bindings["run_id"] != 2:
+        conn.execute("ALTER TABLE session_run_bindings RENAME TO session_run_bindings_v8")
+        conn.execute(_SESSION_BINDINGS_SQL)
+        # The offline upgrade gate hashes the exact old column values in rowid order.
+        conn.execute("""
+            INSERT INTO session_run_bindings
+                (rowid, session_id, run_id, project_root, last_stop_blocked_key, updated_at)
+            SELECT rowid, session_id, run_id, project_root, last_stop_blocked_key, updated_at
+            FROM session_run_bindings_v8 ORDER BY rowid ASC
+        """)
+        conn.execute("DROP TABLE session_run_bindings_v8")
+        conn.execute(_SESSION_BINDINGS_INDEX_SQL)
+    elif "is_primary" not in bindings:
+        conn.execute("ALTER TABLE session_run_bindings ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 1")
+
+    if version < 9:
+        conn.executemany(
+            "UPDATE projects SET project_kind = ? WHERE id = ?",
+            [(classify_project_kind(r["root_path"]), r["id"])
+             for r in conn.execute("SELECT id, root_path FROM projects")],
+        )
+        _refresh_canonical_projects(conn)
+        conn.execute("""
+            UPDATE runs SET session_id = (
+                SELECT b.session_id FROM session_run_bindings AS b
+                WHERE b.run_id = runs.id AND b.session_id <> ''
+                ORDER BY b.updated_at DESC, b.rowid DESC LIMIT 1
+            )
+            WHERE (session_id IS NULL OR session_id = '') AND EXISTS (
+                SELECT 1 FROM session_run_bindings AS b WHERE b.run_id = runs.id AND b.session_id <> ''
+            )
+        """)
+        conn.execute("UPDATE runs SET session_seq = 1 WHERE session_id <> '' AND session_seq = 0")
 
 
 class Database:
@@ -415,6 +547,7 @@ class Database:
     def migrate(self) -> int:
         """Create/upgrade SQLite schema idempotently and return the current schema version."""
         with self.transaction() as conn:
+            version = 0
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'").fetchone():
                 version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0]
                 if version > SCHEMA_VERSION:
@@ -454,6 +587,7 @@ class Database:
                     conn.execute(f"ALTER TABLE workspaces ADD COLUMN {column} TEXT;")
             if "workflow_version" not in {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}:
                 conn.execute("ALTER TABLE runs ADD COLUMN workflow_version INTEGER NOT NULL DEFAULT 0")
+            _migrate_session_metadata(conn, version)
             from orchestrator.workflow import install_schema
             install_schema(conn)
             from orchestrator.native_actions import install_schema as install_native_schema
@@ -508,8 +642,10 @@ class Database:
         *,
         name: str | None = None,
         is_git: bool | None = None,
+        codex_project_id: str | None = None,
+        codex_project_name: str | None = None,
     ) -> dict[str, Any]:
-        """Insert or return an existing project keyed by canonical root_path."""
+        """Insert or update a project keyed by its root path."""
         norm_root = self._normalize_root(root_path)
         resolved_name = (name or Path(norm_root).name or norm_root).strip()
         now = time.time()
@@ -529,20 +665,21 @@ class Database:
                         "UPDATE projects SET name = ? WHERE id = ?;",
                         (resolved_name, existing["id"]),
                     )
-                row = conn.execute(
-                    "SELECT * FROM projects WHERE id = ?;", (existing["id"],)
-                ).fetchone()
-                assert row is not None
-                return _project_from_row(row)
-
-            project_id = _new_id("proj")
-            conn.execute(
-                """
-                INSERT INTO projects (id, root_path, name, is_git, created_at)
-                VALUES (?, ?, ?, ?, ?);
-                """,
-                (project_id, norm_root, resolved_name, 1 if is_git else 0, now),
-            )
+                if codex_project_id is not None or codex_project_name is not None:
+                    conn.execute("""
+                        UPDATE projects SET codex_project_id = COALESCE(?, codex_project_id),
+                            codex_project_name = COALESCE(?, codex_project_name) WHERE id = ?
+                    """, (codex_project_id, codex_project_name, existing["id"]))
+                project_id = existing["id"]
+            else:
+                project_id = _new_id("proj")
+                conn.execute("""
+                    INSERT INTO projects
+                        (id, root_path, name, is_git, created_at, codex_project_id, codex_project_name, project_kind)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (project_id, norm_root, resolved_name, int(bool(is_git)), now,
+                      codex_project_id, codex_project_name, classify_project_kind(norm_root)))
+            _refresh_canonical_projects(conn, Path(norm_root))
             row = conn.execute(
                 "SELECT * FROM projects WHERE id = ?;", (project_id,)
             ).fetchone()
@@ -588,6 +725,9 @@ class Database:
         metadata: dict[str, Any] | str | None = None,
         run_id: str | None = None,
         session_id: str | None = None,
+        turn_id: str | None = None,
+        trigger_prompt: str = "",
+        execution_root: str = "",
     ) -> dict[str, Any]:
         """Create a new orchestration run, auto-registering the project when project_root is given."""
         if mode not in VALID_RUN_MODES:
@@ -603,11 +743,12 @@ class Database:
         if session_id is not None and (not isinstance(session_id, str) or not session_id.strip()):
             raise ValueError("session_id must be a non-empty string when provided")
 
+        clean_session = session_id.strip() if session_id is not None else None
         meta_json = _json_dumps(metadata, "{}")
-        now = time.time()
         rid = run_id or _new_id("run")
 
         with self.transaction() as conn:
+            now = time.time()
             resolved_project_id = project_id
             resolved_root_path: str
             if resolved_project_id is None:
@@ -625,17 +766,18 @@ class Database:
                     raise NotFoundError(f"Project not found: {resolved_project_id}")
                 resolved_root_path = str(proj_row["root_path"])
 
-            conn.execute(
-                """
-                INSERT INTO runs (id, project_id, mode, title, status, metadata_json, created_at, updated_at, workflow_version)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 5);
-                """,
-                (rid, resolved_project_id, mode, title, status, meta_json, now, now),
-            )
-            if session_id is not None:
+            session_seq = self._next_session_seq(conn, clean_session) if clean_session is not None else 0
+            conn.execute("""
+                INSERT INTO runs
+                    (id, project_id, mode, title, status, metadata_json, created_at, updated_at, workflow_version,
+                     session_id, turn_id, session_seq, trigger_prompt, execution_root)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 5, ?, ?, ?, ?, ?)
+            """, (rid, resolved_project_id, mode, title, status, meta_json, now, now,
+                  clean_session, turn_id, session_seq, trigger_prompt, execution_root))
+            if clean_session is not None:
                 self._upsert_session_binding_in_tx(
                     conn,
-                    session_id=session_id.strip(),
+                    session_id=clean_session,
                     run_id=rid,
                     project_root=resolved_root_path,
                     now=now,
@@ -1780,7 +1922,32 @@ class Database:
             "project_root": row["project_root"],
             "last_stop_blocked_key": row["last_stop_blocked_key"],
             "updated_at": row["updated_at"],
+            "is_primary": bool(row["is_primary"]),
         }
+
+    @staticmethod
+    def _next_session_seq(conn: sqlite3.Connection, session_id: str) -> int:
+        return int(conn.execute(
+            "SELECT COALESCE(MAX(session_seq), 0) + 1 FROM runs WHERE session_id = ?", (session_id,)
+        ).fetchone()[0])
+
+    _SESSION_BINDING_ORDER = """
+        ORDER BY b.is_primary DESC, (r.status = 'active') DESC, b.updated_at DESC, b.rowid DESC
+    """
+
+    @staticmethod
+    def _session_binding_row(
+        conn: sqlite3.Connection, session_id: str, run_id: str | None
+    ) -> sqlite3.Row | None:
+        if run_id is not None:
+            return conn.execute(
+                "SELECT * FROM session_run_bindings WHERE session_id = ? AND run_id = ?",
+                (session_id, run_id),
+            ).fetchone()
+        return conn.execute("""
+            SELECT b.* FROM session_run_bindings AS b LEFT JOIN runs AS r ON r.id = b.run_id
+            WHERE b.session_id = ? AND b.is_primary = 1
+        """ + Database._SESSION_BINDING_ORDER + " LIMIT 1", (session_id,)).fetchone()
 
     def _upsert_session_binding_in_tx(
         self,
@@ -1790,28 +1957,17 @@ class Database:
         run_id: str,
         project_root: str,
         now: float | None = None,
+        is_primary: bool = True,
     ) -> dict[str, Any]:
         ts = float(now) if now is not None else time.time()
-        norm_root = self._normalize_root(project_root)
-        conn.execute(
-            """
-            INSERT INTO session_run_bindings (session_id, run_id, project_root, last_stop_blocked_key, updated_at)
-            VALUES (?, ?, ?, NULL, ?)
-            ON CONFLICT (session_id) DO UPDATE SET
-                run_id = excluded.run_id,
-                project_root = excluded.project_root,
-                last_stop_blocked_key = CASE
-                    WHEN session_run_bindings.run_id = excluded.run_id THEN session_run_bindings.last_stop_blocked_key
-                    ELSE NULL
-                END,
-                updated_at = excluded.updated_at;
-            """,
-            (session_id, run_id, norm_root, ts),
-        )
-        row = conn.execute(
-            "SELECT * FROM session_run_bindings WHERE session_id = ?;",
-            (session_id,),
-        ).fetchone()
+        conn.execute("""
+            INSERT INTO session_run_bindings (session_id, run_id, project_root, updated_at, is_primary)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (session_id, run_id) DO UPDATE SET
+                project_root = excluded.project_root, updated_at = excluded.updated_at,
+                is_primary = excluded.is_primary
+        """, (session_id, run_id, self._normalize_root(project_root), ts, int(is_primary)))
+        row = self._session_binding_row(conn, session_id, run_id)
         assert row is not None
         return self._session_binding_from_row(row)
 
@@ -1820,6 +1976,8 @@ class Database:
         session_id: str,
         run_id: str,
         project_root: str | Path | None = None,
+        *,
+        is_primary: bool = True,
     ) -> dict[str, Any]:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a non-empty string")
@@ -1828,59 +1986,94 @@ class Database:
         clean_session = session_id.strip()
         clean_run = run_id.strip()
         with self.transaction() as conn:
-            run_row = conn.execute(
-                "SELECT project_id FROM runs WHERE id = ?;", (clean_run,)
-            ).fetchone()
+            run_row = conn.execute("""
+                SELECT r.session_id, p.root_path FROM runs AS r JOIN projects AS p ON p.id = r.project_id
+                WHERE r.id = ?
+            """, (clean_run,)).fetchone()
             if run_row is None:
                 raise NotFoundError(f"Run not found: {clean_run}")
+            if not run_row["session_id"]:
+                conn.execute(
+                    "UPDATE runs SET session_id = ?, session_seq = ? WHERE id = ?",
+                    (clean_session, self._next_session_seq(conn, clean_session), clean_run),
+                )
+            resolved_root = run_row["root_path"]
             if project_root is not None and str(project_root).strip():
-                resolved_root = self._normalize_root(project_root)
-            else:
-                proj_row = conn.execute(
-                    "SELECT root_path FROM projects WHERE id = ?;",
-                    (run_row["project_id"],),
-                ).fetchone()
-                if proj_row is None:
-                    raise NotFoundError(f"Project not found: {run_row['project_id']}")
-                resolved_root = str(proj_row["root_path"])
+                resolved_root = str(project_root)
             return self._upsert_session_binding_in_tx(
-                conn,
-                session_id=clean_session,
-                run_id=clean_run,
-                project_root=resolved_root,
+                conn, session_id=clean_session, run_id=clean_run,
+                project_root=resolved_root, is_primary=is_primary,
             )
 
-    def get_session_binding(self, session_id: str) -> dict[str, Any] | None:
+    def get_session_binding(self, session_id: str, run_id: str | None = None) -> dict[str, Any] | None:
         if not isinstance(session_id, str) or not session_id.strip():
             return None
         with self.read_connection() as conn:
-            row = conn.execute(
-                "SELECT * FROM session_run_bindings WHERE session_id = ?;",
-                (session_id.strip(),),
-            ).fetchone()
+            row = self._session_binding_row(conn, session_id.strip(), run_id)
             return self._session_binding_from_row(row) if row is not None else None
 
+    def list_session_bindings(self, session_id: str) -> list[dict[str, Any]]:
+        with self.read_connection() as conn:
+            rows = conn.execute("""
+                SELECT b.* FROM session_run_bindings AS b LEFT JOIN runs AS r ON r.id = b.run_id
+                WHERE b.session_id = ?
+            """ + self._SESSION_BINDING_ORDER, (session_id.strip(),))
+            return [self._session_binding_from_row(row) for row in rows]
+
     def update_session_stop_blocked_key(
-        self, session_id: str, blocked_key: str | None
+        self, session_id: str, blocked_key: str | None, *, run_id: str | None = None
     ) -> dict[str, Any]:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a non-empty string")
         clean_session = session_id.strip()
-        now = time.time()
         with self.transaction() as conn:
-            existing = conn.execute(
-                "SELECT * FROM session_run_bindings WHERE session_id = ?;",
-                (clean_session,),
-            ).fetchone()
+            existing = self._session_binding_row(conn, clean_session, run_id)
             if existing is None:
                 raise NotFoundError(f"Session binding not found: {clean_session}")
-            conn.execute(
-                "UPDATE session_run_bindings SET last_stop_blocked_key = ?, updated_at = ? WHERE session_id = ?;",
-                (blocked_key, now, clean_session),
-            )
-            row = conn.execute(
-                "SELECT * FROM session_run_bindings WHERE session_id = ?;",
-                (clean_session,),
-            ).fetchone()
+            bound_run_id = existing["run_id"]
+            conn.execute("""
+                UPDATE session_run_bindings SET last_stop_blocked_key = ?, updated_at = ?
+                WHERE session_id = ? AND run_id = ?
+            """, (blocked_key, time.time(), clean_session, bound_run_id))
+            row = self._session_binding_row(conn, clean_session, bound_run_id)
             assert row is not None
             return self._session_binding_from_row(row)
+
+    def upsert_session_turn(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        cwd: str,
+        prompt_preview: str,
+        active_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("turn_id must be a non-empty string")
+        clean_session, clean_turn = session_id.strip(), turn_id.strip()
+        with self.transaction() as conn:
+            now = time.time()
+            conn.execute("""
+                INSERT INTO session_turns
+                    (session_id, turn_id, cwd, prompt_preview, active_run_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (session_id, turn_id) DO UPDATE SET
+                    cwd = excluded.cwd, prompt_preview = excluded.prompt_preview,
+                    active_run_id = excluded.active_run_id, updated_at = excluded.updated_at
+            """, (clean_session, clean_turn, cwd, prompt_preview, active_run_id, now, now))
+            row = conn.execute(
+                "SELECT * FROM session_turns WHERE session_id = ? AND turn_id = ?",
+                (clean_session, clean_turn),
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def list_session_turns(self, session_id: str) -> list[dict[str, Any]]:
+        with self.read_connection() as conn:
+            rows = conn.execute("""
+                SELECT * FROM session_turns WHERE session_id = ?
+                ORDER BY updated_at DESC, rowid DESC
+            """, (session_id.strip(),))
+            return [dict(row) for row in rows]
