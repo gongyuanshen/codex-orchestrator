@@ -882,14 +882,15 @@ def create_app(
 
         run = database.get_run(ws["run_id"])
         project = database.get_project(run["project_id"]) if run else None
-        allowed = False
-        if project is not None:
-            proj_root = Path(project["root_path"]).resolve(strict=False)
-            if ws_path.is_relative_to(proj_root / WORKSPACES_DIRNAME) or ws_path.parent.name == WORKSPACES_DIRNAME:
-                allowed = True
-        if not allowed and ws_path.parent.name == WORKSPACES_DIRNAME:
-            allowed = True
-        if not allowed:
+        roots = [project["root_path"], run["execution_root"]] if project else []
+        manifest = ws["snapshot_manifest"]
+        if isinstance(manifest, dict) and manifest.get("project_root"):
+            # Existing workspaces may be anchored at an explicit source or Git toplevel.
+            roots.append(manifest["project_root"])
+        allowed_parents = [
+            Path(root).resolve(strict=False) / WORKSPACES_DIRNAME for root in roots if root
+        ]
+        if not any(parent in ws_path.parents for parent in allowed_parents):
             raise PermissionError(
                 f"Refusing to open non-workspace directory outside {WORKSPACES_DIRNAME}: {ws_path}"
             )

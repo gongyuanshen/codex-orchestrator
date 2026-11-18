@@ -83,7 +83,8 @@ def classify_project_kind(root_path: str | Path) -> str:
     parts = tuple(path.split("/"))
     if any(parts[i:i + 2] == (".codex", "backups") for i in range(len(parts))):
         return "temp"
-    if any(parts[i:i + 2] == ("docs", "verification") and "fixture" in parts[i + 2:]
+    if any(parts[i:i + 2] == ("docs", "verification")
+           and any(part in {"fixture", "fixture-project"} for part in parts[i + 2:])
            for i in range(len(parts))):
         return "fixture"
     if any(parts[i:i + 3] == ("appdata", "local", "temp")
