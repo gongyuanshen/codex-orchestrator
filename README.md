@@ -61,12 +61,12 @@ codex plugin add tri-orchestrator@tri-orchestrator
 安装后将自动完成以下过程：
 - Codex 按所选市场版本缓存 `./plugin/`；当前版本为 `0.6.0`，对应缓存 `~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.6.0/`。
 - 首次触发 MCP 时，Codex 在插件缓存目录内自动执行 `uv run --quiet --project . python -m orchestrator.mcp_shim`，安装运行时依赖（`mcp`、`starlette`、`uvicorn`、`httpx`）并拉起后台单例守护进程。
-- **零脚本角色回退契约：** 若 `~/.codex/agents/*.toml` 中未安装专用角色配置，`$boost`、`$teamwork` 与 `$swarm` 在调用 `spawn_agent` 时会**省略 `agent_type` 参数**（不要传 `agent_type="default"`），按角色档位显式传入 `reasoning_effort`（`planner="xhigh"`，`verifier` / `investigator` / `interviewer` / `challenger="high"`，`coder` / `swarm_worker="medium"`，且绝不硬编码 `model`），并在提示词中内联完整角色契约。
+- **零脚本角色回退契约：** 若 `~/.codex/agents/*.toml` 中未安装专用角色配置，`$boost`、`$teamwork` 与 `$swarm` 在调用 `spawn_agent` 时会**省略 `agent_type` 参数**（不要传 `agent_type="default"`），同时**省略 `model` 与 `reasoning_effort`**（100% 继承当前主会话的模型与思考档位，绝不硬编码模型或思考档位），并在提示词中内联完整角色契约。
 
 ### 方式 B — 可选完整角色配置、V2 开启、钩子自检与缓存预热
 
 克隆本仓库后运行平台安装脚本，可额外获得：
-1. 将全部 6 个专用角色配置（`plugin/agents/*.toml`，预设调优后的 `model_reasoning_effort` 与只读角色 `sandbox_mode`）安装至 `~/.codex/agents/`（始终继承当前 Codex 会话模型，不硬编码任何模型名）；
+1. 将全部 6 个专用角色配置（`plugin/agents/*.toml`，仅配置角色职责与只读角色 `sandbox_mode`）安装至 `~/.codex/agents/`（始终 100% 继承当前 Codex 主会话的模型与思考档位 `model_reasoning_effort`，不硬编码任何模型名或思考档位）；
 2. 创建带时间戳备份与基线备份后，安全合并 `[agents]` 并发限制（`max_threads = 6`、`max_depth = 2`）与 `[features]` 多代理开关（`multi_agent = true`、`multi_agent_v2 = true`）至 `~/.codex/config.toml`，并通过 `codex --strict-config` 校验；
 3. 在 Codex 插件缓存目录（`~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.6.0/`）中预热 `uv sync --no-dev`，生成全部 6 个 `tri-orchestrator-{mcp,daemon,verify,hook,challenge,pipeline}` 可执行入口，同时不修改仓库内任何受追踪文件；
 4. 通过 `codex app-server --stdio` 执行 `hooks/list` 自检，核实 4 个生命周期钩子（`sessionStart`、`postCompact`、`userPromptSubmit`、`stop`）已被原生发现。默认保留 `untrusted` 状态供用户在 Codex 桌面端一键点击信任；自动化或纯 CLI 环境可显式附加 `-TrustPluginHooks`（PowerShell）或 `--trust-plugin-hooks`（Bash）将信任哈希写入 `[hooks.state]`。
@@ -100,7 +100,7 @@ bash scripts/install.sh
 | 技能指令 | 编排定位 | 适用场景 |
 | :--- | :--- | :--- |
 | **`$boost`** | 自适应单目标极速执行：智能路由单兵直达或按需委派、逐字锁定需求、独立 `verifier` 挑战验收与主协调者抽检，以及同线程返工闭环。 | 聚焦型修复、小中型功能或局部重构（1–2 文件单兵或定向调度 `investigator` / `coder` / `verifier`）。 |
-| **`$teamwork`** | 结构化端到端协同交付流水线：需求访谈澄清（`interviewer`，支持 `[skip-interview]` 跳过）、`xhigh` 架构规划与互斥 `file_ownership` 文件所有权矩阵（`planner`）、隔离工作区并行开发（`coder`）、双层验收（`verifier`）、同线程返工与逐里程碑顺序合入。 | 需严格冻结需求规格且零文件写冲突的中大型多模块交互式研发任务。 |
+| **`$teamwork`** | 结构化端到端协同交付流水线：需求访谈澄清（`interviewer`，支持 `[skip-interview]` 跳过）、架构规划与互斥 `file_ownership` 文件所有权矩阵（`planner`）、隔离工作区并行开发（`coder`）、双层验收（`verifier`）、同线程返工与逐里程碑顺序合入。 | 需严格冻结需求规格且零文件写冲突的中大型多模块交互式研发任务。 |
 | **`$swarm`** | 基于 SQLite `#seq` 频道（`main`、`#backend`、`#ui`、`#verify` 等）的多成员蜂窝并发协同、增量游标 `board_read(since_seq)`、紧凑 `board_status(compact=True)` 状态同步、看门狗停滞分类与 Web 实时人工干预。 | 需要成员间点对点交接、交互式协同与实时可观测性的并行工作流。 |
 | **`$pipeline`** | 宿主终端确定性自动闭环 DAG 管线：冻结 `pipeline_spec.json` 后由 `tri-orchestrator-pipeline` CLI 驱动独立隔离的 `codex app-server --listen stdio://` 工作线程，自动完成并发/拓扑切片、独立只读验收、最多 3 轮同线程返工、串行合入与 `--resume-run` 断点续跑。 | 多模块批量重构、长时无人值守批处理、需要消除根会话中继 Token 开销或关窗后台续跑的确定性工程任务。 |
 

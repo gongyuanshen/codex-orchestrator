@@ -227,6 +227,7 @@ import pathlib, sys, tomllib
 p = pathlib.Path(sys.argv[1])
 d = tomllib.loads(p.read_text(encoding="utf-8"))
 assert "model" not in d, f"Hardcoded model forbidden in {p}"
+assert "model_reasoning_effort" not in d, f"Hardcoded model_reasoning_effort forbidden in {p}"
 assert d.get("name") and d.get("description") and d.get("developer_instructions"), f"Missing required fields in {p}"
 PY
 done

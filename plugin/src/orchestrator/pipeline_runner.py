@@ -334,6 +334,13 @@ def validate_pipeline_spec(raw_spec: Any) -> dict[str, Any]:
     if raw_spec.get("model") is not None:
         model = _validate_nonempty_str(raw_spec["model"], "model")
 
+    effort: str | None = None
+    raw_effort = raw_spec.get("effort")
+    if raw_effort is None:
+        raw_effort = raw_spec.get("reasoning_effort")
+    if raw_effort is not None:
+        effort = _validate_nonempty_str(raw_effort, "effort")
+
     default_profile = _default_env_profile()
     if raw_spec.get("env_profile") is not None:
         top_env_profile = _validate_nonempty_str(raw_spec["env_profile"], "env_profile")
@@ -541,6 +548,7 @@ def validate_pipeline_spec(raw_spec: Any) -> dict[str, Any]:
         "max_workers": max_workers,
         "allow_network": allow_network,
         "model": model,
+        "effort": effort,
         "env_profile": top_env_profile,
         "dep_mode": top_dep_mode,
         "steps": topo_steps,
@@ -1521,7 +1529,7 @@ class PipelineRunner:
         cwd: Path,
         role: str,
         model: str | None,
-        effort: str,
+        effort: str | None,
         allow_network: bool,
     ) -> dict[str, Any] | None:
         assert self._rpc is not None and self._appserver is not None
@@ -1775,6 +1783,7 @@ class PipelineRunner:
         verifier_name: str,
         cwd: Path,
         model: str | None,
+        effort: str | None = None,
         existing_tid: str | None = None,
     ) -> str:
         assert self._appserver is not None
@@ -1786,7 +1795,7 @@ class PipelineRunner:
             started_ver = await self._appserver.start_verifier_thread(
                 cwd,
                 model=model,
-                effort="high",
+                effort=effort,
             )
             tid = str(started_ver["thread_id"])
             self._worker_threads[verifier_name] = tid
@@ -1838,6 +1847,7 @@ class PipelineRunner:
             verifier_name=verifier_name,
             cwd=verifier_cwd,
             model=spec["model"],
+            effort=spec.get("effort"),
             existing_tid=verifier_tid,
         )
         if author_tid and resolved_v_tid == author_tid:
@@ -1960,7 +1970,7 @@ class PipelineRunner:
             cwd=verifier_cwd,
             role="verifier",
             model=spec["model"],
-            effort="high",
+            effort=spec.get("effort"),
             allow_network=False,
         )
         if v_turn is None:
@@ -2176,7 +2186,7 @@ class PipelineRunner:
                                 started_author = await self._appserver.start_author_thread(
                                     author_cwd,
                                     model=spec["model"],
-                                    effort="medium",
+                                    effort=spec.get("effort"),
                                     allow_network=spec["allow_network"],
                                 )
                                 author_tid = str(started_author["thread_id"])
@@ -2359,7 +2369,7 @@ class PipelineRunner:
                             cwd=author_cwd,
                             role="author",
                             model=spec["model"],
-                            effort="medium",
+                            effort=spec.get("effort"),
                             allow_network=spec["allow_network"],
                         )
                         if author_turn is None:
@@ -2746,7 +2756,7 @@ class PipelineRunner:
                                 cwd=project_root,
                                 role="verifier",
                                 model=spec["model"],
-                                effort="high",
+                                effort=spec.get("effort"),
                                 allow_network=False,
                             )
                         except AppServerError:
@@ -3069,13 +3079,13 @@ class PipelineRunner:
                 fresh = await self._appserver.start_verifier_thread(
                     role_cwd,
                     model=spec["model"],
-                    effort="high",
+                    effort=spec.get("effort"),
                 )
             else:
                 fresh = await self._appserver.start_author_thread(
                     role_cwd,
                     model=spec["model"],
-                    effort="medium",
+                    effort=spec.get("effort"),
                     allow_network=spec["allow_network"],
                 )
             new_wire_tid = str(fresh["thread_id"])
@@ -3186,7 +3196,7 @@ class PipelineRunner:
                             cwd=role_cwd,
                             role=role_tag,
                             model=spec["model"],
-                            effort="high" if role_tag == "verifier" else "medium",
+                            effort=spec.get("effort"),
                             allow_network=False if role_tag == "verifier" else spec["allow_network"],
                         )
                     except AppServerError as exc:

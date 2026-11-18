@@ -1373,7 +1373,7 @@ def test_resume_run_skips_done_steps_and_finishes_remaining_dag(tmp_path: Path) 
     assert original_step2_tid in resumed_map
     assert resumed_map[original_step2_tid]["excludeTurns"] is True
     assert "persistExtendedHistory" not in resumed_map[original_step2_tid]
-    assert resumed_map[original_step2_tid]["config"] == {"model_reasoning_effort": "medium"}
+    assert "config" not in resumed_map[original_step2_tid]
 
 
 def test_cli_subprocess_binary_end_to_end_execution(tmp_path: Path) -> None:

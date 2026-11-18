@@ -298,6 +298,7 @@ actual_roles = set()
 for tf in sorted((root / "plugin" / "agents").glob("*.toml")):
     data = tomllib.loads(tf.read_text(encoding="utf-8"))
     assert "model" not in data, f"Hardcoded model forbidden in {tf.name}"
+    assert "model_reasoning_effort" not in data, f"Hardcoded model_reasoning_effort forbidden in {tf.name}"
     assert data.get("name") and data.get("description") and data.get("developer_instructions"), f"Missing required fields in {tf.name}"
     actual_roles.add(tf.stem)
 assert actual_roles == expected_roles, f"Role mismatch: {actual_roles} != {expected_roles}"
