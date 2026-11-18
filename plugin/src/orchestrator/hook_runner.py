@@ -3,8 +3,8 @@
 Design & Safety Red-Lines (M9 / Section 3.4.2):
 1. Pure Python stdlib implementation for sub-100ms cold startup.
 2. Strict `<= 1.5s` HTTP timeout against `/api/rpc` ONLY (bypassing system proxies on loopback).
-   If the `18790` daemon is offline, unreachable, slow, or returns any error, IMMEDIATELY
-   exit `0` silently — NEVER auto-spawn or touch the daemon or SQLite files directly!
+   If the daemon is unavailable, emit only local startup or explicit mode context;
+   NEVER auto-spawn the daemon or touch SQLite files directly!
 3. All stdout payloads conform 100% to Codex `0.166.0-alpha.5.1` wire JSON schemas
    (`additionalProperties: false`):
    - `SessionStart`: `startup` injects concise local `session_id` (`<= 220 chars`) or bound `resume_context`; `compact`/`resume` injects `hookSpecificOutput` (`hookEventName="SessionStart"`, `additionalContext <= 800 chars`)
@@ -32,6 +32,7 @@ DEFAULT_PORT = 18790
 MAX_RPC_TIMEOUT_SEC = 1.5
 DEFAULT_RPC_TIMEOUT_SEC = 1.2
 MAX_RESUME_CONTEXT_CHARS = 800
+MAX_PROMPT_PREVIEW_CHARS = 160
 MAX_STOP_REASON_CHARS = 500
 
 SUPPORTED_HOOK_EVENTS = frozenset({
@@ -487,16 +488,50 @@ def build_hook_stdout_json(
         if source in NON_RESUME_SESSION_START_SOURCES:
             return None
 
-    invoked_mode: str | None = None
     if event_name == "UserPromptSubmit":
-        invoked_mode = detect_explicit_mode_invocation(str(payload.get("prompt") or ""))
+        turn_id = str(payload.get("turn_id") or "").strip()
+        prompt = str(payload.get("prompt") or "")
+        invoked_mode = detect_explicit_mode_invocation(prompt)
+        if invoked_mode is None and not turn_id:
+            return None
+
+        rpc_url = resolve_rpc_url(env)
+        turn_result = None
+        if rpc_url:
+            turn_result = call_daemon_rpc(
+                rpc_url,
+                "session_hook_check",
+                {
+                    "session_id": session_id,
+                    "event_name": event_name,
+                    "cwd": cwd,
+                    "turn_id": turn_id,
+                    "prompt_preview": truncate_chars(" ".join(prompt.split()), MAX_PROMPT_PREVIEW_CHARS),
+                    "has_mode_invocation": invoked_mode is not None,
+                },
+                timeout_sec=clamp_timeout(timeout_sec, env),
+            )
         if invoked_mode is None:
             return None
 
+        context = f"[tri-orchestrator] Active Codex root session_id={session_id}"
+        if turn_id:
+            context += f" turn_id={turn_id}"
+        context += f" for ${invoked_mode}"
+        if turn_result and turn_result.get("bound") and turn_result.get("resume_context"):
+            context += f" | {turn_result['resume_context']}"
+        else:
+            context += f' (pass session_id="{session_id}" to run_create / workflow_prepare_dispatch).'
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": truncate_chars(context, max_chars=MAX_RESUME_CONTEXT_CHARS),
+            }
+        }
+
     rpc_url = resolve_rpc_url(env)
     if not rpc_url:
-        # Daemon URL cannot be resolved — for SessionStart(startup) and UserPromptSubmit,
-        # still inject local session_id so downstream hooks have a binding.
+        # Startup still carries the local session_id if the RPC URL is invalid.
         if event_name == "SessionStart":
             source = str(payload.get("source") or "").strip().lower()
             if source == "startup":
@@ -510,17 +545,6 @@ def build_hook_stdout_json(
                         ),
                     }
                 }
-        if event_name == "UserPromptSubmit" and invoked_mode is not None:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": truncate_chars(
-                        f"[tri-orchestrator] Active Codex root session_id={session_id} for ${invoked_mode} "
-                        f"(pass session_id=\"{session_id}\" to run_create / workflow_prepare_dispatch).",
-                        max_chars=MAX_RESUME_CONTEXT_CHARS,
-                    ),
-                }
-            }
         return None
 
     deadline_timeout = clamp_timeout(timeout_sec, env)
@@ -584,19 +608,6 @@ def build_hook_stdout_json(
             }
 
     if rpc_result is None:
-        # Daemon offline, unreachable, timed out, or `session_hook_check` unavailable.
-        # For UserPromptSubmit with an explicit mode invocation, fall through to local session_id injection.
-        if event_name == "UserPromptSubmit" and invoked_mode is not None:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": truncate_chars(
-                        f"[tri-orchestrator] Active Codex root session_id={session_id} for ${invoked_mode} "
-                        f"(pass session_id=\"{session_id}\" to run_create / workflow_prepare_dispatch).",
-                        max_chars=MAX_RESUME_CONTEXT_CHARS,
-                    ),
-                }
-            }
         return None
 
     if event_name in {"SessionStart", "PostCompact"}:
@@ -627,25 +638,6 @@ def build_hook_stdout_json(
             }
         # PostCompact schema (`post-compact.command.output`) forbids `hookSpecificOutput` (`additionalProperties: false`)
         return {"systemMessage": capped}
-
-    if event_name == "UserPromptSubmit":
-        if rpc_result.get("bound") and rpc_result.get("resume_context"):
-            ctx = truncate_chars(
-                f"[tri-orchestrator session_id={session_id}] {rpc_result['resume_context']}",
-                max_chars=MAX_RESUME_CONTEXT_CHARS,
-            )
-        else:
-            ctx = truncate_chars(
-                f"[tri-orchestrator] Active Codex root session_id={session_id} for ${invoked_mode} "
-                f"(pass session_id=\"{session_id}\" to run_create / workflow_prepare_dispatch).",
-                max_chars=MAX_RESUME_CONTEXT_CHARS,
-            )
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "UserPromptSubmit",
-                "additionalContext": ctx,
-            }
-        }
 
     if event_name == "Stop":
         should_block, reason = evaluate_rpc_hook_response_for_stop(
