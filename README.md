@@ -1,310 +1,222 @@
 # 三重编排器 (Tri Orchestrator)
 
-面向 Codex 的自包含多代理编排插件，提供 **`$boost`**（极速模式）、**`$teamwork`**（协同模式）、**`$swarm`**（蜂窝模式）三种交互式原生 V2 子代理工作流，配套生命周期钩子（`SessionStart`、`PostCompact`、`UserPromptSubmit`、`Stop`），底层由本地单例 HTTP/SSE 守护进程、SQLite WAL `#seq` 消息板、`git clone --local` / 三方目录快照隔离工作区（含非破坏性冲突预检）以及极简中文 Web 控制台（`http://127.0.0.1:18790`）提供支撑。
+面向 Codex CLI / Codex Desktop 的自包含多代理编排插件，提供 **`$boost`**、**`$teamwork`**、**`$swarm`** 三种原生 V2 多代理工作流，由本地单例 HTTP/SSE 守护进程（`127.0.0.1:18790`）、SQLite WAL 状态机、`#seq` 消息板、物理隔离工作区与生命周期钩子组成。
 
-## 0.6.1 更新
+## 核心特性
 
-- **工作区、会话、任务三层视图：** 工作区切片归并到真实项目，Codex 会话内的任务按批次编号。控制台可用 `Ctrl+K` 搜索会话和触发提示词，跨项目、跨模式直达活跃任务。
-- **多轮与并发状态：** 日志区记录对话轮次，概况页展示执行目录及同项目并发直改提醒。Stop 钩子只检查当前根会话绑定的活跃任务。
-- **兼容升级（`schema 9` / `workflow5`）：** 保留旧项目 ID 和任务链接；没有会话绑定证据的历史任务仍显示为「未绑定会话任务」。
-
-## 0.6.0 历史更新
-
-- **原子宏工具与首轮直达（`workflow5` / `schema 8`）：** 新增 `workflow_prepare_dispatch`、`native_action_record_call`、`workflow_author_turn`、`workflow_verifier_turn`、`workflow_closeout_run` 与 `session_bind`，将工作区创建、派发登记、作者接收/提交、双层验收与全流程收尾压缩为原子事务，消除子代理首轮 `waiting-only` 空转，并将 `board_status(compact=True)` 轮询载荷缩减约 74%–82%。
-- **生命周期钩子与单一清单收敛（`tri-orchestrator-hook`）：** 移除旧版根级 `plugin/plugin.json`，统一收敛至 `plugin/.codex-plugin/plugin.json` 并声明 `plugin/hooks/hooks.json`，支持 `SessionStart`、`PostCompact`、`UserPromptSubmit`、`Stop` 四类钩子，实现冷启动本地 `session_id` 注入、上下文压缩后自动恢复与未收尾工作流单次防早退拦截；守护进程离线时静默零副作用退出，绝不自动拉起后台服务。
-- **高复杂并发盲审采集（`tri-orchestrator-challenge`）：** 新增宿主侧只读并发盲审采集器，配合 `tri-orchestrator-verify` 为四维高复杂审查（`specification` / `code` / `stress` / `evidence`）生成带 64 位 SHA-256 摘要的硬回执。
-- **Codex V2 原生对齐与平滑升级：** 安装脚本自动幂等启用 `multi_agent = true` 与 `multi_agent_v2 = true`，执行 `hooks/list` 四钩子自检，并支持可选 `-TrustPluginHooks` / `--trust-plugin-hooks`；全套提供 **35 个公开 MCP 工具**与 **5 个 CLI 可执行程序**（`tri-orchestrator-{mcp,daemon,verify,hook,challenge}`），`schema 7 -> 8` 升级 100% 原值保留全部历史任务与 `workflow0..4` 门禁规则。
-
-## 0.5.0 历史更新
-
-- **可靠派发：** 记录原生代理调用的领取、开始、结果和核对过程，区分“尚未调用”和“结果未知”。
-- **真实验收：** 新增命令行采集器 `tri-orchestrator-verify`，保存真实退出码、输出和绑定当前产物的验收回执。
-- **协同交接：** 计划准入检查文件冲突，紧凑交接包保留关键状态，结构化审查关联具体发现与返工。
-- **更直接的工作流：** Boost 按任务难度选择执行路径；批量消息和停滞分类帮助协调者处理待办。
-- **兼容升级：** 新增工作流版本 4，保留旧任务规则；统一提供 29 个 MCP 工具，数据库版本为 7，并修复 Windows 后台进程启动问题。
-
-交互式日常任务由主助手通过 Codex 原生 V2 工具创建和控制代理；`18790` 守护进程仅提供持久状态、隔离工作区、门禁与观测，绝不暴露任何任意命令执行 RPC，也不会独立接管原生子代理。
-
-`tri-orchestrator-verify` 与 `tri-orchestrator-challenge` 均由宿主侧或验收者在终端运行，不通过后台服务执行任意命令。验收命令和工作目录由产物清单冻结，仅白名单环境变量键名（`env_profile`），绝不序列化环境变量值。
-
-## Route A 历史交付（0.3.0）
-
-正式服务新增可靠收件箱、版本绑定的候选／集成验收、步骤检查点和最多3轮自动返工。原生代理仍由根协调者投递、唤醒和中断；消息回执不是独立验收。
-
-- 新建任务采用结构化流程2；既有流程0/1保留各自合同，不补造PASS。Boost挑战绑定当前产物与原验收者；Teamwork逐里程碑集成及指定接手方确认；Swarm执行消息绑定步骤、任务包、返工轮次与合同。
-- 27个统一MCP工具中，新增 `inbox_send/get/ack/wait`、`workflow_step_save/advance`、`artifact_capture`、`verification_record`。严格执行顺序见 [共享工作流合同](plugin/skills/route-a-workflow.md)。
-- 文件或任务包变化会使旧验收失效。工作区必须通过候选门禁后合入，并通过集成门禁后清理；中途失败必须显式核对，不自动重放。
-- 所有模式仍共用18790和各自入口。登记状态、实际宿主观察及观察过期明确分开；心跳不会自动证明模型仍在运行。
-- `scripts/upgrade.py` 提供 `prepare/apply/verify/rollback` 的受控离线包辅助流程：所有模式无活动任务、服务停止和备份核验后才允许写入。它不会修改Codex注册表配置、停止服务、重命名版本化缓存或假装完成宿主安装激活。旧版缓存不得直接伪装成新版本。
-- 一旦新版产生真实新数据，拒绝用旧备份覆盖回滚，保留数据进行前向修复；进行中的旧会话不承诺即时热刷新，需要时请重开会话或手动重载。
-
-## 前置依赖
-
-- **Codex CLI**（支持插件机制、V2 子代理与生命周期钩子的 `codex`）
-- **[`uv`](https://docs.astral.sh/uv/)**（在插件缓存目录中自动管理 Python `>=3.12` 独立运行时）
-- **`git`**（用于本地克隆工作区隔离；非 Git 目录使用三方目录快照）
+- **三种编排工作流**：按任务规模选择 `$boost`（单目标极速执行）、`$teamwork`（澄清规划 + 分模块协同）或 `$swarm`（多成员并行 + 频道交接）。
+- **物理工作区隔离**：Git 仓库使用 `git clone --local` 隔离分支，非 Git 目录使用三方快照隔离；合入前执行非破坏性冲突预检（`workspace_merge_preview`）。
+- **硬验收与并发盲审**：通过 `tri-orchestrator-verify` 冻结产物清单与命令输出生成 SHA-256 验收回执，并支持 `tri-orchestrator-challenge` 只读并发盲审。
+- **Codex 原生会话对齐**：只读桥接本地 Codex 项目与会话标题，按「工作区项目 → Codex 会话 → 编排轮次」三层归并展示，隔离多会话并发与 `Stop` 钩子检查。
+- **实时中文 Web 控制台**：提供多模式控制台（`/boost`、`/teamwork`、`/swarm`）、`Ctrl+K` 跨项目跨模式检索、协作图回放、成员状态与工作区 Diff 检查器。
 
 ---
 
-## 安装指南
+## 环境要求
 
-### 方式 A — 零脚本 GitHub 开箱即用安装
+- **Codex CLI**（支持插件机制、原生 V2 子代理与生命周期钩子）
+- **[`uv`](https://docs.astral.sh/uv/)**（管理 Python `>=3.12` 运行环境）
+- **`git`**（用于 Git 工作区克隆隔离与合并；非 Git 目录自动回退到目录快照）
 
-以下零脚本流程适用于首次安装。已有旧 Schema 运行库时，先结束活跃任务，再按 `scripts/upgrade.py` 的受控流程备份并离线迁移；新守护进程不会在启动时迁移旧库。不要覆盖旧版本的 Codex 托管缓存。
+---
 
-在 Windows、macOS 或 Linux 上直接通过 Codex CLI 从 GitHub 安装，无需运行任何本地脚本：
+## 安装与升级
+
+### 方式一：通过 Codex CLI 直接安装（零脚本）
+
+适用于首次安装，无需本地克隆仓库或运行额外脚本：
 
 ```bash
 codex plugin marketplace add gongyuanshen/codex-orchestrator
 codex plugin add tri-orchestrator@tri-orchestrator
 ```
 
-安装后将自动完成以下过程：
-- Codex 按所选市场版本缓存 `./plugin/`；例如 `0.6.1` 对应缓存 `~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.6.1/`。
-- 首次触发 MCP 时，Codex 在插件缓存目录内自动执行 `uv run --quiet --project . python -m orchestrator.mcp_shim`，安装运行时依赖（`mcp`、`starlette`、`uvicorn`、`httpx`）并拉起后台单例守护进程。
-- **零脚本角色回退契约：** 若 `~/.codex/agents/*.toml` 中未安装专用角色配置，`$boost`、`$teamwork` 与 `$swarm` 在调用 `spawn_agent` 时会**省略 `agent_type` 参数**（不要传 `agent_type="default"`），同时**省略 `model` 与 `reasoning_effort`**（100% 继承当前主会话的模型与思考档位，绝不硬编码模型或思考档位），并在提示词中内联完整角色契约。
+安装完成后：
+- Codex 会将 `./plugin/` 缓存到本地插件目录（`~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/<version>/`）。
+- 首次触发 MCP 工具时，Codex 自动执行 `uv run --quiet --project . python -m orchestrator.mcp_shim` 初始化依赖并拉起后台单例守护进程。
+- 若未安装专用角色 TOML，`$boost`、`$teamwork` 与 `$swarm` 调用 `spawn_agent` 时会省略 `agent_type`、`model` 与 `reasoning_effort`，直接继承当前主会话配置并在提示词中内联角色契约。
 
-### 方式 B — 可选完整角色配置、V2 开启、钩子自检与缓存预热
+### 方式二：运行仓库安装脚本（完整角色与钩子配置）
 
-克隆本仓库后运行平台安装脚本，可额外获得：
-1. 将全部 6 个专用角色配置（`plugin/agents/*.toml`，仅配置角色职责与只读角色 `sandbox_mode`）安装至 `~/.codex/agents/`（始终 100% 继承当前 Codex 主会话的模型与思考档位 `model_reasoning_effort`，不硬编码任何模型名或思考档位）；
-2. 创建带时间戳备份与基线备份后，安全合并 `[agents]` 并发限制（`max_threads = 6`、`max_depth = 2`）与 `[features]` 多代理开关（`multi_agent = true`、`multi_agent_v2 = true`）至 `~/.codex/config.toml`，并通过 `codex --strict-config` 校验；
-3. 在对应版本的 Codex 插件缓存目录预热 `uv sync --no-dev`，生成全部 5 个 `tri-orchestrator-{mcp,daemon,verify,hook,challenge}` 可执行入口，同时不修改仓库内任何受追踪文件；
-4. 通过 `codex app-server --stdio` 执行 `hooks/list` 自检，核实 4 个生命周期钩子（`sessionStart`、`postCompact`、`userPromptSubmit`、`stop`）已被原生发现。默认保留 `untrusted` 状态供用户在 Codex 桌面端一键点击信任；自动化或纯 CLI 环境可显式附加 `-TrustPluginHooks`（PowerShell）或 `--trust-plugin-hooks`（Bash）将信任哈希写入 `[hooks.state]`。
+克隆仓库后运行平台脚本，可额外完成 6 个角色 TOML（`~/.codex/agents/`）安装、安全启用 `multi_agent` 与 `multi_agent_v2`、缓存依赖预热以及 `hooks/list` 四钩子自检：
 
 **Windows（PowerShell）：**
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/install.ps1
-# 可选：在 CLI 环境下直接信任 4 个插件生命周期钩子
-# powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -TrustPluginHooks
-```
-
-可选 Windows 端到端验证：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/verify_e2e.ps1
+# 如需在 CLI 中直接写入钩子信任哈希，可附加 -TrustPluginHooks
 ```
 
 **macOS / Linux（Bash）：**
 
 ```bash
 bash scripts/install.sh
-# 可选：在 CLI 环境下直接信任 4 个插件生命周期钩子
-# bash scripts/install.sh --trust-plugin-hooks
+# 如需在 CLI 中直接写入钩子信任哈希，可附加 --trust-plugin-hooks
 ```
+
+### 旧版本运行库升级
+
+如果本地已存在旧版 Schema 运行库，需先结束全部活跃任务并停止守护进程，再使用 `scripts/upgrade.py` 执行受控备份与离线升级，最后通过 Codex 重新安装插件：
+
+```bash
+python scripts/upgrade.py prepare --source-plugin ./plugin --target-plugin <old-plugin-dir> --data-dir <data-dir> --backup-dir <backup-dir>
+python scripts/upgrade.py apply --backup-dir <backup-dir>
+python scripts/upgrade.py verify --backup-dir <backup-dir>
+```
+
+> 守护进程冷启动不会自动迁移旧版 Schema，也不要直接覆盖旧版托管缓存目录；升级遇到新数据写入后拒绝用旧备份回滚，保留数据进行前向修复。
 
 ---
 
-## 工作流（`$boost`、`$teamwork`、`$swarm`）
+## 编排工作流
 
 | 技能指令 | 编排定位 | 适用场景 |
 | :--- | :--- | :--- |
-| **`$boost`** | 自适应单目标极速执行：智能路由单兵直达或按需委派、逐字锁定需求、独立 `verifier` 挑战验收与主协调者抽检，以及同线程返工闭环。 | 聚焦型修复、小中型功能或局部重构（1–2 文件单兵或定向调度 `investigator` / `coder` / `verifier`）。 |
-| **`$teamwork`** | 结构化端到端协同交付流水线：需求访谈澄清（`interviewer`，支持 `[skip-interview]` 跳过）、架构规划与互斥 `file_ownership` 文件所有权矩阵（`planner`）、隔离工作区并行开发（`coder`）、双层验收（`verifier`）、同线程返工与逐里程碑顺序合入。 | 需严格冻结需求规格且零文件写冲突的中大型多模块交互式研发任务。 |
-| **`$swarm`** | 基于 SQLite `#seq` 频道（`main`、`#backend`、`#ui`、`#verify` 等）的多成员蜂窝并发协同、增量游标 `board_read(since_seq)`、紧凑 `board_status(compact=True)` 状态同步、看门狗停滞分类与 Web 实时人工干预。 | 需要成员间点对点交接、交互式协同与实时可观测性的并行工作流。 |
+| **`$boost`** | 单目标极速执行：路由单兵直达或定向委派，锁定契约、独立 `verifier` 验收与返工闭环。 | 聚焦修复、小中型功能或局部重构。 |
+| **`$teamwork`** | 结构化协同流水线：需求澄清（`interviewer`，支持 `[skip-interview]`）→ 规划与互斥文件所有权（`planner`）→ 隔离开发（`coder`）→ 双层验收（`verifier`）→ 逐里程碑合入。 | 需冻结规格且多模块并行、零文件写冲突的中大型任务。 |
+| **`$swarm`** | 基于 `#seq` 频道与持久游标的多成员并发协同、停滞分类与人工实时干预。 | 需要多成员点对点交接与实时协同观测的并行任务。 |
 
 ---
 
-### 工作区模式与依赖边界
+## Web 控制台（`http://127.0.0.1:18790`）
 
-- `mode="git_clone"` 才要求在分配的分支提交、报告真实 commit SHA，并在验收/合并前保持 Git 工作树干净。`mode="snapshot"` 的 `branch_name=None` 正常；合并前 `dirty=true` 表示相对基线有改动，应检查 `workspace_diff`、文件所有权和真实测试输出，不要求提交或初始化 Git。
-- 两种模式都先 `workspace_merge_preview` 再 `workspace_merge(strategy="merge")`；snapshot 执行三方目录比较与应用。合入后完成主目录集成验证，再由 `workspace_cleanup` 按对应模式核验已合入且工作区未新增改动，不能用 Git 的干净工作树要求阻断快照验收。
-- `dep_mode="none"` 不配置依赖目录。需要独立依赖文件时使用 `copy`；`fresh_venv_uv` 创建新的 `.venv`，依赖包需在其中安装，不负责创建 `node_modules`。
-- `link_ro_cache` 的名称保留兼容，实际使用目录链接/硬链接（无法链接时复制），是**共享可写**依赖，不是只读或写入隔离。经链接写入可能修改源项目依赖；需隔离依赖写入时使用 `copy` 或 `fresh_venv_uv`。
-- `$boost` Solo 验收失败由协调者本人修复，再交同一个 verifier；Delegation 则交原 coder 返工，再交原 verifier。静态技能契约测试只检查文档约束，不证明原生代理已执行完整闭环。
+守护进程启动后，在浏览器访问 **`http://127.0.0.1:18790`**（各模式共用同一服务与数据库，入口仅作展示分区）：
 
-## 架构概览
+- **模式入口**：[`/boost`](http://127.0.0.1:18790/boost)、[`/teamwork`](http://127.0.0.1:18790/teamwork)、[`/swarm`](http://127.0.0.1:18790/swarm)，支持携带 `run_id` 链接直达历史任务。
+- **三层导航与全局检索**：按「真实工作区 → Codex 会话 → 编排轮次」组织侧栏与顶部选择器；支持 `Ctrl+K` 跨项目、跨模式直达活跃任务，并标记同项目非隔离直改并发风险。
+- **概况与日志**：展示任务状态、触发原话、执行目录与轮次介入分隔，支持全文展开及 `.md` / `.json` 运行报告导出。
+- **消息板与人工干预**：按频道、`@提及` 与关键词过滤 `#seq` 消息流，底部可向 `human` 频道发送人工指令。
+- **成员与协作图**：展示冻结任务契约、互斥文件矩阵、成员心跳/卡死分类与交互式 SVG 拓扑回放图。
+- **工作区检查器**：查看文件变更与统一 Diff，执行冲突预检、打开本地目录、请求暂停/停止成员及受门禁保护的清理操作（`git push`、`reset` 与未合入强制删除端点均禁用并返回 `HTTP 403`）。
+
+---
+
+## 工作区、依赖与运行边界
+
+- **工作区隔离模式**：
+  - `mode="git_clone"` 需要在分配分支提交真实 commit SHA，并在验收/合入前保持工作树干净。
+  - `mode="snapshot"` 下 `branch_name=None` 属正常状态；合入前 `dirty=true` 表示相对基线存在改动，合入与清理按三方目录快照基线核验。
+  - 两种模式均应先执行 `workspace_merge_preview`，再执行 `workspace_merge(strategy="merge")` 与 `workspace_cleanup`。
+- **依赖目录策略（`dep_mode`）**：
+  - `none` 不配置依赖目录；需要独立依赖副本时使用 `copy`。
+  - `fresh_venv_uv` 创建全新 `.venv` 供测试安装依赖，不负责创建 `node_modules`。
+  - `link_ro_cache` 为兼容历史保留的命名，底层采用目录链接/硬链接（失败时复制），属于**共享可写**依赖而非只读隔离；需要写入隔离时请改用 `copy` 或 `fresh_venv_uv`。
+- **控制、重试与结果传递语义**：
+  - 守护进程与看门狗不会自动代调或重启原生代理，也不会自动跨步骤重放结果未知的写操作；人工文字消息不会自动投递给子代理，暂停/结束请求由协调者在工具边界读取并执行原生中断后回执。
+  - 成员状态由协调者登记，不通过后台扫描原生进程推断；守护进程不会修改 Codex 的模型或网络代理配置。
+  - 当 MCP 单次返回体超过 stdio 内联预算时，完整 JSON 会原子落盘至运行时目录 `results/` 下，并返回含路径、字节数与 SHA-256 的 `delivery: "file"` 回执（直接读取结果文件，勿重复重放写操作）。
+
+---
+
+## 架构与目录结构
 
 ```text
 Codex CLI / V2 Subagents / Lifecycle Hooks
-   │  stdio JSON-RPC（MCP shim） / 本地 HTTP RPC（hook）
+   │  stdio JSON-RPC (mcp_shim) / 本地 HTTP RPC (hook_runner)
    ▼
-5 个 CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
-   │  daemon.lock 互斥锁（msvcrt / fcntl）-> 自动拉起唯一后台守护进程（hook 离线绝不拉起）
+CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
+   │  daemon.lock 互斥锁（hook 在守护进程离线时静默退出，不自动拉起服务）
    ▼
 单例 HTTP/SSE 守护进程（127.0.0.1:18790）
    ├── /api/rpc & /api/tools   ──► RpcDispatcher（35 个公开 MCP 工具 + 1 个内部钩子 RPC）
-   ├── /api/events             ──► EventBus（SSE 实时事件流）
-   ├── /                       ──► Boost / Teamwork / Swarm 入口选择
-   ├── /boost, /teamwork, /swarm ──► 各模式控制台
-   ├── Watchdog Loop           ──► workflow5/4 进展分类与需处理告警；旧合同保留心跳规则
-   ├── SQLite WAL Engine       ──► schema 9（projects、runs、session_run_bindings、
-   │                               session_turns、task_packets、workers、board_messages、workspaces 等）
-   └── WorkspaceManager        ──► .swarm-workspaces/<run>-<worker>
-                                   （git clone --local / 三方快照 + 端口池）
+   ├── /api/sessions, /projects, /runs & /api/events（SSE 实时流）
+   ├── /, /boost, /teamwork, /swarm（中文 Web 控制台）
+   ├── Watchdog Loop           ──► 进展分类与卡死/人工决策告警
+   ├── SQLite WAL Engine       ──► schema 9（projects, runs, session_turns,
+   │                               session_run_bindings, task_packets, workers,
+   │                               board_messages, workspaces 等）
+   └── WorkspaceManager        ──► .swarm-workspaces/<run>-<worker> + 端口池
 ```
-
-### 仓库目录结构
 
 ```text
 .
-├── .agents/plugins/marketplace.json            # Codex 插件市场目录（指向 ./plugin）
-├── plugin/                                     # 自包含可分发插件包（v0.6.1）
-│   ├── .codex-plugin/plugin.json               # 唯一 Codex 插件清单（元数据、skills、hooks、mcpServers）
-│   ├── .mcp.json                               # Codex MCP 覆盖配置（env_vars、超时设置）
-│   ├── mcp.json                                # MCP 启动配置（${PLUGIN_ROOT}）
-│   ├── hooks/hooks.json                        # 4 类生命周期钩子声明（SessionStart, PostCompact, UserPromptSubmit, Stop）
-│   ├── pyproject.toml & uv.lock                # Python 运行时包（>=3.12）与 5 个 CLI 脚本入口定义
-│   ├── agents/*.toml                           # 6 个角色配置（interviewer, planner, investigator, coder, verifier, swarm_worker）
-│   ├── assets/{icon.svg,logo.svg}              # 插件图标资源
-│   ├── skills/
-│   │   ├── route-a-workflow.md                 # 共享工作流合同（workflow5 原子宏与 workflow1..4 兼容分支）
-│   │   └── {boost,teamwork,swarm}/             # 3 个显式工作流技能（SKILL.md）
-│   └── src/orchestrator/                       # 守护进程、MCP shim、宏 RPC、钩子、挑战运行器、Web 控制台
-├── scripts/                                    # 跨平台安装脚本（install.ps1 / install.sh）、卸载、受控升级与 E2E 验证脚本
-├── tests/                                      # 单元、契约与真实 codex.exe 端到端回归测试套件
-└── pyproject.toml & uv.lock                    # 仓库根开发/测试配置（可编辑安装 plugin + pytest）
+├── .agents/plugins/marketplace.json   # Codex 本地市场清单
+├── plugin/                            # 自包含 Codex 插件包
+│   ├── .codex-plugin/plugin.json      # 插件元数据、skills/hooks/mcp 声明
+│   ├── .mcp.json & mcp.json           # Codex MCP 启动配置
+│   ├── hooks/hooks.json               # SessionStart / PostCompact / UserPromptSubmit / Stop
+│   ├── agents/*.toml                  # 6 个角色定义（interviewer/planner/investigator/coder/verifier/swarm_worker）
+│   ├── skills/                        # route-a-workflow.md 与 {boost,teamwork,swarm}/SKILL.md
+│   ├── src/orchestrator/              # 守护进程、MCP shim、桥接器、钩子、验收/盲审运行器与 Web 前端
+│   └── pyproject.toml & uv.lock       # 插件运行时依赖与 CLI 入口定义
+├── scripts/                           # install.ps1 / install.sh / uninstall.ps1 / upgrade.py / verify_e2e.ps1
+├── tests/                             # 单元、契约、UI 与端到端测试套件
+└── pyproject.toml & uv.lock           # 仓库开发与测试环境配置
 ```
 
 ---
 
-## CLI 可执行程序（5 个）
+## CLI 可执行程序与 MCP 工具
+
+### CLI 入口（5 个）
 
 | 可执行程序 | 入口模块 | 用途说明 |
 | :--- | :--- | :--- |
-| `tri-orchestrator-mcp` | `orchestrator.mcp_shim:main` | Codex stdio MCP 桥接层，按互斥锁自动确保本地单例守护进程在线并转发 35 个公开 MCP 工具。 |
-| `tri-orchestrator-daemon` | `orchestrator.daemon:main` | 本地单例 HTTP/SSE 守护进程（默认 `127.0.0.1:18790`），承载 SQLite WAL 状态机与中文 Web 控制台。 |
-| `tri-orchestrator-verify` | `orchestrator.verify_runner:main` | 终端硬验收采集器，按冻结产物清单与 `env_profile` 键名白名单执行测试命令并输出 SHA-256 `receipt.json`。 |
-| `tri-orchestrator-hook` | `orchestrator.hook_runner:main` | 生命周期钩子运行器（`SessionStart` / `PostCompact` / `UserPromptSubmit` / `Stop`），硬超时 `<=1.5s`，守护进程离线时静默 `exit 0`。 |
-| `tri-orchestrator-challenge` | `orchestrator.challenge_runner:main` | 宿主侧只读并发盲审采集器（并发上限 `<=4`），校验源码零突变并产出带 SHA-256 的挑战报告。 |
+| `tri-orchestrator-mcp` | `orchestrator.mcp_shim:main` | Codex stdio MCP 桥接层，按互斥锁确保单例守护进程在线并转发 MCP 工具调用。 |
+| `tri-orchestrator-daemon` | `orchestrator.daemon:main` | 本地 HTTP/SSE 守护进程，承载 SQLite WAL 状态机与 Web 控制台。 |
+| `tri-orchestrator-verify` | `orchestrator.verify_runner:main` | 终端验收采集器，按冻结清单与白名单 `env_profile` 执行命令并输出 SHA-256 `receipt.json`。 |
+| `tri-orchestrator-hook` | `orchestrator.hook_runner:main` | 生命周期钩子运行器（硬超时 `<=1.5s`，离线静默 `exit 0`）。 |
+| `tri-orchestrator-challenge` | `orchestrator.challenge_runner:main` | 宿主侧只读并发盲审采集器，校验零源码突变并生成挑战回执。 |
+
+### 公开 MCP 工具（35 个）
+
+> `/api/rpc` 另保留 1 个内部接口 `session_hook_check` 供本地 `tri-orchestrator-hook` 调用，不暴露于模型 `tools/list`。
+
+| 分类 | 工具列表 |
+| :--- | :--- |
+| **运行与会话** | `run_create`、`run_update`、`run_list`、`session_bind` |
+| **任务契约** | `task_packet_save`、`task_packet_get` |
+| **消息板 (`#seq`)** | `board_post`、`board_read`、`board_status`、`board_channel_list` |
+| **成员与控制** | `worker_register`、`worker_heartbeat`、`worker_status_update`、`worker_control_ack` |
+| **原生派发账本** | `workflow_prepare_dispatch`、`native_action_record_call`、`native_action_update` |
+| **持久收件箱** | `inbox_send`、`inbox_get`、`inbox_ack`、`inbox_wait` |
+| **工作流与验收** | `workflow_step_save`、`workflow_step_advance`、`workflow_author_turn`、`workflow_verifier_turn`、`artifact_capture`、`verification_record`、`workflow_review`、`workflow_closeout_run` |
+| **隔离工作区** | `workspace_create`、`workspace_status`、`workspace_diff`、`workspace_merge_preview`、`workspace_merge`、`workspace_cleanup` |
 
 ---
 
-## MCP 工具（35 个公开工具）
-
-> 注：除下方 35 个公开 MCP 工具外，`/api/rpc` 另保留 1 个内部只读/单次门禁查询接口 `session_hook_check` 供本地 `tri-orchestrator-hook` 调用，不向模型 `tools/list` 暴露以节省上下文。
-
-| 分类 | 工具名 | 功能说明 |
-| :--- | :--- | :--- |
-| **运行与会话管理** | `run_create` | 创建 `boost` / `teamwork` / `swarm` 运行实例（默认 `workflow5`），支持绑定根会话 `session_id` 并返回 `cli_executables`。 |
-| | `run_update` | 更新运行状态（`active`、`completed`、`failed`、`archived`）、`title` 或 `metadata`。 |
-| | `run_list` | 按 `project_id`、`status` 或 `mode` 筛选并列出运行记录。 |
-| | `session_bind` | 将宿主根会话 `session_id` 显式绑定至指定 `run_id` 与 `project_root`，供生命周期钩子精确关联。 |
-| **任务契约** | `task_packet_save` | 持久化单调递增版本的任务契约（`goal`、`file_ownership`、`acceptance_criteria`）。 |
-| | `task_packet_get` | 获取指定运行最新（或指定 `version`）的任务契约。 |
-| **消息板 (`#seq`)** | `board_post` | 发布消息、差异或测试报告至指定频道（`main`、`#verify` 等），返回紧凑指针 `{seq, channel, mentions, summary}`。 |
-| | `board_read` | 按 `since_seq` 或 `reader_name` 游标增量读取消息（支持 `advance_cursor=true`）。 |
-| | `board_status` | 只读返回成员状态、待办、核对项、进展分类与 `cli_executables`；支持 `compact=true` 大幅裁剪轮询载荷，不隐式 ACK。 |
-| | `board_channel_list` | 列出当前运行的活跃频道及消息计数。 |
-| **成员管理** | `worker_register` | 绑定真实 Codex V2 `/root/<task_name>` 身份并注册/更新成员节点。 |
-| | `worker_heartbeat` | 刷新成员心跳时间戳并清除 `stalled_alerted` 告警标记。 |
-| | `worker_status_update` | 变更成员状态（`waiting`、`working`、`stopped`、`killed`）。 |
-| | `worker_control_ack` | 协调者或管线运行器执行原生中断后，提交带真实结果的 `applied` / `failed` 回执；只有 `applied` 原子更新成员状态。 |
-| **原子派发与转交账本** | `workflow_prepare_dispatch` | 单事务原子完成工作区创建、成员预登记、步骤保存/推进、收件箱投递与原生调用领取（支持 `workflow5` 首轮直达与延迟 `verifier`）。 |
-| | `native_action_record_call` | 原子将宿主调用原始回执落盘、由服务端计算 64 位 SHA-256 摘要并完成转交确认/对账（自动回填 `workflow5` 子代理路径）。 |
-| | `native_action_update` | 细粒度领取/开始/记录/核对原生转交账本；支持冻结收件人批量，工具自身不调用宿主或完成业务。 |
-| **持久收件箱** | `inbox_send` | 发送绑定收件人和步骤版本的持久消息，同 `key` 同 `payload` 幂等。 |
-| | `inbox_get` | 按稳定消息 ID 读取完整内容及回执历史。 |
-| | `inbox_ack` | 记录 `accepted` / `completed` / `failed` 或明确取消；消息回执不等于独立验收。 |
-| | `inbox_wait` | 有界异步等待未终态消息，不隐式 ACK；已 `accepted` 工作需核对而非盲重放。 |
-| **工作流、宏回合与证据** | `workflow_step_save` | 创建或显式修订冻结步骤；乐观锁版本检查、原绑定与预算保留，强制文件所有权互斥准入。 |
-| | `workflow_step_advance` | 按门禁推进、观察、交接/精确 ACK 或生成本地单次修订边界；不伪造原生调用。 |
-| | `workflow_author_turn` | 作者端原子宏：单事务打包 `inbox_ack`、成员工作态切换、步骤 `accept` / `submit` 及可选消息板摘要发布。 |
-| | `workflow_verifier_turn` | 验收端原子宏：`prepare`（确认收件、切换工作态、捕获产物并返回 `verify_executable`）或 `record`（自动挑战绑定、校验真实回执并记录裁决）。 |
-| | `artifact_capture` | 捕获候选/集成源码指纹与冻结命令清单（支持 `env_profile="windows_minimal_py" \| "posix_minimal_py"` 键名白名单）。 |
-| | `verification_record` | 原 `verifier` 追加不可变逐项验收及 `tri-orchestrator-verify` 采集回执；仅消息板 PASS 不能通过门禁。 |
-| | `workflow_review` | 只读 `challenger` 记录映射发现；原 `verifier` 核实 FAIL、驳回或解决，原作者返工预算不变。 |
-| | `workflow_closeout_run` | 协调者收尾原子宏：单次受门禁校验调用完成全部已通过集成审查步骤的 `complete`、干净工作区清理、成员 `stopped` 与运行 `completed`。 |
-| **隔离工作区** | `workspace_create` | 在 `.swarm-workspaces/` 下创建隔离的 `git clone --local`（或三方快照）工作区并分配测试端口（`18800..18999`）。 |
-| | `workspace_status` | 返回工作区脏标记、领先提交数及变更文件列表。 |
-| | `workspace_diff` | 返回文件变更状态及统一 Diff 文本。 |
-| | `workspace_merge_preview` | 非破坏性合并冲突预检（`git merge-tree --write-tree` 或三方快照），不改动主仓库。 |
-| | `workspace_merge` | Git 模式合并/cherry-pick 已提交的干净分支；snapshot 模式按基线执行三方目录合并，冲突不写入。 |
-| | `workspace_cleanup` | 核验已成功合入且工作区无合入后的新增改动；按 Git 提交证据或 snapshot 基线检查，再删除工作区目录。 |
-
----
-
-## 中文 Web 控制台（`http://127.0.0.1:18790`）
-
-### 任务概览与按需详情
-
-首页提供三个模式入口，共用一个服务和数据库，不额外占用端口：
-
-- [`/boost`](http://127.0.0.1:18790/boost)：聚焦单个目标，直接执行或按需委派，再独立验收。
-- [`/teamwork`](http://127.0.0.1:18790/teamwork)：先澄清与规划，再按模块分工开发和验收。
-- [`/swarm`](http://127.0.0.1:18790/swarm)：多成员并行，通过频道交接与汇总进展。
-
-每个入口只列出对应模式的任务，默认先展示任务概览：任务状态、成员职责与已登记工作、最近动态。顶部“项目 / 任务”用于选择工作目录及其中的一次编排记录；无指定上下文时优先选择本模式进行中的任务。日志全文按需展开，协作图、工作区检查和人工消息入口仍保留。
-
-旧版 `/?project_id=...&run_id=...` 或仅带 `run_id` 的链接会按任务实际模式跳转；超过最近 100 条的历史任务也可通过链接打开。指定错误的模式、项目或不存在的任务会明确报错，不会自动替换成另一任务。切换模式使用独立页面导航，项目内无本模式任务时显示空状态。当前任务的实时更新仍由 SSE 接收；新建任务通过“立即同步”刷新列表。模式入口是展示分区，不是权限、进程或存储隔离。
-
-成员状态是协调者登记的状态，不是后台直接探测原生代理进程。恢复旧任务时，应显式重新登记成员及当前工作；发布消息本身不恢复成员状态。
-
-摘要快照与 `board_status` 不返回内部文件哈希清单，摘要快照不扫描工作目录。未执行详细检查的文件变更数显示为“未检查”，不等于零变更；需要时打开工作区详情读取差异。完整 manifest 仍保存在数据库中供差异与合并使用。
-
-MCP shim 拉起守护进程后，可在浏览器打开 **`http://127.0.0.1:18790`** 使用 Antigravity 极简风格中文控制台：
-
-- **项目/任务选择与浅/深色主题**：切换仓库项目与运行实例，查看编排模式、健康状态与 SSE 连接状态；支持浅/深色主题、一键同步与导出 `.md` / `.json` 运行报告。
-- **`消息板` 视图**：支持按频道（`全部` / `主频道` / `人工` / 自定义频道）、`@提及`（含中文相邻提及识别）与关键词检索过滤连续消息流（含转义安全的 Markdown 渲染、跳至最新与自动滚动开关），并在底部提供悬浮人工干预输入框向 `human` 频道实时发送指令（`POST /api/runs/{run_id}/human-message`）。
-- **`成员` 视图**：顶部全宽展示冻结的任务契约目标、验收标准与互斥文件所有权矩阵；下方按活跃与已结束分组显示成员图标、职责角色、执行归属徽章、1 秒级心跳延迟、卡死告警、分配端口与未合入文件数。
-- **`协作图` 视图**：基于 `#seq` 消息与成员动态生成的交互式 SVG 拓扑协作图，支持时间轴滑块与自动回放（`▶` / `⏸`）、隐藏未活跃成员及 `@all` 广播边展开，点击或悬停节点可高亮关联协作路径。
-- **侧滑工作区检查器（`工作区检查`）**：点击成员行或顶栏开关即可滑出右侧检查器，查看工作区元数据、文件变更列表及统一 Diff，并严格限定 4 类安全操作（合并冲突预检、打开本地目录、请求暂停/结束任务，等待协调者执行并回执，保留文件、仅针对已合入且干净工作区的清理与 HTTP `409` 拦截）。危险操作端点（`git push`、`reset`、未合入强制删除）均被显式禁止并返回 `HTTP 403`。
-
-### 运行时环境变量（`TRI_ORCH_*`）
+## 运行时环境变量
 
 | 变量名 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `TRI_ORCH_HOST` | `127.0.0.1` | 守护进程监听主机。 |
+| `TRI_ORCH_HOST` | `127.0.0.1` | 守护进程监听地址。 |
 | `TRI_ORCH_PORT` | `18790` | 守护进程 HTTP/SSE 端口。 |
-| `TRI_ORCH_DATA_DIR` | `%LOCALAPPDATA%\tri-orchestrator`（Windows）<br>`~/.local/share/tri-orchestrator`（POSIX） | 运行时数据目录，存放 `state.db`、`daemon.lock`、`daemon.pid.json`、`shim.log` 与 `daemon.log`。 |
-| `TRI_ORCH_STALL_SEC` | `300` | 默认成员心跳卡死告警阈值（秒）。 |
-| `TRI_ORCH_WATCHDOG_INTERVAL_SEC` | `15` | 看门狗后台巡检间隔（秒）。 |
-| `TRI_ORCH_PORT_RANGE` | `18800..18999` | 分配给隔离工作区的测试端口池范围。 |
-| `TRI_ORCH_HOOK_TIMEOUT_SEC` | `1.5` | `tri-orchestrator-hook` 访问本地守护进程的超时秒数（硬上限封顶为 `1.5` 秒）。 |
+| `TRI_ORCH_DATA_DIR` | `%LOCALAPPDATA%\tri-orchestrator`（Windows）<br>`~/.local/share/tri-orchestrator`（POSIX） | 运行时数据目录（`state.db`、`daemon.lock`、`daemon.pid.json`、`results/`、日志等）。 |
+| `TRI_ORCH_STALL_SEC` | `300` | 成员心跳停滞告警阈值（秒）。 |
+| `TRI_ORCH_WATCHDOG_INTERVAL_SEC` | `15` | 看门狗巡检间隔（秒）。 |
+| `TRI_ORCH_PORT_RANGE` | `18800..18999` | 隔离工作区测试端口池范围。 |
+| `TRI_ORCH_HOOK_TIMEOUT_SEC` | `1.5` | `tri-orchestrator-hook` 本地 RPC 超时上限（秒，最大 `1.5`）。 |
 
 ---
 
-## 开发与测试
+## 开发测试与卸载
+
+### 运行测试
 
 ```bash
 uv run pytest -v
 ```
 
----
+### 卸载
 
-## 卸载指南
-
-### 方式 A — 零脚本卸载
+**零脚本卸载：**
 
 ```bash
 codex plugin remove tri-orchestrator@tri-orchestrator
 codex plugin marketplace remove tri-orchestrator
 ```
 
-### 方式 B — Windows 脚本卸载
-
-自动停止正在运行的守护进程、移除插件与市场注册信息、清理 `config.toml` 中与本插件关联的 `[hooks.state]` 条目及 `~/.codex/agents/` 中的 6 个角色 TOML（若存在安装前基线文件则自动还原），并支持按需恢复 `config.toml` 备份或清理运行时数据目录：
+**Windows 脚本卸载（自动停服、移除插件与市场、还原配置与角色备份）：**
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1
-# 可选参数：
-# powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1 -RestoreConfigBackup -RemoveDataDir
+# 可选参数：-RestoreConfigBackup -RemoveDataDir
 ```
 
-### macOS / Linux 清理（若曾使用 `scripts/install.sh`）
+**macOS / Linux**：执行上述 `codex plugin ...` 移除命令后，按需清理 `~/.codex/agents/` 下对应角色文件，停止 `daemon.pid.json` 进程并清理 `~/.local/share/tri-orchestrator`。
 
-先执行上方两条 `codex plugin ...` 移除命令，随后按需删除 `~/.codex/agents/` 下的 6 个角色文件（`interviewer.toml`、`planner.toml`、`investigator.toml`、`coder.toml`、`verifier.toml`、`swarm_worker.toml`），并在停止 `daemon.pid.json` 对应进程后清理 `~/.local/share/tri-orchestrator`。
+---
 
 ## 许可证
 
-MIT
-
-
-## 控制与连接语义
-
-- 控制台的暂停/结束任务是**请求**，HTTP 202 仅表示已入队。界面显示“待协调者执行”，不提前显示停止成功。未绑定真实代理身份的历史成员不能请求控制。
-- 协调者从 `board_status.control_requests` 读取请求，使用原生中断工具后再 `worker_control_ack`。失败保留原因，成员状态不变；重启不会丢失请求。结束任务表示中断并停止继续派发该成员，不表示杀死宿主 Codex 主会话。
-- 协调者在工具边界和最长 30 秒的等待前后检查请求；协调者离线、模型断网或执行长工具时仍可能延迟，界面会保持待处理，不自动伪造回执。
-- 人工文字消息只写入消息板，不会自动投递给原生代理。`$boost` 协调者须在派发/返工前、等待前后和收尾前，通过 `board_read(reader_name="coordinator", advance_cursor=False)` 读取，分别记录原始 `#seq` 的收到、拟采取行动、实际转发与后续完成证据；批次处置已记载后，再按相同 `since_seq` 和非空批次数量以 `advance_cursor=True` 推进持久游标。中断恢复时先核对收据和原生状态，不保证 exactly-once；游标前进或转发成功不等于任务完成。
-- 原生派发前的成员登记为待命；成功绑定并实际派发后才记为工作中。原生线程完成后，仍待审查/返工的成员记为待命；整个工作流收尾才记为已停止。状态来自协调者或管线运行器明确报告，不是后台直接读取 Codex 内部数据库。
-- 已停止/已终止成员和已结束运行不显示当前卡住告警；历史告警留在消息板。迟到心跳不能恢复已暂停或已终止的成员。
-- MCP 转发不重放结果未知的写请求。读超时后先核对原操作是否落地，不盲目重试。健康检查异常或已有存活但不健康实例时明确报错，不再据此拉起第二个 daemon。失败启动不得覆盖正常实例的 PID 文件。
-- 插件连接错误不会被伪装成模型连接错误，也不会自动绕过 MCP 直写数据库。Codex 模型网络、代理配置不由此插件修改。
-
-
-## Large result delivery
-
-Codex stdio is a bounded message transport, not a bulk-file channel. Small MCP results keep their original JSON schema. When the final encoded tool response exceeds the inline budget, the shim atomically stores the **complete original JSON result** under the runtime data directory's `results/` folder and returns an explicit `delivery: "file"` receipt with the absolute result path, byte count and SHA-256. This is not silent truncation. Read the local result file; do not replay a completed write tool call. File creation errors are reported as tool errors, not success.
-
-The browser HTTP API keeps its existing payload contract. No model/proxy settings or workspace files are changed by result delivery. Result files are retained for audit and can consume disk space; this release does not automatically delete them. Binary diff detection scans in bounded chunks before text decoding, and existing binary files remain visible in the diff listing.
+[MIT](LICENSE)
