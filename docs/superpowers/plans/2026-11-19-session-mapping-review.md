@@ -10,6 +10,8 @@
 
 **Spec:** [0.6.1 会话映射合入审查修复设计](../specs/2026-11-19-session-mapping-review-design.md).
 
+**交付状态（2026-11-19）：**实现提交 `5e4982a`，验收范围记录 `8c9c6f9`。下文原始任务描述保留，逐项执行结果见末尾「验收核对」。Codex 原生派发、正式候选/集成回执和正式收尾按用户要求暂缓；生产部署不在本地交付范围。
+
 ## Global Constraints
 
 - Preserve `0.6.1 / schema9 / workflow5`, tool names and strict requirements, and the original `GET /api/runs/{run_id}` response.
@@ -101,10 +103,21 @@
 - [ ] **Verify interaction red.** `.\.venv\Scripts\python.exe -m pytest -q tests/test_s3_web_ui.py` must show detached focus and missing distinct activity/warning in the added regressions.
 - [ ] **Implement interaction fixes.** In `renderProjectPopover()`, `renderRunSidebar()` and `renderCommandPalette()`, skip unchanged redraws; otherwise restore visible focused items by stable ID, not list index. Use distinct session counts when available, while retaining total active tasks and existing fallback labels. Render `#projectWriteRisk` at top-bar level and keep the existing Overview warning.
 - [ ] **Verify interaction green.** `.\.venv\Scripts\python.exe -m pytest -q tests/test_s3_web_ui.py tests/test_ui_redesign_dashboard.py`; zero failures.
-- [ ] **Verify browser behavior.** Use a temporary daemon with synthetic data only; switch cross-mode and cross-project, exercise keyboard focus during an unrelated live update, verify warning visibility across tabs against light/dark styles, and check one `/api/events` connection per tab.
+- [x] **Verify browser behavior.** Chromium isolated fixtures verified cross-project/mode navigation, dark-theme session interaction, and write-warning persistence after opening Logs. The final focus pass on `19794` verified all three selectors during real SSE-triggered DOM replacement and observed a single `/api/events` connection with no console errors.
 
 ### Final Integration Gate
 
-- [ ] `.\.venv\Scripts\python.exe -m pytest -q -rs --tb=short`: inspect all failures and skips; runtime tests use isolated ports/data. Re-run the explicit T7 using the documented temp scenario; verify project collapse, retained binding, and no live database write.
-- [ ] Confirm `node --check plugin/src/orchestrator/web/app.js`, both `uv lock --offline --check` commands, offline wheel build and extracted-wheel smoke test. Recheck `git diff --check` and excluded handoff file.
-- [ ] Request read-only follow-up review on the actual patch; no integration if important findings remain. Present integration options after fresh green results; no automatic commit or push.
+- [x] 全量回归：898 通过、2 跳过、0 失败。真机 T7 隔离副本单独通过；三个切片归并，保留一个真实绑定，另外两个未绑定。
+- [x] JavaScript 语法、两份离线锁文件、wheel 构建和解包冒烟均通过。`git diff --check` 通过，临时交接文件未入库。
+- [x] 完成独立审查并修复主要发现，复验通过后仅在 `G:\test` 本地提交；未推送、未部署。
+
+### 验收核对
+
+| 任务 | 状态 | 可核对的证据 |
+| --- | --- | --- |
+| 1. 升级门禁与测试隔离 | 已实现并验证 | `tests/test_s4_upgrade_t7.py` 的旧库拒绝启动、WAL/SHM 不变及受控升级；`tests/conftest.py` 隔离测试环境。 |
+| 2. 项目归并与执行路径 | 已实现并验证 | `tests/test_schema9_migration.py` 的旧 ID/行值保留、继承 Git 标记及 Codex 父项目；`tests/test_s2_rpc_isolation.py` 的同名前缀、符号链接和历史外部路径拒绝。 |
+| 3. 轮次归属与 SSE | 已实现并验证 | `tests/test_s3_api_sessions.py` 的触发/续聊归属、重放、全局与单任务事件隔离；历史无证据的任务不补绑。 |
+| 4. 实时控制台 | 已实现并验证 | `tests/test_s3_web_ui.py` 验证缓存、延迟响应、单连接、键盘定位和告警。最终版 Chromium 在真实 SSE 刷新确实替换 DOM 时，分别确认项目项、会话标题与命令面板结果保留焦点，且没有切换当前任务。 |
+| 原 S3 Codex 原生验收 | 暂缓 | 夹具中的候选/集成回执及 `workflow_closeout_run` 已执行；不是实际 Codex 原生验收。 |
+| 生产部署与生产 MCP 重连 | 不在本轮范围 | 生产守护进程和数据库未修改。 |
