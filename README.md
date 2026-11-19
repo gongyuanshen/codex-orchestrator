@@ -8,16 +8,12 @@
 - **多轮与并发状态：** 日志区记录对话轮次，概况页展示执行目录及同项目并发直改提醒。Stop 钩子只检查当前根会话绑定的活跃任务。
 - **兼容升级（`schema 9` / `workflow5`）：** 保留旧项目 ID 和任务链接；没有会话绑定证据的历史任务仍显示为「未绑定会话任务」。
 
-数据库副本演练及复验方法见 [0.6.1 会话映射验收](docs/verification/v0.6.1-session-mapping.md)。
-
 ## 0.6.0 历史更新
 
 - **原子宏工具与首轮直达（`workflow5` / `schema 8`）：** 新增 `workflow_prepare_dispatch`、`native_action_record_call`、`workflow_author_turn`、`workflow_verifier_turn`、`workflow_closeout_run` 与 `session_bind`，将工作区创建、派发登记、作者接收/提交、双层验收与全流程收尾压缩为原子事务，消除子代理首轮 `waiting-only` 空转，并将 `board_status(compact=True)` 轮询载荷缩减约 74%–82%。
 - **生命周期钩子与单一清单收敛（`tri-orchestrator-hook`）：** 移除旧版根级 `plugin/plugin.json`，统一收敛至 `plugin/.codex-plugin/plugin.json` 并声明 `plugin/hooks/hooks.json`，支持 `SessionStart`、`PostCompact`、`UserPromptSubmit`、`Stop` 四类钩子，实现冷启动本地 `session_id` 注入、上下文压缩后自动恢复与未收尾工作流单次防早退拦截；守护进程离线时静默零副作用退出，绝不自动拉起后台服务。
 - **高复杂并发盲审采集（`tri-orchestrator-challenge`）：** 新增宿主侧只读并发盲审采集器，配合 `tri-orchestrator-verify` 为四维高复杂审查（`specification` / `code` / `stress` / `evidence`）生成带 64 位 SHA-256 摘要的硬回执。
 - **Codex V2 原生对齐与平滑升级：** 安装脚本自动幂等启用 `multi_agent = true` 与 `multi_agent_v2 = true`，执行 `hooks/list` 四钩子自检，并支持可选 `-TrustPluginHooks` / `--trust-plugin-hooks`；全套提供 **35 个公开 MCP 工具**与 **5 个 CLI 可执行程序**（`tri-orchestrator-{mcp,daemon,verify,hook,challenge}`），`schema 7 -> 8` 升级 100% 原值保留全部历史任务与 `workflow0..4` 门禁规则。
-
-发布与验证记录见 [0.6.0 发布记录](docs/verification/github-060-20261118/report.md)、[0.6.0 隔离验收报告](docs/verification/v0.6.0-isolated-acceptance.md)、[0.6.0 二阶段与深度审计验收](docs/verification/v0.6.0-phase2-supplement-acceptance.md)、[M9 生命周期钩子实测](docs/verification/m9-hooks-spike-0.6.0.md) 与 [0.6.0 正式升级回执](docs/verification/v0.6.0-production-upgrade-receipt.md)。
 
 ## 0.5.0 历史更新
 
@@ -29,7 +25,7 @@
 
 交互式日常任务由主助手通过 Codex 原生 V2 工具创建和控制代理；`18790` 守护进程仅提供持久状态、隔离工作区、门禁与观测，绝不暴露任何任意命令执行 RPC，也不会独立接管原生子代理。
 
-历史 0.5.0 发布记录见 [0.5.0 发布记录](docs/verification/github-050-20261117/report.md)。`tri-orchestrator-verify` 与 `tri-orchestrator-challenge` 均由宿主侧或验收者在终端运行，不通过后台服务执行任意命令。验收命令和工作目录由产物清单冻结，仅白名单环境变量键名（`env_profile`），绝不序列化环境变量值。
+`tri-orchestrator-verify` 与 `tri-orchestrator-challenge` 均由宿主侧或验收者在终端运行，不通过后台服务执行任意命令。验收命令和工作目录由产物清单冻结，仅白名单环境变量键名（`env_profile`），绝不序列化环境变量值。
 
 ## Route A 历史交付（0.3.0）
 
@@ -40,11 +36,7 @@
 - 文件或任务包变化会使旧验收失效。工作区必须通过候选门禁后合入，并通过集成门禁后清理；中途失败必须显式核对，不自动重放。
 - 所有模式仍共用18790和各自入口。登记状态、实际宿主观察及观察过期明确分开；心跳不会自动证明模型仍在运行。
 - `scripts/upgrade.py` 提供 `prepare/apply/verify/rollback` 的受控离线包辅助流程：所有模式无活动任务、服务停止和备份核验后才允许写入。它不会修改Codex注册表配置、停止服务、重命名版本化缓存或假装完成宿主安装激活。旧版缓存不得直接伪装成新版本。
-- 一旦新版产生真实新数据，拒绝用旧备份覆盖回滚，保留数据进行前向修复。当前旧聊天已在新一轮加载工具并完成真实原生只读调用；这不承诺任意进行中的旧turn/旧shim即时刷新。需要手动刷新时仍由用户操作。
-
-开发和隔离验证记录：[执行台账](docs/superpowers/plans/2026-11-16-route-a-execution.md)。2026-11-17 两批已完成并受控安装0.3.0/schema5；验收及故障恢复见 [第二批交付](docs/verification/modes-20261117/report.md)。三模式真实GUI、旧聊天新turn刷新及后续修复见 [GUI与旧聊天验收](docs/verification/gui-hot-refresh-20261117/report.md)。主分支集成、三模式键盘/实时刷新与工程无障碍收尾见 [最终收尾验收](docs/verification/main-closeout-20261117/report.md)。先前 [0.2.0安装](docs/verification/install-020-20261117/report.md) 与 [安装后收尾](docs/verification/postinstall-small-fixes-20261117/report.md) 作为历史检查点保留。
-
-仓库保留开发计划和验证摘要；本地运行数据库、配置快照、原始验证日志和备份不纳入仓库。
+- 一旦新版产生真实新数据，拒绝用旧备份覆盖回滚，保留数据进行前向修复；进行中的旧会话不承诺即时热刷新，需要时请重开会话或手动重载。
 
 ## 前置依赖
 
@@ -137,8 +129,8 @@ Codex CLI / V2 Subagents / Lifecycle Hooks
    ├── /                       ──► Boost / Teamwork / Swarm 入口选择
    ├── /boost, /teamwork, /swarm ──► 各模式控制台
    ├── Watchdog Loop           ──► workflow5/4 进展分类与需处理告警；旧合同保留心跳规则
-   ├── SQLite WAL Engine       ──► schema 8（projects、runs、session_run_bindings、
-   │                               task_packets、workers、board_messages、workspaces 等）
+   ├── SQLite WAL Engine       ──► schema 9（projects、runs、session_run_bindings、
+   │                               session_turns、task_packets、workers、board_messages、workspaces 等）
    └── WorkspaceManager        ──► .swarm-workspaces/<run>-<worker>
                                    （git clone --local / 三方快照 + 端口池）
 ```
@@ -161,7 +153,6 @@ Codex CLI / V2 Subagents / Lifecycle Hooks
 │   │   └── {boost,teamwork,swarm}/             # 3 个显式工作流技能（SKILL.md）
 │   └── src/orchestrator/                       # 守护进程、MCP shim、宏 RPC、钩子、挑战运行器、Web 控制台
 ├── scripts/                                    # 跨平台安装脚本（install.ps1 / install.sh）、卸载、受控升级与 E2E 验证脚本
-├── docs/verification/                          # 版本发布记录、钩子实测、隔离验收与正式升级回执摘要
 ├── tests/                                      # 单元、契约与真实 codex.exe 端到端回归测试套件
 └── pyproject.toml & uv.lock                    # 仓库根开发/测试配置（可编辑安装 plugin + pytest）
 ```
@@ -238,13 +229,9 @@ Codex CLI / V2 Subagents / Lifecycle Hooks
 
 旧版 `/?project_id=...&run_id=...` 或仅带 `run_id` 的链接会按任务实际模式跳转；超过最近 100 条的历史任务也可通过链接打开。指定错误的模式、项目或不存在的任务会明确报错，不会自动替换成另一任务。切换模式使用独立页面导航，项目内无本模式任务时显示空状态。当前任务的实时更新仍由 SSE 接收；新建任务通过“立即同步”刷新列表。模式入口是展示分区，不是权限、进程或存储隔离。
 
-2026-11-16 已在 Swarm 全部结束后通过官方插件安装流程更新到 **0.1.2**，合并此前工作流、工作区与概览修复及三个独立入口。安装版、数据迁移与真实浏览器验收见 [安装验证记录](docs/verification/installed-20261116/report.md)；此前源码隔离证据保留在 `docs/verification/mode-entries-20261116/report.md`。
-
 成员状态是协调者登记的状态，不是后台直接探测原生代理进程。恢复旧任务时，应显式重新登记成员及当前工作；发布消息本身不恢复成员状态。
 
 摘要快照与 `board_status` 不返回内部文件哈希清单，摘要快照不扫描工作目录。未执行详细检查的文件变更数显示为“未检查”，不等于零变更；需要时打开工作区详情读取差异。完整 manifest 仍保存在数据库中供差异与合并使用。
-
-源码验证、运行审计及安装生效边界见 `docs/verification/dashboard-20261116/audit.md`。
 
 MCP shim 拉起守护进程后，可在浏览器打开 **`http://127.0.0.1:18790`** 使用 Antigravity 极简风格中文控制台：
 
@@ -314,8 +301,6 @@ MIT
 - 已停止/已终止成员和已结束运行不显示当前卡住告警；历史告警留在消息板。迟到心跳不能恢复已暂停或已终止的成员。
 - MCP 转发不重放结果未知的写请求。读超时后先核对原操作是否落地，不盲目重试。健康检查异常或已有存活但不健康实例时明确报错，不再据此拉起第二个 daemon。失败启动不得覆盖正常实例的 PID 文件。
 - 插件连接错误不会被伪装成模型连接错误，也不会自动绕过 MCP 直写数据库。Codex 模型网络、代理配置不由此插件修改。
-
-本轮实现与验证记录见 `docs/superpowers/plans/2026-11-15-reliable-control.md`。
 
 
 ## Large result delivery
