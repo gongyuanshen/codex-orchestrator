@@ -1,6 +1,7 @@
 """Factual workflow4 watchdog classifications, without synthetic host control."""
 import json
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -8,6 +9,7 @@ from orchestrator.board import BoardService
 from orchestrator.config import Settings
 from orchestrator.db import Database
 import orchestrator.watchdog as watchdog
+import orchestrator.workflow as workflow_module
 from orchestrator.workflow import WorkflowService
 
 
@@ -170,31 +172,37 @@ def test_human_direction_after_done_steps_still_requires_coordinator(case, menti
 def test_repeated_same_idle_observation_does_not_create_duplicate_persistent_alert(case):
     db, board, run, step = case
     flow = WorkflowService(db)
+    start = time.time()
     for index in range(2):
         current = flow.get_step(step['id'])
+        observed_at = start + index
         flow.step_advance(current['id'], 'observe', current['revision'], observation={
             'agent_id': current['owner_agent_id'], 'state': 'idle',
-            'observed_at': time.time(), 'evidence': 'Actual native observation ' + str(index)})
-        alerts = watchdog.StallWatchdog(db, board).scan_once()
+            'observed_at': observed_at, 'evidence': 'Actual native observation ' + str(index)})
+        alerts = watchdog.StallWatchdog(db, board).scan_once(now=observed_at)
         assert len(alerts) == (1 if index == 0 else 0)
 
 
-def test_verifier_observation_before_submit_is_not_current_review_state(case):
+def test_verifier_observation_before_submit_is_not_current_review_state(case, monkeypatch):
     db, _, run, step = case
     set_step(case, state='implementing')
     flow = WorkflowService(db)
     current = flow.get_step(step['id'])
+    now = time.time()
+    monkeypatch.setattr(workflow_module, 'time', SimpleNamespace(time=lambda: now))
     current = flow.step_advance(current['id'], 'observe', current['revision'], observation={
         'agent_id': current['verifier_agent_id'], 'state': 'idle',
-        'observed_at': time.time(), 'evidence': 'Reviewer was idle before work was submitted'})
+        'observed_at': now, 'evidence': 'Reviewer was idle before work was submitted'})
+    now += 1
     current = flow.step_advance(current['id'], 'submit', current['revision'])
-    facts = watchdog.classify_run(db, run['id'])
+    facts = watchdog.classify_run(db, run['id'], now=now)
     assert facts['classification'] == 'normal_wait'
     assert facts['alert_required'] is False
+    now += 1
     flow.step_advance(current['id'], 'observe', current['revision'], observation={
         'agent_id': current['verifier_agent_id'], 'state': 'idle',
-        'observed_at': time.time(), 'evidence': 'Current reviewer state after submit'})
-    assert watchdog.classify_run(db, run['id'])['classification'] == 'no_progress'
+        'observed_at': now, 'evidence': 'Current reviewer state after submit'})
+    assert watchdog.classify_run(db, run['id'], now=now)['classification'] == 'no_progress'
 
 
 def test_stopped_notice_only_recipient_does_not_reopen_done_work(case):

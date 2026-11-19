@@ -119,7 +119,7 @@ def _query_appserver_hooks_list(codex_exe: Path, codex_home: Path, cwd: Path) ->
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "test-m9b-hooks-list", "version": "0.6.0"},
+                    "clientInfo": {"name": "test-m9b-hooks-list", "version": "0.6.1"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -192,7 +192,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     assert manifest_path.is_file()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["name"] == "tri-orchestrator"
-    assert manifest["version"] == "0.6.0"
+    assert manifest["version"] == "0.6.1"
     assert manifest["hooks"] == "./hooks/hooks.json"
     assert manifest["skills"] == "./skills/"
     assert manifest["mcpServers"] == "./.mcp.json"
@@ -246,7 +246,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     spec.loader.exec_module(upgrade_mod)
     assert upgrade_mod.package_identity(PLUGIN_DIR) == {
         "name": "tri-orchestrator",
-        "version": "0.6.0",
+        "version": "0.6.1",
     }
     assert "pipeline_runner_v1" not in UPGRADE_PY.read_text(encoding="utf-8")
 
@@ -266,7 +266,7 @@ def test_install_ps1_rejects_legacy_dual_manifest(tmp_path: Path) -> None:
     )
     shutil.copy2(PLUGIN_DIR / "hooks" / "hooks.json", fake_plugin / "hooks" / "hooks.json")
     # Re-introduce a stale root plugin.json to confirm fail-closed detection
-    (fake_plugin / "plugin.json").write_text('{"name": "tri-orchestrator", "version": "0.6.0"}\n', encoding="utf-8")
+    (fake_plugin / "plugin.json").write_text('{"name": "tri-orchestrator", "version": "0.6.1"}\n', encoding="utf-8")
 
     codex_home = tmp_path / "codex_home"
     env = dict(
@@ -376,7 +376,7 @@ def test_real_install_hooks_list_trust_and_uninstall_e2e(tmp_path: Path) -> None
         / "cache"
         / "tri-orchestrator"
         / "tri-orchestrator"
-        / "0.6.0"
+        / "0.6.1"
         / ".venv"
         / "Scripts"
     )

@@ -28,7 +28,7 @@ from mcp.server.models import InitializationOptions
 
 from orchestrator import __version__
 from orchestrator.config import Settings, get_settings
-from orchestrator.db import SCHEMA_VERSION
+from orchestrator.db import SCHEMA_VERSION, require_runtime_schema
 from orchestrator.rpc_handlers import get_tool_definitions
 
 if os.name == "nt":
@@ -352,6 +352,7 @@ def ensure_daemon_running(
             owner = json.loads(cfg.pid_path.read_text(encoding="utf-8"))
             if _is_pid_alive(int(owner["pid"])):
                 raise RuntimeError(f"Daemon pid={owner['pid']} alive but unhealthy at {cfg.base_url}")
+        require_runtime_schema(cfg.db_path)
         _cleanup_stale_pid_file(cfg)
         logger.info("Daemon offline; spawning detached daemon on %s", cfg.base_url)
         proc = _spawn_detached_daemon(cfg)

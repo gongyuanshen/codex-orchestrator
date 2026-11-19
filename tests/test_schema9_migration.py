@@ -240,3 +240,43 @@ def test_schema8_reader_rejects_schema9_without_changes(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="Database schema 9 is newer than supported 8"):
         db_module.Database(path, settings=settings)
     assert upgrade.database_snapshot(path) == before
+
+
+def test_legacy_git_slice_and_codex_only_parent_keep_original_ids(tmp_path, monkeypatch):
+    from orchestrator import codex_bridge
+
+    workspace = tmp_path / "repo"
+    codex_root = workspace / "registered"
+    for directory in (workspace / ".git", workspace / "切片", workspace / "nested-git",
+                      codex_root / "child", workspace.with_name("repo-sibling")):
+        directory.mkdir(parents=True)
+    (workspace / "nested-git" / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")
+    path = tmp_path / "state.db"
+    _schema8_fixture(path, workspace)
+    with closing(sqlite3.connect(path)) as conn, conn:
+        conn.execute("UPDATE projects SET is_git=1 WHERE id='slice'")
+        conn.executemany("INSERT INTO projects VALUES (?, ?, ?, 0, 6)", [
+            ("codex-child", str(codex_root / "child"), "child"),
+            ("sibling", str(workspace.with_name("repo-sibling")), "sibling"),
+        ])
+    monkeypatch.setattr(codex_bridge, "list_codex_projects", lambda: [
+        {"project_id": "codex-id", "name": "Registered workspace", "root_path": str(codex_root)},
+    ])
+    upgrade = _upgrade_script()
+    before = upgrade.database_snapshot(path)
+    with db_module.Database(path) as db:
+        assert db.get_project("slice")["canonical_project_id"] == "main"
+        assert db.get_project("git-slice")["canonical_project_id"] is None
+        assert db.get_project("sibling")["canonical_project_id"] is None
+        parent = db.get_project_by_root(codex_root)
+        assert parent["name"] == "Registered workspace" and parent["canonical_project_id"] is None
+        assert db.get_project("codex-child")["canonical_project_id"] == parent["id"]
+        assert db.get_run("slice-run")["project_id"] == "slice"
+        db.ensure_project(codex_root / "child")
+        assert db.get_project("codex-child")["canonical_project_id"] == parent["id"]
+        monkeypatch.setattr(codex_bridge, "list_codex_projects", lambda: [])
+        db.reconcile_codex_projects()
+        assert db.get_project(parent["id"])["canonical_project_id"] is None
+        db.migrate()
+        assert db.get_project_by_root(codex_root)["id"] == parent["id"]
+    upgrade.require_old_rows(path, before)

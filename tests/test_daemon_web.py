@@ -233,7 +233,12 @@ def test_run_list_mode_and_project_filters_apply_before_limit(daemon_env, tmp_pa
     for mode, expected in runs.items():
         response = client.get("/api/runs", params={"project_id": expected["project_id"], "mode": mode, "limit": 1})
         assert response.status_code == 200, response.text
-        assert response.json()["runs"] == [expected]
+        [actual] = response.json()["runs"]
+        assert {key: actual[key] for key in expected} == expected
+        assert set(actual) - expected.keys() == {
+            "canonical_project_id", "concurrent_project_active_count", "concurrent_local_write_risk",
+            "codex_thread_name", "codex_project_name", "session_display_name",
+        }
         active = client.get("/api/runs", params={"mode": mode, "status": "active", "limit": 1}).json()["runs"]
         assert len(active) == 1
         assert active[0]["mode"] == mode

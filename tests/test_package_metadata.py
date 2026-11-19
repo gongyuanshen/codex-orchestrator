@@ -9,7 +9,7 @@ from orchestrator.mcp_shim import create_mcp_server
 
 
 def test_mode_enhancement_release_identity():
-    assert __version__ == '0.6.0'
+    assert __version__ == '0.6.1'
 
 
 def test_package_and_mcp_release_versions_match(tmp_path):
