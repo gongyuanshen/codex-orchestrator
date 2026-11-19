@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from orchestrator import codex_bridge
 from orchestrator.config import Settings, get_settings
 
 SCHEMA_VERSION = 9
@@ -38,6 +39,30 @@ VALID_WORKSPACE_STATUSES = frozenset(
 
 class NotFoundError(LookupError):
     """Raised when a referenced project, run, worker, workspace, or packet does not exist."""
+
+
+class SchemaUpgradeRequired(RuntimeError):
+    """An existing runtime database must be upgraded offline."""
+
+
+def require_runtime_schema(db_path: Path) -> None:
+    if not db_path.exists():
+        return
+    try:
+        with codex_bridge.readonly_snapshot(db_path) as conn:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not tables:
+                return
+            version = conn.execute("SELECT COALESCE(MAX(version),0) FROM schema_migrations").fetchone()[0] \
+                if "schema_migrations" in tables else 0
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError(f"Unable to read runtime schema: {db_path}") from exc
+    if version > SCHEMA_VERSION:
+        raise RuntimeError(f"Database schema {version} is newer than supported {SCHEMA_VERSION}")
+    if version < SCHEMA_VERSION:
+        raise SchemaUpgradeRequired(
+            f"Database schema {version} requires offline upgrade to {SCHEMA_VERSION}; use scripts/upgrade.py"
+        )
 
 
 def _new_id(prefix: str) -> str:
@@ -94,21 +119,67 @@ def classify_project_kind(root_path: str | Path) -> str:
     return "temp" if path == temp_root or path.startswith(temp_root.rstrip("/") + "/") else "workspace"
 
 
-def _refresh_canonical_projects(conn: sqlite3.Connection, subtree: Path | None = None) -> None:
-    projects = [(Path(os.path.abspath(r["root_path"])), r) for r in conn.execute(
-        "SELECT id, root_path, is_git, canonical_project_id FROM projects ORDER BY rowid ASC"
+def _independent_git(path: Path, recorded_git: bool) -> bool:
+    try:
+        (path / ".git").stat()
+        return True
+    except FileNotFoundError:
+        return recorded_git and not path.is_dir()
+    except OSError:
+        return recorded_git
+
+
+def _project_path(value: str) -> Path:
+    return Path(os.path.abspath(codex_bridge._strip_win_extended_prefix(value)))
+
+
+def _refresh_canonical_projects(
+    conn: sqlite3.Connection, subtree: Path | None = None, *, codex_roots: frozenset[Path] = frozenset(),
+) -> None:
+    projects = [(_project_path(r["root_path"]), r) for r in conn.execute(
+        "SELECT id, root_path, is_git, canonical_project_id, codex_project_id FROM projects ORDER BY rowid ASC"
     )]
     roots: dict[Path, str] = {}
     for path, project in sorted(projects, key=lambda entry: len(entry[0].parts)):
         canonical_id = project["canonical_project_id"]
         if subtree is None or path.is_relative_to(subtree):
             canonical_id = next((roots[parent] for parent in path.parents if parent in roots), None)
-            if canonical_id and (project["is_git"] or (path / ".git").exists()):
+            saved_root = not codex_roots and project["codex_project_id"] and not project["canonical_project_id"]
+            if canonical_id and (path in codex_roots or saved_root or _independent_git(path, bool(project["is_git"]))):
                 canonical_id = None
             if project["canonical_project_id"] != canonical_id:
                 conn.execute("UPDATE projects SET canonical_project_id = ? WHERE id = ?",
                              (canonical_id, project["id"]))
         roots.setdefault(path, canonical_id or project["id"])
+
+
+def _reconcile_codex_projects(conn: sqlite3.Connection, catalog: list) -> None:
+    existing = {_project_path(row["root_path"]): row for row in conn.execute("SELECT * FROM projects")}
+    roots = {_project_path(item["root_path"]): item for item in catalog}
+    for path, row in existing.items():
+        if path in roots or _independent_git(path, bool(row["is_git"])):
+            continue
+        parent = next((p for p in path.parents if p in roots or p in existing), None)
+        if parent is None or parent not in roots or parent in existing:
+            continue
+        item = roots[parent]
+        conn.execute("""
+            INSERT OR IGNORE INTO projects
+                (id, root_path, name, is_git, created_at, codex_project_id, codex_project_name, project_kind)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'workspace')
+        """, (_new_id("proj"), str(parent), item["name"], int((parent / ".git").exists()),
+              time.time(), item["project_id"], item["name"]))
+    _refresh_canonical_projects(conn, codex_roots=frozenset(roots))
+
+
+def resolve_execution_root(execution_root: str, project_root: str | Path) -> str:
+    if not execution_root:
+        return ""
+    root = Path(project_root).resolve(strict=False)
+    execution = Path(execution_root).resolve(strict=False)
+    if not execution.is_relative_to(root):
+        raise ValueError("execution_root must be within the registered project_root")
+    return str(execution)
 
 
 def _project_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -414,7 +485,7 @@ def _migrate_session_metadata(conn: sqlite3.Connection, version: int) -> None:
             [(classify_project_kind(r["root_path"]), r["id"])
              for r in conn.execute("SELECT id, root_path FROM projects")],
         )
-        _refresh_canonical_projects(conn)
+        _reconcile_codex_projects(conn, codex_bridge.list_codex_projects())
         conn.execute("""
             UPDATE runs SET session_id = (
                 SELECT b.session_id FROM session_run_bindings AS b
@@ -680,7 +751,9 @@ class Database:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (project_id, norm_root, resolved_name, int(bool(is_git)), now,
                       codex_project_id, codex_project_name, classify_project_kind(norm_root)))
-            _refresh_canonical_projects(conn, Path(norm_root))
+            _refresh_canonical_projects(conn, _project_path(norm_root), codex_roots=frozenset(
+                _project_path(item["root_path"]) for item in codex_bridge.list_codex_projects()
+            ))
             row = conn.execute(
                 "SELECT * FROM projects WHERE id = ?;", (project_id,)
             ).fetchone()
@@ -693,6 +766,11 @@ class Database:
                 "SELECT * FROM projects WHERE id = ?;", (project_id,)
             ).fetchone()
             return _project_from_row(row) if row is not None else None
+
+    def reconcile_codex_projects(self) -> None:
+        catalog = codex_bridge.list_codex_projects()
+        with self.transaction() as conn:
+            _reconcile_codex_projects(conn, catalog)
 
     def get_project_by_root(self, root_path: str | Path) -> dict[str, Any] | None:
         norm_root = self._normalize_root(root_path)
@@ -767,6 +845,7 @@ class Database:
                     raise NotFoundError(f"Project not found: {resolved_project_id}")
                 resolved_root_path = str(proj_row["root_path"])
 
+            execution_root = resolve_execution_root(execution_root, resolved_root_path)
             session_seq = self._next_session_seq(conn, clean_session) if clean_session is not None else 0
             conn.execute("""
                 INSERT INTO runs
@@ -783,6 +862,11 @@ class Database:
                     project_root=resolved_root_path,
                     now=now,
                 )
+                if turn_id:
+                    conn.execute(
+                        "UPDATE session_turns SET active_run_id = ? WHERE session_id = ? AND turn_id = ?",
+                        (rid, clean_session, turn_id),
+                    )
             row = conn.execute("SELECT * FROM runs WHERE id = ?;", (rid,)).fetchone()
             assert row is not None
             return _run_from_row(row)
@@ -848,13 +932,20 @@ class Database:
         project_id: str | None = None,
         status: str | None = None,
         mode: str | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
+        include_merged: bool = False,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
+            if include_merged:
+                clauses.append(
+                    "(project_id = ? OR project_id IN (SELECT id FROM projects WHERE canonical_project_id = ?))"
+                )
+                params.extend((project_id, project_id))
+            else:
+                clauses.append("project_id = ?")
+                params.append(project_id)
         if status is not None:
             clauses.append("status = ?")
             params.append(status)
@@ -862,13 +953,43 @@ class Database:
             clauses.append("mode = ?")
             params.append(mode)
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.append(max(1, int(limit)))
+        limit_sql = " LIMIT ?" if limit is not None else ""
+        if limit is not None:
+            params.append(max(1, int(limit)))
         with self.read_connection() as conn:
             rows = conn.execute(
-                f"SELECT * FROM runs {where_sql} ORDER BY updated_at DESC, created_at DESC LIMIT ?;",
+                f"SELECT * FROM runs {where_sql} ORDER BY updated_at DESC, created_at DESC, rowid DESC{limit_sql};",
                 params,
             ).fetchall()
             return [_run_from_row(r) for r in rows]
+
+    def dashboard_project_activity(self) -> dict[str, dict[str, Any]]:
+        """Count all runs at their canonical root and identify active unisolated writers."""
+        with self.read_connection() as conn:
+            rows = conn.execute("""
+                SELECT COALESCE(p.canonical_project_id, p.id) AS canonical_id,
+                    COUNT(*) AS total_run_count,
+                    COUNT(CASE WHEN r.status = 'active' THEN 1 END) AS active_run_count,
+                    COUNT(DISTINCT CASE WHEN r.status = 'active' THEN r.session_id END) AS active_session_count,
+                    MAX(CASE WHEN r.status = 'active' THEN (
+                        CASE WHEN json_valid(r.metadata_json)
+                             THEN json_extract(r.metadata_json, '$.execution_kind') = 'coordinator_local'
+                             ELSE 0 END
+                        OR EXISTS (
+                            SELECT 1 FROM workflow_steps AS s WHERE s.run_id = r.id
+                              AND CASE WHEN json_valid(s.checkpoint_json)
+                                       THEN json_extract(s.checkpoint_json, '$.execution_kind') = 'coordinator_local'
+                                       ELSE 0 END
+                        )
+                        OR NOT EXISTS (
+                            SELECT 1 FROM workspaces AS w WHERE w.run_id = r.id
+                              AND w.status IN ('active', 'verified', 'conflict')
+                        )
+                    ) ELSE 0 END) AS has_local_writer
+                FROM runs AS r JOIN projects AS p ON p.id = r.project_id
+                GROUP BY canonical_id
+            """)
+            return {row["canonical_id"]: dict(row) for row in rows}
 
     # ------------------------------------------------------------------
     # Task Packets (versioned per run)
@@ -2056,20 +2177,55 @@ class Database:
         clean_session, clean_turn = session_id.strip(), turn_id.strip()
         with self.transaction() as conn:
             now = time.time()
+            claimed_by = conn.execute("""
+                SELECT id FROM runs WHERE session_id = ? AND turn_id = ?
+                ORDER BY session_seq DESC LIMIT 1
+            """, (clean_session, clean_turn)).fetchone()
+            if claimed_by is not None:
+                active_run_id = claimed_by["id"]
             conn.execute("""
                 INSERT INTO session_turns
                     (session_id, turn_id, cwd, prompt_preview, active_run_id, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (session_id, turn_id) DO UPDATE SET
                     cwd = excluded.cwd, prompt_preview = excluded.prompt_preview,
-                    active_run_id = excluded.active_run_id, updated_at = excluded.updated_at
-            """, (clean_session, clean_turn, cwd, prompt_preview, active_run_id, now, now))
+                    active_run_id = CASE WHEN ? THEN excluded.active_run_id
+                                         ELSE COALESCE(session_turns.active_run_id, excluded.active_run_id) END,
+                    updated_at = excluded.updated_at
+            """, (clean_session, clean_turn, cwd, prompt_preview, active_run_id, now, now, claimed_by is not None))
             row = conn.execute(
                 "SELECT * FROM session_turns WHERE session_id = ? AND turn_id = ?",
                 (clean_session, clean_turn),
             ).fetchone()
             assert row is not None
             return dict(row)
+
+    def list_run_session_turns(self, run: dict[str, Any]) -> list[dict[str, Any]]:
+        session_id = run["session_id"]
+        if session_id is None:
+            return []
+        with self.read_connection() as conn:
+            rows = conn.execute("""
+                SELECT t.* FROM session_turns AS t
+                WHERE t.session_id = ?
+                  AND (t.turn_id = ? OR (t.active_run_id = ? AND NOT EXISTS (
+                    SELECT 1 FROM runs AS claimed
+                    WHERE claimed.session_id = t.session_id AND claimed.turn_id = t.turn_id
+                  )))
+                ORDER BY created_at ASC, rowid ASC
+            """, (session_id, run["turn_id"], run["id"]))
+            return [dict(row) for row in rows]
+
+    def get_session_turn(self, session_id: str, turn_id: str) -> dict[str, Any] | None:
+        with self.read_connection() as conn:
+            row = conn.execute("SELECT * FROM session_turns WHERE session_id = ? AND turn_id = ?",
+                               (session_id, turn_id)).fetchone()
+            return dict(row) if row is not None else None
+
+    def has_run_trigger(self, session_id: str, turn_id: str) -> bool:
+        with self.read_connection() as conn:
+            return conn.execute("SELECT 1 FROM runs WHERE session_id = ? AND turn_id = ? LIMIT 1",
+                                (session_id, turn_id)).fetchone() is not None
 
     def list_session_turns(self, session_id: str) -> list[dict[str, Any]]:
         with self.read_connection() as conn:

@@ -25,9 +25,9 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from orchestrator.board import BoardService
-from orchestrator import __version__
+from orchestrator import __version__, codex_bridge
 from orchestrator.config import Settings, get_settings
-from orchestrator.db import Database, NotFoundError, SCHEMA_VERSION
+from orchestrator.db import Database, NotFoundError, SCHEMA_VERSION, VALID_RUN_MODES, require_runtime_schema
 from orchestrator.inbox import InboxConflictError, request_wait
 from orchestrator.workflow import WorkflowConflictError
 from orchestrator.rpc_handlers import EventBus, RpcDispatcher
@@ -377,7 +377,11 @@ def create_app(
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
         started_at = time.time()
         cfg.ensure_data_dir()
+        if owns_db:
+            require_runtime_schema(cfg.db_path)
         database = db if db is not None else Database.from_settings(cfg)
+        if owns_db:
+            database.reconcile_codex_projects()
         board = BoardService(database, cfg)
         workspace_mgr = WorkspaceManager(database, cfg)
         event_bus = EventBus()
@@ -518,9 +522,57 @@ def create_app(
     # Projects, Runs, Snapshot, Export
     # ------------------------------------------------------------------
 
+    def _dashboard_projects(database: Database, include_merged: bool) -> list[dict[str, Any]]:
+        activity = database.dashboard_project_activity()
+        return [
+            {
+                **project,
+                "display_name": project["codex_project_name"] or project["name"],
+                **{key: counts.get(key, 0) for key in ("active_run_count", "active_session_count", "total_run_count")},
+            }
+            for project in database.list_projects()
+            if include_merged or project["canonical_project_id"] is None
+            for counts in [activity.get(project["canonical_project_id"] or project["id"], {})]
+        ]
+
+    def _concurrent_risk(canonical_id: str, activity: dict[str, dict[str, Any]]) -> dict[str, Any]:
+        counts = activity.get(canonical_id, {})
+        active_count = counts.get("active_run_count", 0)
+        return {
+            "canonical_project_id": canonical_id,
+            "concurrent_project_active_count": active_count,
+            "concurrent_local_write_risk": active_count > 1 and bool(counts["has_local_writer"]),
+        }
+
+    def _enrich_runs(
+        database: Database, runs: list[dict[str, Any]], activity: dict[str, dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        if not runs:
+            return []
+        projects = {project["id"]: project for project in database.list_projects()}
+        threads = codex_bridge.get_threads_meta(run["session_id"] for run in runs if run["session_id"])
+        enriched = []
+        for run in runs:
+            project = projects[run["project_id"]]
+            canonical = projects[project["canonical_project_id"] or project["id"]]
+            thread = threads.get(run["session_id"], {})
+            thread_name = thread.get("title")
+            enriched.append({
+                **run,
+                **_concurrent_risk(canonical["id"], activity),
+                "codex_thread_name": thread_name,
+                "codex_project_name": canonical["codex_project_name"] or project["codex_project_name"]
+                or thread.get("codex_project_name"),
+                "session_display_name": thread_name or (run["title"] if run["session_id"] else None),
+            })
+        return enriched
+
     async def api_projects(request: Request) -> JSONResponse:
         database: Database = request.app.state.db
-        projects = await asyncio.to_thread(database.list_projects)
+        include_merged = request.query_params.get("include_merged", "1")
+        if include_merged not in {"0", "1"}:
+            return _json_error(400, "include_merged must be 0 or 1", error_type="ValueError")
+        projects = await asyncio.to_thread(_dashboard_projects, database, include_merged == "1")
         return JSONResponse({"projects": projects})
 
     async def api_runs(request: Request) -> JSONResponse:
@@ -534,14 +586,74 @@ def create_app(
             limit = int(raw_limit) if raw_limit else 100
         except ValueError:
             return _json_error(400, f"Invalid limit: {raw_limit!r}", error_type="ValueError")
-        runs = await asyncio.to_thread(
-            database.list_runs,
-            project_id=project_id,
-            status=status,
-            mode=mode,
-            limit=limit,
-        )
-        return JSONResponse({"runs": runs})
+
+        def build() -> dict[str, Any]:
+            runs = database.list_runs(
+                project_id=project_id, status=status, mode=None if mode == "all" else mode,
+                limit=limit, include_merged=True,
+            )
+            return {"runs": _enrich_runs(database, runs, database.dashboard_project_activity())}
+
+        return JSONResponse(await asyncio.to_thread(build))
+
+    async def api_sessions(request: Request) -> JSONResponse:
+        database: Database = request.app.state.db
+        qp = request.query_params
+        project_id = qp.get("project_id") or "all"
+        status = qp.get("status", "all")
+        mode = qp.get("mode", "all")
+        if status not in {"active", "all"} or mode not in VALID_RUN_MODES | {"all"}:
+            return _json_error(400, "Invalid session status or mode", error_type="ValueError")
+
+        def build() -> dict[str, Any]:
+            project = database.get_project(project_id) if project_id != "all" else None
+            selected = database.list_runs(
+                project_id=(project["canonical_project_id"] or project_id) if project else (
+                    None if project_id == "all" else project_id
+                ),
+                status=None if status == "all" else status,
+                mode=None if mode == "all" else mode,
+                include_merged=True,
+                limit=None,
+            )
+            global_active = database.list_runs(status="active", limit=None) if project_id != "all" or mode != "all" else [
+                run for run in selected if run["status"] == "active"
+            ]
+            activity = database.dashboard_project_activity()
+            by_id = {run["id"]: run for run in (*selected, *global_active)}
+            enriched = {run["id"]: run for run in _enrich_runs(database, list(by_id.values()), activity)}
+            groups: dict[tuple[str, str | None], dict[str, Any]] = {}
+            for raw in selected:
+                run = enriched[raw["id"]]
+                canonical_id, session_id = run["canonical_project_id"], run["session_id"]
+                group = groups.setdefault((canonical_id, session_id), {
+                    "project_id": canonical_id,
+                    "canonical_project_id": canonical_id,
+                    "session_id": session_id if session_id is not None else "unbound",
+                    "codex_thread_name": run["codex_thread_name"],
+                    "session_display_name": run["session_display_name"],
+                    "runs": [],
+                    "active_count": 0,
+                })
+                group["runs"].append(run)
+                group["active_count"] += run["status"] == "active"
+            sessions = sorted(
+                groups.values(),
+                key=lambda group: (group["active_count"] > 0, group["runs"][0]["updated_at"]),
+                reverse=True,
+            )
+            for group in sessions:
+                group["runs"].sort(key=lambda run: (run["session_seq"], run["updated_at"]), reverse=True)
+            return {
+                "sessions": sessions,
+                "global_active_runs": [enriched[run["id"]] for run in global_active],
+                "concurrent_risks": [
+                    risk for canonical_id in sorted(activity)
+                    if (risk := _concurrent_risk(canonical_id, activity))["concurrent_local_write_risk"]
+                ],
+            }
+
+        return JSONResponse(await asyncio.to_thread(build))
 
     async def api_run(request: Request) -> JSONResponse:
         database: Database = request.app.state.db
@@ -563,6 +675,7 @@ def create_app(
         if run is None:
             raise NotFoundError(f"Run not found: {run_id}")
         project = database.get_project(run["project_id"])
+        [dashboard_run] = _enrich_runs(database, [run], database.dashboard_project_activity())
         packets = database.list_task_packets(run_id)
         latest_packet = packets[-1] if packets else None
         status_summary = board.board_status(run_id)
@@ -579,7 +692,8 @@ def create_app(
                 channels.append(default_ch)
 
         return {
-            "run": run,
+            "run": dashboard_run,
+            "session_turns": database.list_run_session_turns(run),
             "project": project,
             "task_packet": latest_packet,
             "task_packets": packets,
@@ -677,7 +791,14 @@ def create_app(
                             break
                         if get_task in done:
                             item = get_task.result()
-                            data_json = json.dumps(item["data"], ensure_ascii=False)
+                            data = item["data"]
+                            if run_id is None and item["event"] == "run_updated" and isinstance(data.get("run"), dict):
+                                data = {**data, "run": {
+                                    key: value for key, value in data["run"].items()
+                                    if key in {"id", "project_id", "mode", "title", "status", "session_id",
+                                               "session_seq", "created_at", "updated_at", "workflow_version"}
+                                }}
+                            data_json = json.dumps(data, ensure_ascii=False)
                             yield f"event: {item['event']}\ndata: {data_json}\n\n"
                         else:
                             yield ": keepalive\n\n"
@@ -937,6 +1058,7 @@ def create_app(
         Route("/api/tools", api_tools, methods=["GET"]),
         Route("/api/rpc", api_rpc, methods=["POST"]),
         Route("/api/projects", api_projects, methods=["GET"]),
+        Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/runs", api_runs, methods=["GET"]),
         Route("/api/runs/{run_id}", api_run, methods=["GET"]),
         Route("/api/runs/{run_id}/snapshot", api_run_snapshot, methods=["GET"]),

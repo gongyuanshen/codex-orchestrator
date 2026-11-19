@@ -1,5 +1,6 @@
 """Workflow4 admission; real files and serialized SQLite transactions."""
 import concurrent.futures
+import math
 import sys
 import time
 import json
@@ -37,8 +38,15 @@ def advance(s, step, action, **kwargs):
 
 
 def observe(s, step, state='idle'):
-    return advance(s, step, 'observe', observation=dict(agent_id=step['owner_agent_id'],
-        state=state, observed_at=time.time(), evidence='native tool observation fixture'))
+    step = s.get_step(step['id'])
+    agent_id = step['owner_agent_id']
+    previous = step['checkpoint'].get('native_observations', {}).get(agent_id)
+    observed_at = time.time()
+    if previous:
+        # These fixtures represent a new host observation even within a coarse Windows tick.
+        observed_at = max(observed_at, math.nextafter(previous['observed_at'], math.inf))
+    return s.step_advance(step['id'], 'observe', step['revision'], observation=dict(
+        agent_id=agent_id, state=state, observed_at=observed_at, evidence='native tool observation fixture'))
 
 
 def verify(s, step, scope, verdict='PASS', *, code=None, **kwargs):

@@ -122,7 +122,7 @@ class EventBus:
         stale_ids: list[int] = []
 
         for sub_id, (sub_loop, queue, filter_run_id) in targets:
-            if filter_run_id and target_run_id and filter_run_id != target_run_id:
+            if filter_run_id and filter_run_id != target_run_id:
                 continue
             if sub_loop.is_closed():
                 stale_ids.append(sub_id)
@@ -195,7 +195,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 },
                 "turn_id": {"type": "string", "description": "Codex turn that triggered this run."},
                 "trigger_prompt": {"type": "string", "description": "Prompt that triggered this run."},
-                "execution_root": {"type": "string", "description": "Execution directory within or separate from the registered project root."},
+                "execution_root": {"type": "string", "description": "Execution directory at or below the registered project root."},
             },
             "required": ["mode", "title"],
             "additionalProperties": False,
@@ -970,14 +970,6 @@ class RpcDispatcher:
         execution_root = args.get("execution_root") or ""
         project_fields = None
 
-        if session_id and (turn_id is None or trigger_prompt is None):
-            turns = self.db.list_session_turns(session_id)
-            if turns:
-                if turn_id is None:
-                    turn_id = turns[0]["turn_id"]
-                if trigger_prompt is None:
-                    trigger_prompt = turns[0]["prompt_preview"]
-
         thread = None
         if project_id is None and project_root is None and session_id:
             thread = codex_bridge.get_thread_meta(session_id)
@@ -1020,14 +1012,13 @@ class RpcDispatcher:
                 codex_name = thread["codex_project_name"] or codex_name
 
             name = (args.get("project_name") or "").strip() or None
-            if root != requested_root and name in {
-                None, requested_root.name, root.name, registered["name"] if registered else None,
-            }:
+            if root != requested_root:
                 name = codex_name or (registered["name"] if registered else None)
             elif name is None and (root == codex_root or thread):
                 name = codex_name
             project_fields = (root, name, is_git, codex_id, codex_name)
 
+        previous_run_id = None
         with self.db.transaction():
             if project_fields is not None:
                 root, name, is_git, codex_id, codex_name = project_fields
@@ -1035,6 +1026,23 @@ class RpcDispatcher:
                     root, name=name, is_git=is_git,
                     codex_project_id=codex_id, codex_project_name=codex_name,
                 )["id"]
+            if session_id:
+                turn = self.db.get_session_turn(session_id, turn_id) if turn_id else None
+                if turn_id is None:
+                    turns = self.db.list_session_turns(session_id)
+                    project = self.db.get_project(project_id) if project_id else None
+                    if turns and project:
+                        candidate = turns[0]
+                        cwd = candidate["cwd"]
+                        scope = Path(project["root_path"]).resolve(strict=False)
+                        if (not cwd or Path(cwd).resolve(strict=False).is_relative_to(scope)) and not \
+                                self.db.has_run_trigger(session_id, candidate["turn_id"]):
+                            turn = candidate
+                            turn_id = turn["turn_id"]
+                if turn:
+                    previous_run_id = turn["active_run_id"]
+                    if trigger_prompt is None:
+                        trigger_prompt = turn["prompt_preview"]
             run = self.db.create_run(
                 mode=mode,
                 title=title,
@@ -1047,6 +1055,11 @@ class RpcDispatcher:
                 execution_root=str(Path(execution_root).resolve(strict=False)) if execution_root else "",
             )
         self._emit("run_updated", {"run_id": run["id"], "run": run}, run_id=run["id"])
+        if session_id:
+            self._emit("session_updated", {"run_id": run["id"], "session_id": session_id}, run_id=run["id"])
+            if previous_run_id and previous_run_id != run["id"]:
+                self._emit("session_updated", {"run_id": previous_run_id, "session_id": session_id,
+                                               "turn_id": turn_id}, run_id=previous_run_id)
         return {**run, "cli_executables": _discover_cli_executables()}
 
     @staticmethod
@@ -1273,7 +1286,11 @@ class RpcDispatcher:
 
     def _handle_workflow_step_save(self, args: dict[str, Any]) -> dict[str, Any]:
         step = self.workflow.step_save(**args)
-        self._emit("workflow_updated", {"run_id": step["run_id"], "step": step}, run_id=step["run_id"])
+        run_id = step["run_id"]
+        self._emit("workflow_updated", {"run_id": run_id, "step": step}, run_id=run_id)
+        run = self.db.get_run(run_id)
+        if run and run["session_id"]:
+            self._emit("session_updated", {"run_id": run_id, "session_id": run["session_id"]}, run_id=run_id)
         return step
 
     def _handle_workflow_step_advance(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1870,6 +1887,10 @@ class RpcDispatcher:
             {"run_id": run_id, "action_id": begun["action_id"], "status": begun["status"]},
             run_id=run_id,
         )
+        if args.get("session_id") is not None:
+            self._emit(
+                "session_updated", {"run_id": run_id, "session_id": str(args["session_id"]).strip()}, run_id=run_id,
+            )
 
         return {
             "step": compact_step,
@@ -2546,6 +2567,7 @@ class RpcDispatcher:
             run_id,
             project_root=args.get("project_root"),
         )
+        self._emit("session_updated", {"run_id": run_id, "session_id": session_id}, run_id=run_id)
         return {"bound": True, **binding}
 
     def _handle_session_hook_check(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -2600,9 +2622,14 @@ class RpcDispatcher:
             turn_id = (args.get("turn_id") or "").strip()
             invoked = args.get("has_mode_invocation")
             if turn_id and (invoked is True or bindings or self.db.list_session_turns(session_id)):
-                self.db.upsert_session_turn(
+                turn = self.db.upsert_session_turn(
                     session_id, turn_id, cwd=cwd_text, prompt_preview=args.get("prompt_preview", ""),
                     active_run_id=selected[1]["id"] if selected else None,
+                )
+                self._emit(
+                    "session_updated",
+                    {"run_id": turn["active_run_id"], "session_id": session_id, "turn_id": turn_id},
+                    run_id=turn["active_run_id"],
                 )
             if selected is None:
                 return empty

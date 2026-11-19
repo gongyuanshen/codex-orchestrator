@@ -45,22 +45,32 @@ def test_failed_and_terminal(tmp_path):
 
 def test_legacy_migration(tmp_path):
     import sqlite3
-    from orchestrator.db import _SCHEMA_SQL
+    from contextlib import closing
     path = tmp_path / 'legacy'
-    conn = sqlite3.connect(path)
-    conn.executescript(_SCHEMA_SQL)
-    conn.execute('INSERT INTO schema_migrations VALUES (1, 0)')
-    conn.execute("INSERT INTO projects VALUES ('old', 'old-root', 'preserved', 0, 0)")
-    conn.commit()
-    conn.close()
-    db = Database(path)
-    assert db.migrate() == SCHEMA_VERSION
-    assert db.get_project('old')['name'] == 'preserved'
-    db.close()
-    db = Database(path)
-    assert db.get_project('old')['name'] == 'preserved'
-    assert 'agent_id' in {r['name'] for r in db.connect().execute('PRAGMA table_info(workers)')}
-    db.close()
+    # Pin the pre-control tables rather than seeding an already-upgraded database.
+    with closing(sqlite3.connect(path)) as conn:
+        conn.executescript("""
+            CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at REAL NOT NULL);
+            INSERT INTO schema_migrations VALUES (1, 0);
+            CREATE TABLE projects (
+                id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL, is_git INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL
+            );
+            INSERT INTO projects VALUES ('old', 'old-root', 'preserved', 0, 0);
+            CREATE TABLE workers (
+                id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+                name TEXT NOT NULL, role TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'waiting',
+                workspace_id TEXT, current_task TEXT NOT NULL DEFAULT '', last_heartbeat_at REAL NOT NULL,
+                stall_threshold_sec INTEGER NOT NULL DEFAULT 300, stalled_alerted INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL, UNIQUE (run_id, name)
+            );
+        """)
+    with Database(path) as db:
+        assert db.migrate() == SCHEMA_VERSION
+        assert db.get_project('old')['name'] == 'preserved'
+    with Database(path) as db:
+        assert db.get_project('old')['name'] == 'preserved'
+        assert 'agent_id' in {r['name'] for r in db.connect().execute('PRAGMA table_info(workers)')}
 
 def test_binding_and_control_boundaries(tmp_path):
     db = Database(tmp_path / 'db')

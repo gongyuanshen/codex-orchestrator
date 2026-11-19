@@ -122,6 +122,15 @@ def _connect(db: Path, wal: Path, files: tuple[_FileState | None, ...]) -> Itera
             yield conn
 
 
+@contextmanager
+def readonly_snapshot(path: Path) -> Iterator[sqlite3.Connection]:
+    """Inspect an existing SQLite store without opening its live WAL index."""
+    path = path.resolve()
+    wal = path.with_name(path.name + "-wal")
+    with _connect(path, wal, (_file_state(path), _file_state(wal))) as conn:
+        yield conn
+
+
 def _read_names(path: Path) -> dict[str, str]:
     names: dict[str, str] = {}
     try:

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from orchestrator.config import Settings, get_settings
-from orchestrator.db import Database, NotFoundError
+from orchestrator.db import Database, NotFoundError, resolve_execution_root
 
 try:
     import _winapi
@@ -595,6 +595,11 @@ class WorkspaceManager:
             execution_root = Path(run["execution_root"]).resolve(strict=False) if run["execution_root"] else None
             if project_root is not None and resolved_root != execution_root:
                 execution_root = None
+            if execution_root is not None:
+                project = self.db.get_project(run["project_id"])
+                if project is None:
+                    raise NotFoundError(f"Project not found: {run['project_id']}")
+                execution_root = Path(resolve_execution_root(str(execution_root), project["root_path"]))
             if execution_root is not None and not execution_root.is_dir():
                 raise FileNotFoundError(f"Execution root directory does not exist: {execution_root}")
             is_git_worktree, repo_root, git_common_dir, has_head = self._detect_git_repo(

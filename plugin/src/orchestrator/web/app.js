@@ -6,6 +6,9 @@
   const GRAPH_PLAY_INTERVAL_MS = 700;
   const THEME_STORAGE_KEY = 'tri-orch-theme';
   const BASE_CHANNELS = ['all', 'main', 'human'];
+  const ALL_PROJECTS = '__all__';
+  const ALL_PROJECTS_LABEL = '全部项目（跨项目并发）';
+  const MODE_BADGES = { boost: 'Boost', teamwork: 'Teamwork', swarm: 'Swarm' };
 
   const MODE_LABELS = {
     boost: '极速模式',
@@ -91,14 +94,25 @@
     sidebarOpen: typeof window !== 'undefined' ? window.innerWidth > 1080 : true,
     projectPopoverOpen: false,
     projectSearchQuery: '',
+    projectFixturesOpen: false,
     runSearchQuery: '',
     runStatusFilter: 'all',
+    allModes: false,
+    sessionOpenOverrides: new Map(),
     cmdPaletteOpen: false,
     cmdPaletteQuery: '',
     cmdPaletteIndex: 0,
+    cmdPaletteKeys: [],
+    cmdActiveOnly: false,
+    globalSessions: [],
+    globalActiveRuns: [],
+    riskyProjectIds: new Set(),
+    globalSessionsVersion: 0,
+    globalEventSource: null,
 
     contextVersion: 0,
     snapshotVersion: 0,
+    runListVersion: 0,
     loadState: 'idle',
     loadError: '',
     expandedMessages: new Set(),
@@ -121,6 +135,7 @@
     controlRequests: [],
     workspaces: [],
     messages: [],
+    sessionTurns: [],
     channels: new Set(['main', 'human']),
 
     activeChannel: 'all',
@@ -175,6 +190,8 @@
     runSearchInput: document.getElementById('runSearchInput'),
     runFilterPills: Array.from(document.querySelectorAll('.run-filter-pill')),
     runSidebarList: document.getElementById('runSidebarList'),
+    runModeToggle: document.getElementById('runModeToggle'),
+    globalActiveBadge: document.getElementById('globalActiveBadge'),
     cmdPaletteTrigger: document.getElementById('cmdPaletteTrigger'),
     topbarContextProject: document.getElementById('topbarContextProject'),
     topbarContextRun: document.getElementById('topbarContextRun'),
@@ -909,6 +926,8 @@
     else params.delete('project_id');
     if (state.selectedRunId) params.set('run_id', state.selectedRunId);
     else params.delete('run_id');
+    if (state.allModes) params.set('mode', 'all');
+    else params.delete('mode');
     const qs = params.toString();
     const target = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
     window.history.replaceState(null, '', target);
@@ -926,26 +945,42 @@
     }
   }
 
+  function projectFor(id) {
+    return state.projects.find((p) => String(p.id) === String(id));
+  }
+
+  function canonicalRunProject(run) {
+    return run.canonical_project_id || projectFor(run.project_id)?.canonical_project_id || run.project_id;
+  }
+
+  function inRunProject(run, projectId) {
+    return !projectId || projectId === ALL_PROJECTS ||
+      String(run.project_id) === String(projectId) || String(canonicalRunProject(run)) === String(projectId);
+  }
+
   function validateRunContext(run, runId = null, projectId = null, mode = PAGE_MODE) {
     if (!run?.id || !run.project_id || !Object.hasOwn(MODE_LABELS, run.mode)) {
       throw new Error('任务元数据不完整或模式无效');
     }
     if (runId && String(run.id) !== String(runId)) throw new Error('返回的任务与所选任务不匹配');
     if (mode && run.mode !== mode) throw new Error(`任务属于 ${MODE_NAMES[run.mode]}，请从对应入口打开`);
-    if (projectId && String(run.project_id) !== String(projectId)) throw new Error('所选任务不属于该项目');
+    if (!inRunProject(run, projectId)) throw new Error('所选任务不属于该项目');
   }
 
   async function resolveRun(runId, projectId = null, mode = PAGE_MODE) {
     const version = state.contextVersion;
     const data = await apiRequest(`/api/runs/${encodeURIComponent(runId)}`);
     if (version !== state.contextVersion) return null;
-    validateRunContext(data.run, runId, projectId, mode);
+    validateRunContext(data.run, runId, null, mode);
     if (String(data.project?.id) !== String(data.run.project_id)) throw new Error('任务与项目元数据不匹配');
-    return data.run;
+    const run = { ...data.run, canonical_project_id: data.project.canonical_project_id || data.run.project_id };
+    validateRunContext(run, runId, projectId, mode);
+    return run;
   }
 
   async function loadProjects() {
     const params = new URLSearchParams(window.location.search);
+    state.allModes = params.get('mode') === 'all';
     const requestedProject = state.selectedProjectId || params.get('project_id');
     const requestedRun = state.selectedRunId || params.get('run_id');
     state.selectedProjectId = requestedProject || null;
@@ -965,29 +1000,36 @@
       let runId = requestedRun;
       let exactRun = null;
       if (requestedRun) {
-        exactRun = await resolveRun(requestedRun, requestedProject);
+        exactRun = await resolveRun(requestedRun, requestedProject, state.allModes ? null : PAGE_MODE);
         if (!exactRun) return;
-        projectId = exactRun.project_id;
+        projectId = requestedProject || canonicalRunProject(exactRun);
       } else if (!projectId) {
-        const result = await apiRequest(`/api/runs?status=active&mode=${PAGE_MODE}`);
+        const mode = state.allModes ? 'all' : PAGE_MODE;
+        const result = await apiRequest(`/api/runs?status=active&mode=${mode}`);
         if (version !== state.contextVersion) return;
         const runs = Array.isArray(result) ? result : result.runs;
-        runs.forEach((run) => validateRunContext(run));
+        runs.forEach((run) => validateRunContext(run, null, null, state.allModes ? null : PAGE_MODE));
         let preferred = runs[0];
         if (!preferred) {
-          const recent = await apiRequest(`/api/runs?mode=${PAGE_MODE}`);
+          const recent = await apiRequest(`/api/runs?mode=${mode}`);
           if (version !== state.contextVersion) return;
           const recentRuns = Array.isArray(recent) ? recent : recent.runs;
-          recentRuns.forEach((run) => validateRunContext(run));
+          recentRuns.forEach((run) => validateRunContext(run, null, null, state.allModes ? null : PAGE_MODE));
           preferred = recentRuns[0];
         }
-        projectId = preferred?.project_id || state.projects[0]?.id || null;
+        projectId = preferred ? canonicalRunProject(preferred) : (state.projects.find(isWorkspaceProject) || state.projects[0])?.id || null;
         runId = preferred?.id || null;
       }
-      if (projectId && !state.projects.some((p) => String(p.id) === String(projectId))) {
+      if (projectId && projectId !== ALL_PROJECTS && !projectFor(projectId)) {
         throw new Error('所选项目不存在，请重新选择项目');
       }
       await loadRuns(projectId, runId, exactRun);
+      // Legacy responses have no S3 catalog fields; do not interleave optional I/O with the core load.
+      if (state.projects.length === 0 || state.projects.some((p) => Object.hasOwn(p, 'project_kind'))) {
+        void refreshGlobalSessions().then((supported) => {
+          if (supported) connectGlobalEvents();
+        });
+      }
     } catch (err) {
       if (version !== state.contextVersion) return;
       state.loadState = 'error';
@@ -1012,20 +1054,30 @@
     syncUrlParams();
     if (!projectId) return;
     try {
-      const data = await apiRequest(`/api/runs?project_id=${encodeURIComponent(projectId)}&mode=${PAGE_MODE}`);
+      const mode = state.allModes ? null : PAGE_MODE;
+      const scope = projectId === ALL_PROJECTS ? '' : `project_id=${encodeURIComponent(projectId)}&`;
+      const data = await apiRequest(`/api/runs?${scope}mode=${mode || 'all'}`);
       if (version !== state.contextVersion) return;
-      const runs = Array.isArray(data) ? data : data.runs;
-      runs.forEach((run) => validateRunContext(run, null, projectId));
+      const runs = [...(Array.isArray(data) ? data : data.runs)];
+      runs.forEach((run) => validateRunContext(run, null, projectId, mode));
+      const freshIds = new Set(runs.map((run) => run.id));
+      for (const { runs: cached } of state.globalSessions) {
+        for (const run of cached) {
+          if (!freshIds.has(run.id) && inRunProject(run, projectId) && (!mode || run.mode === mode)) {
+            runs.push(run);
+            freshIds.add(run.id);
+          }
+        }
+      }
       if (preferredRunId && !runs.some((r) => String(r.id) === String(preferredRunId))) {
-        const selectedRun = exactRun || await resolveRun(preferredRunId, projectId);
+        const selectedRun = exactRun || await resolveRun(preferredRunId, projectId, mode);
         if (!selectedRun) return;
+        validateRunContext(selectedRun, preferredRunId, projectId, mode);
         runs.push(selectedRun);
       }
-      runs.sort((a, b) => {
-        const activeOrder = Number(b.status === 'active') - Number(a.status === 'active');
-        return activeOrder || (parseTimestampMs(b.updated_at || b.created_at) || 0) - (parseTimestampMs(a.updated_at || a.created_at) || 0);
-      });
+      runs.sort((a, b) => Number(b.status === 'active') - Number(a.status === 'active') || runUpdatedMs(b) - runUpdatedMs(a));
       state.runs = runs;
+      state.runListVersion += 1;
       renderRunSelector();
       const runId = preferredRunId || runs[0]?.id;
       if (runId) await selectRun(runId);
@@ -1065,6 +1117,7 @@
     state.controlRequests = [];
     state.workspaces = [];
     state.messages = [];
+    state.sessionTurns = [];
     state.channels = new Set(['main', 'human']);
     state.selectedWorkerId = null;
     state.graphStep = null;
@@ -1098,7 +1151,8 @@
     try {
       const snap = await apiRequest(`/api/runs/${encodeURIComponent(runId)}/snapshot`);
       if (version !== state.contextVersion || request !== state.snapshotVersion) return false;
-      validateRunContext(snap.run, runId, state.selectedProjectId);
+      const mode = state.run?.mode || (state.allModes ? state.runs.find((r) => r.id === runId)?.mode || null : PAGE_MODE);
+      validateRunContext(snap.run, runId, state.selectedProjectId, mode);
       applySnapshot(snap);
       state.loadState = 'ready';
       state.loadError = '';
@@ -1118,6 +1172,7 @@
 
   function applySnapshot(snap) {
     state.run = snap.run;
+    state.sessionTurns = snap.session_turns ?? [];
     state.workflow = snap.workflow ?? null;
     state.inbox = snap.inbox ?? null;
     state.nativeActions = snap.native_actions ?? null;
@@ -1168,6 +1223,113 @@
 
   // ---------- SSE 实时事件流 ----------
 
+  function connectGlobalEvents() {
+    if (state.globalEventSource) return;
+    closeEventSource();
+    const source = new EventSource('/api/events');
+    state.globalEventSource = source;
+    let pending = false;
+    let refreshing = false;
+    const refresh = async () => {
+      pending = true;
+      if (refreshing) return;
+      refreshing = true;
+      try {
+        await Promise.resolve();
+        while (pending) {
+          pending = false;
+          await refreshGlobalSessions();
+        }
+      } finally {
+        refreshing = false;
+      }
+    };
+    // Recheck after subscription so a write between the initial fetch and connect isn't lost.
+    attachRunEvents(source, () => state.globalEventSource === source ? state.selectedRunId : null, refresh);
+    source.onopen = () => {
+      setSseBadge('connected', '实时流');
+      if (state.run && state.loadState === 'ready') refreshSnapshot(state.selectedRunId, { silent: true });
+      void refresh();
+    };
+    source.onerror = () => setSseBadge('reconnecting', '重连中...');
+  }
+
+  async function refreshGlobalSessions() {
+    const version = ++state.globalSessionsVersion;
+    const listVersion = state.runListVersion;
+    let data;
+    try {
+      data = await apiRequest('/api/sessions');
+    } catch {
+      // Older daemons can still serve the project and run selectors.
+      return;
+    }
+    if (version !== state.globalSessionsVersion || !Array.isArray(data?.sessions) || !Array.isArray(data.global_active_runs)) return;
+    const runs = data.sessions.flatMap((session) => session.runs);
+    let projectsChanged = false;
+    if (runs.some((run) => !projectFor(canonicalRunProject(run)))) {
+      try {
+        const catalog = await apiRequest('/api/projects');
+        if (version !== state.globalSessionsVersion) return;
+        const projects = Array.isArray(catalog) ? catalog : catalog?.projects;
+        if (Array.isArray(projects)) {
+          state.projects = projects;
+          projectsChanged = true;
+        }
+      } catch {
+        if (version !== state.globalSessionsVersion) return;
+      }
+    }
+    state.globalSessions = data.sessions;
+    state.globalActiveRuns = data.global_active_runs;
+    state.riskyProjectIds = new Set((data.concurrent_risks || [])
+      .filter((risk) => risk.concurrent_local_write_risk).map((risk) => risk.canonical_project_id));
+    const activeIds = new Set(state.globalActiveRuns.map((run) => run.session_id).filter(Boolean));
+    el.globalActiveBadge.textContent = `${activeIds.size} 个会话运行中`;
+    el.globalActiveBadge.classList.remove('hidden');
+    el.globalActiveBadge.classList.toggle('has-active', activeIds.size > 0);
+
+    const activeByProject = new Map();
+    const sessionsByProject = new Map();
+    for (const run of state.globalActiveRuns) {
+      const id = canonicalRunProject(run);
+      activeByProject.set(id, (activeByProject.get(id) || 0) + 1);
+      if (run.session_id) {
+        if (!sessionsByProject.has(id)) sessionsByProject.set(id, new Set());
+        sessionsByProject.get(id).add(run.session_id);
+      }
+    }
+    for (const project of state.projects) {
+      const id = project.canonical_project_id || project.id;
+      const activeCount = activeByProject.get(id) || 0;
+      const sessionCount = sessionsByProject.get(id)?.size || 0;
+      if (project.active_run_count !== activeCount || project.active_session_count !== sessionCount) {
+        project.active_run_count = activeCount;
+        project.active_session_count = sessionCount;
+        projectsChanged = true;
+      }
+    }
+    if (projectsChanged) renderProjectSelector();
+
+    if (listVersion === state.runListVersion && state.selectedProjectId &&
+        (state.loadState === 'idle' || state.loadState === 'ready')) {
+      const listed = runs.filter((run) =>
+        inRunProject(run, state.selectedProjectId) && (state.allModes || run.mode === PAGE_MODE));
+      const current = listed.find((run) => run.id === state.run?.id);
+      if (state.run && !current) listed.push(state.run);
+      state.runs = listed;
+      renderRunSelector();
+      if (current) {
+        state.run = { ...state.run, ...current };
+        renderOverview();
+      }
+    }
+    if (projectsChanged || state.run) updateTopRunControls();
+    renderProjectWriteRisk();
+    if (state.cmdPaletteOpen) renderCommandPalette();
+    return true;
+  }
+
   function closeEventSource() {
     if (state.eventSource) {
       state.eventSource.close();
@@ -1179,6 +1341,11 @@
   }
 
   function connectEventSource(runId) {
+    if (state.globalEventSource) {
+      const ready = state.globalEventSource.readyState === 1;
+      setSseBadge(ready ? 'connected' : 'connecting', ready ? '实时流' : '连接实时流...');
+      return;
+    }
     closeEventSource();
     if (!runId) return;
 
@@ -1211,12 +1378,21 @@
       }
     };
 
+    attachRunEvents(es, () => ownsStream() ? runId : null);
+  }
+
+  function attachRunEvents(es, currentRunId, refreshCatalog = null) {
     const handleEvent = (eventType, rawData) => {
-      if (!ownsStream()) return;
+      if (refreshCatalog && ['run_updated', 'session_updated', 'workspace_updated'].includes(eventType)) {
+        void refreshCatalog();
+      }
+      const runId = currentRunId();
+      if (!runId) return;
       const payload = safeJsonParse(rawData, null);
       if (!payload || typeof payload !== 'object') return;
       const data = payload.data && typeof payload.data === 'object' ? payload.data : payload;
-      if (data.run_id && String(data.run_id) !== String(state.selectedRunId)) return;
+      const eventRunId = data.run_id || data.run?.id;
+      if ((refreshCatalog || eventRunId) && String(eventRunId) !== String(runId)) return;
 
       switch (eventType) {
         case 'board_message':
@@ -1243,6 +1419,7 @@
         case 'workflow_updated':
         case 'inbox_updated':
         case 'native_action_updated':
+        case 'session_updated':
           refreshSnapshot(runId, { silent: true });
           break;
         case 'stall_alert':
@@ -1259,6 +1436,7 @@
       'worker_control_updated',
       'workspace_updated',
       'run_updated',
+      'session_updated',
       'task_packet_updated',
       'stall_alert',
       'workflow_updated',
@@ -1347,7 +1525,7 @@
 
   function applyRunUpdate(updatedRun) {
     try {
-      validateRunContext(updatedRun, state.selectedRunId, state.selectedProjectId);
+      validateRunContext(updatedRun, state.selectedRunId, state.selectedProjectId, state.run?.mode || PAGE_MODE);
     } catch (err) {
       state.runs = [];
       clearRunState();
@@ -1410,31 +1588,76 @@
     }
   }
 
+  function projectName(project) {
+    return project?.display_name || project?.codex_project_name || project?.name || project?.root_path || '';
+  }
+
+  function isWorkspaceProject(project) {
+    // Before S3, the project API did not distinguish fixture projects.
+    return !project.canonical_project_id && (!Object.hasOwn(project, 'project_kind') || project.project_kind === 'workspace');
+  }
+
+  function sessionName(run) {
+    return run.codex_thread_name || run.session_display_name || (run.session_id ? run.title || run.session_id : '');
+  }
+
+  function runTitle(run) {
+    return run.title || `任务 ${shortId(run.id)}`;
+  }
+
+  function runContextLabel(run) {
+    return run.session_id ? [sessionName(run), run.session_seq ? `#${run.session_seq}` : ''].filter(Boolean).join(' · ') : runTitle(run);
+  }
+
+  function replaceSelectorMarkup(container, html, keys, fallback) {
+    if (container.innerHTML === html) return;
+    const focused = document.activeElement;
+    let selector = '';
+    if (focused && container.contains(focused)) {
+      selector = keys.map((key) => [key, focused.getAttribute(key)])
+        .filter(([, value]) => value !== null)
+        .map(([key, value]) => `[${key}="${CSS.escape(value)}"]`).join('');
+      if (!selector && focused.tagName === 'SUMMARY') {
+        const group = focused.closest('[data-session-group], [data-fixture-group]');
+        if (group) {
+          const id = group.getAttribute('data-session-group');
+          selector = id === null ? '[data-fixture-group] > summary' :
+            `[data-session-group="${CSS.escape(id)}"] > summary`;
+        }
+      }
+    }
+    container.innerHTML = html;
+    if (selector) {
+      const target = container.querySelector(selector);
+      (target?.getClientRects().length ? target : fallback).focus({ preventScroll: true });
+    }
+  }
+
   function renderProjectPopover() {
     const q = state.projectSearchQuery.trim().toLowerCase();
-    const list = state.projects.filter((p) => {
-      if (!q) return true;
-      return `${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q);
-    });
-    if (list.length === 0) {
-      el.projectPopoverList.innerHTML = `<div class="empty-state">${state.projects.length === 0 ? '暂无已注册项目' : '未匹配到相关项目'}</div>`;
-      return;
-    }
-    el.projectPopoverList.innerHTML = list
-      .map((p) => {
-        const selected = String(p.id) === String(state.selectedProjectId);
-        const kind = p.is_git ? 'Git' : '目录';
-        return `
-          <button type="button" class="popover-item ${selected ? 'is-selected' : ''}" role="option" aria-selected="${selected ? 'true' : 'false'}" data-select-project="${escapeHtml(p.id)}">
-            <div class="popover-item-top">
-              <span class="popover-item-title">${escapeHtml(p.name || p.root_path)}</span>
-              <span class="chip-tag ${p.is_git ? 'tint-primary' : 'tint-muted'}">${escapeHtml(kind)}</span>
-            </div>
-            <span class="popover-item-path mono">${escapeHtml(p.root_path || '')}</span>
-          </button>
-        `;
-      })
-      .join('');
+    const list = state.projects.filter((p) => `${projectName(p)} ${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q));
+    const renderItem = (p) => {
+      const selected = String(p.id) === String(state.selectedProjectId);
+      return `
+        <button type="button" class="popover-item ${selected ? 'is-selected' : ''}" aria-current="${selected}" data-select-project="${escapeHtml(p.id)}">
+          <div class="popover-item-top">
+            <span class="popover-item-title">${escapeHtml(projectName(p))}</span>
+            ${p.active_run_count != null ? `<span class="chip-tag tabular ${p.active_run_count ? 'tint-success' : 'tint-muted'}">${escapeHtml(p.active_run_count)} 个活跃</span>` : ''}
+            ${p.active_session_count ? `<span class="chip-tag tabular tint-muted">${escapeHtml(p.active_session_count)} 个会话</span>` : ''}
+            ${p.is_git ? '<span class="chip-tag tint-primary">[Git]</span>' : ''}
+          </div>
+          ${p.root_path ? `<span class="popover-item-path mono" title="${escapeHtml(p.root_path)}">${escapeHtml(p.root_path)}</span>` : ''}
+        </button>`;
+    };
+    const primary = list.filter(isWorkspaceProject);
+    const fixtures = list.filter((p) => !isWorkspaceProject(p));
+    replaceSelectorMarkup(el.projectPopoverList,
+      (ALL_PROJECTS_LABEL.includes(q) ? renderItem({ id: ALL_PROJECTS, name: ALL_PROJECTS_LABEL }) : '') +
+      primary.map(renderItem).join('') +
+      (fixtures.length ? `<details class="selector-disclosure" data-fixture-group ${state.projectFixturesOpen || q ? 'open' : ''}>
+        <summary>临时与验收夹具（${fixtures.length}）</summary>${fixtures.map(renderItem).join('')}</details>` : '') +
+      (list.length === 0 ? `<div class="empty-state">${state.projects.length ? '未匹配到相关项目' : '暂无已注册项目'}</div>` : ''),
+      ['data-select-project'], el.projectSearchInput);
   }
 
   function formatRelativeTimeShort(raw) {
@@ -1448,14 +1671,25 @@
     return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
   }
 
+  function runUpdatedMs(run) {
+    return parseTimestampMs(run.updated_at ?? run.created_at) ?? 0;
+  }
+
+  function renderRunModeToggle() {
+    el.runModeToggle.textContent = state.allModes ? '全部模式' : '仅看本模式';
+    el.runModeToggle.setAttribute('aria-pressed', String(state.allModes));
+  }
+
   function renderRunSidebar() {
+    const replace = (html) => replaceSelectorMarkup(el.runSidebarList, html, ['data-select-run'], el.runSearchInput);
     const q = state.runSearchQuery.trim().toLowerCase();
     const filter = state.runStatusFilter;
     el.sidebarRunsCount.textContent = String(state.runs.length);
+    renderRunModeToggle();
 
     if (state.runs.length === 0) {
       const msg = state.loadState === 'loading' ? '正在加载任务…' : state.loadState === 'error' ? '任务未加载' : `当前项目暂无 ${MODE_NAMES[PAGE_MODE] || ''} 任务`;
-      el.runSidebarList.innerHTML = `<div class="empty-state">${escapeHtml(msg)}</div>`;
+      replace(`<div class="empty-state">${escapeHtml(msg)}</div>`);
       return;
     }
 
@@ -1464,77 +1698,128 @@
       if (filter === 'active' && status !== 'active') return false;
       if (filter === 'done' && status === 'active') return false;
       if (q) {
-        const hay = `${r.title || ''} ${r.id || ''} ${labelRunStatus(r.status)}`.toLowerCase();
+        const hay = [r.title, r.id, r.session_id, labelRunStatus(r.status), sessionName(r), r.trigger_prompt].join(' ').toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
     });
 
     if (filtered.length === 0) {
-      el.runSidebarList.innerHTML = '<div class="empty-state">没有匹配的对话或任务</div>';
+      replace('<div class="empty-state">没有匹配的对话或任务</div>');
       return;
     }
 
-    const activeRuns = filtered.filter((r) => String(r.status || '').toLowerCase() === 'active');
-    const otherRuns = filtered.filter((r) => String(r.status || '').toLowerCase() !== 'active');
-
-    const renderItem = (r) => {
+    const renderItem = (r, withSession = false) => {
       const selected = String(r.id) === String(state.selectedRunId);
       const status = String(r.status || 'unknown').toLowerCase();
-      const title = r.title || `任务 ${shortId(r.id)}`;
       const updated = formatRelativeTimeShort(r.updated_at || r.created_at);
-      return `
-        <button type="button" class="run-sidebar-item ${selected ? 'is-selected' : ''}" role="option" aria-selected="${selected ? 'true' : 'false'}" data-select-run="${escapeHtml(r.id)}">
+      const title = `
           <div class="run-sidebar-item-top">
-            <span class="run-sidebar-title">${escapeHtml(title)}</span>
-            ${status === 'active' ? '<span class="status-dot dot-ok" aria-hidden="true"></span>' : ''}
-          </div>
+            <span class="run-sidebar-title">${escapeHtml(runTitle(r))}</span>
+            ${!withSession && status === 'active' ? '<span class="status-dot dot-ok" aria-hidden="true"></span>' : ''}
+          </div>`;
+      const metadata = `
           <div class="run-sidebar-meta">
+            ${withSession && r.session_seq ? `<span class="mono tabular">#${escapeHtml(r.session_seq)}</span>` : ''}
+            ${withSession && r.mode ? `<span class="chip-tag ${getModeTone(r.mode)}">${escapeHtml(MODE_BADGES[r.mode])}</span>` : ''}
             <span class="chip-tag ${getRunStatusTone(status)}">${escapeHtml(labelRunStatus(status))}</span>
             <span class="mono tabular">${escapeHtml(updated || shortId(r.id))}</span>
-          </div>
+          </div>`;
+      return `
+        <button type="button" class="run-sidebar-item ${selected ? 'is-selected' : ''}" aria-current="${selected}" data-select-run="${escapeHtml(r.id)}">
+          ${withSession ? metadata + title : title + metadata}
+          ${withSession && r.trigger_prompt ? `<span class="run-trigger-preview" title="${escapeHtml(r.trigger_prompt)}">触发：${escapeHtml(r.trigger_prompt)}</span>` : ''}
         </button>
       `;
     };
 
+    if (state.runs.some((r) => Object.hasOwn(r, 'session_id'))) {
+      const sessions = new Map();
+      for (const run of filtered) {
+        const projectId = canonicalRunProject(run);
+        const id = state.selectedProjectId === ALL_PROJECTS ? `${projectId}:${run.session_id || ''}` : run.session_id || '';
+        if (!sessions.has(id)) sessions.set(id, { id, projectId, runs: [], active: false, updated: 0 });
+        const group = sessions.get(id);
+        group.runs.push(run);
+        group.active ||= run.status === 'active';
+        group.updated = Math.max(group.updated, runUpdatedMs(run));
+      }
+      const groups = Array.from(sessions.values()).sort((a, b) => Number(b.active) - Number(a.active) || b.updated - a.updated);
+      replace(groups.map(({ id, projectId, runs, active }) => {
+        const ordered = runs.sort((a, b) => Number(b.session_seq || 0) - Number(a.session_seq || 0) || runUpdatedMs(b) - runUpdatedMs(a));
+        const selected = ordered.some((r) => String(r.id) === String(state.selectedRunId));
+        const expanded = Boolean(q) || (state.sessionOpenOverrides.get(id) ?? (active || selected));
+        const head = ordered.find((r) => r.codex_thread_name) || ordered[0];
+        const name = head.session_id ? sessionName(head) : '未绑定会话任务';
+        const project = state.selectedProjectId === ALL_PROJECTS ? projectName(projectFor(projectId)) || head.codex_project_name : '';
+        const title = project ? `${project} · ${name}` : name;
+        return `<details class="selector-disclosure session-group" data-session-group="${escapeHtml(id)}" ${expanded ? 'open' : ''}>
+          <summary><span class="session-group-heading">
+            ${active ? '<span class="status-dot dot-ok session-pulse" role="img" aria-label="有任务正在运行"></span>' : ''}
+            <span class="session-group-name" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
+            <span class="chip-tag tint-muted tabular">${ordered.length} 次</span>
+          </span></summary>
+          ${ordered.map((run) => renderItem(run, true)).join('')}
+        </details>`;
+      }).join(''));
+      return;
+    }
+
+    const activeRuns = filtered.filter((r) => r.status === 'active');
+    const otherRuns = filtered.filter((r) => r.status !== 'active');
     const groups = [];
     if (activeRuns.length > 0) {
-      groups.push(`<div class="run-group"><div class="run-group-label"><span>进行中</span><span class="tabular">${activeRuns.length}</span></div>${activeRuns.map(renderItem).join('')}</div>`);
+      groups.push(`<div class="run-group"><div class="run-group-label"><span>进行中</span><span class="tabular">${activeRuns.length}</span></div>${activeRuns.map((run) => renderItem(run)).join('')}</div>`);
     }
     if (otherRuns.length > 0) {
-      groups.push(`<div class="run-group"><div class="run-group-label"><span>历史任务</span><span class="tabular">${otherRuns.length}</span></div>${otherRuns.map(renderItem).join('')}</div>`);
+      groups.push(`<div class="run-group"><div class="run-group-label"><span>历史任务</span><span class="tabular">${otherRuns.length}</span></div>${otherRuns.map((run) => renderItem(run)).join('')}</div>`);
     }
-    el.runSidebarList.innerHTML = groups.join('');
+    replace(groups.join(''));
   }
 
   function getCommandPaletteEntries() {
     const q = state.cmdPaletteQuery.trim().toLowerCase();
     const items = [];
-    for (const r of state.runs) {
-      const title = r.title || `任务 ${shortId(r.id)}`;
+    const entries = new Map();
+    const allRuns = [...state.globalSessions.flatMap((session) => session.runs), ...state.runs];
+    for (const run of allRuns) entries.set(run.id, run);
+    const active = new Map([...state.globalActiveRuns, ...state.runs].map((run) => [run.id, run]).filter(([, run]) => run.status === 'active'));
+    const addRun = (r, group) => {
+      const title = runTitle(r);
       const status = labelRunStatus(r.status);
-      if (!q || `${title} ${r.id} ${status}`.toLowerCase().includes(q)) {
-        items.push({ kind: 'run', id: r.id, title, sub: `${status} · ${shortId(r.id)}`, tone: getRunStatusTone(r.status), badge: status, active: String(r.id) === String(state.selectedRunId) });
-      }
-    }
-    for (const p of state.projects) {
-      const name = p.name || p.root_path;
-      if (!q || `${name} ${p.root_path || ''}`.toLowerCase().includes(q)) {
-        items.push({ kind: 'project', id: p.id, title: name, sub: p.root_path || '', tone: p.is_git ? 'tint-primary' : 'tint-muted', badge: p.is_git ? 'Git' : '目录', active: String(p.id) === String(state.selectedProjectId) });
+      const project = projectFor(canonicalRunProject(r));
+      const name = projectName(project) || r.codex_project_name;
+      const terms = [title, r.id, r.session_id, status, sessionName(r), r.trigger_prompt, name, project?.name, project?.root_path, r.execution_root];
+      if (!terms.join(' ').toLowerCase().includes(q)) return;
+      const sub = [name, r.session_id ? runContextLabel(r) : shortId(r.id), MODE_BADGES[r.mode]].filter(Boolean).join(' · ');
+      items.push({ kind: 'run', group, id: r.id, title, sub, tone: getRunStatusTone(r.status), badge: status, active: String(r.id) === String(state.selectedRunId) });
+    };
+    for (const r of active.values()) addRun(r, 'active');
+    if (!state.cmdActiveOnly) {
+      for (const r of entries.values()) if (!active.has(r.id)) addRun(r, 'sessions');
+      for (const p of state.projects.filter(isWorkspaceProject)) {
+        const name = projectName(p);
+        if (`${name} ${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q)) {
+          items.push({ kind: 'project', group: 'projects', id: p.id, title: name, sub: p.root_path || '', tone: p.is_git ? 'tint-primary' : 'tint-muted', badge: p.is_git ? 'Git' : '目录', active: String(p.id) === String(state.selectedProjectId) });
+        }
       }
     }
     return items;
   }
 
   function renderCommandPalette() {
+    const replace = (html) => replaceSelectorMarkup(el.cmdPaletteResults, html, ['data-cmd-kind', 'data-cmd-id'], el.cmdPaletteInput);
     const items = getCommandPaletteEntries();
+    const selectedKey = state.cmdPaletteKeys[state.cmdPaletteIndex];
+    state.cmdPaletteKeys = items.map((item) => `${item.kind}:${item.id}`);
+    if (selectedKey !== undefined) {
+      state.cmdPaletteIndex = Math.max(0, state.cmdPaletteKeys.indexOf(selectedKey));
+    }
     if (items.length === 0) {
-      el.cmdPaletteResults.innerHTML = '<div class="empty-state">无匹配的项目或运行任务</div>';
+      replace('<div class="empty-state">无匹配的项目或运行任务</div>');
       return;
     }
     if (state.cmdPaletteIndex >= items.length) state.cmdPaletteIndex = 0;
-    const runs = items.filter((i) => i.kind === 'run');
-    const projects = items.filter((i) => i.kind === 'project');
     let idx = 0;
     const renderBtn = (item) => {
       const currentIdx = idx++;
@@ -1548,18 +1833,22 @@
         </button>
       `;
     };
-    const parts = [];
-    if (runs.length) parts.push(`<div><div class="cmd-group-label">当前项目对话 / 运行任务</div>${runs.map(renderBtn).join('')}</div>`);
-    if (projects.length) parts.push(`<div><div class="cmd-group-label">切换工作区项目</div>${projects.map(renderBtn).join('')}</div>`);
-    el.cmdPaletteResults.innerHTML = parts.join('');
+    const groups = { active: '正在运行', sessions: 'Codex 会话与轮次', projects: '切换真实项目' };
+    replace(Object.entries(groups).map(([key, label]) => {
+      const matches = items.filter((item) => item.group === key);
+      return matches.length ? `<div><div class="cmd-group-label">${label}</div>${matches.map(renderBtn).join('')}</div>` : '';
+    }).join(''));
   }
 
-  function openCommandPalette() {
+  function openCommandPalette(activeOnly = false) {
     setProjectPopoverOpen(false);
     state.cmdPaletteOpen = true;
     state.cmdPaletteQuery = '';
     state.cmdPaletteIndex = 0;
+    state.cmdPaletteKeys = [];
+    state.cmdActiveOnly = activeOnly;
     el.cmdPaletteInput.value = '';
+    el.cmdPaletteBackdrop.setAttribute('aria-hidden', 'false');
     el.cmdPaletteBackdrop.classList.remove('hidden');
     renderCommandPalette();
     el.cmdPaletteInput.focus();
@@ -1568,8 +1857,9 @@
   function closeCommandPalette(returnFocus = true) {
     if (!state.cmdPaletteOpen) return;
     state.cmdPaletteOpen = false;
+    el.cmdPaletteBackdrop.setAttribute('aria-hidden', 'true');
     el.cmdPaletteBackdrop.classList.add('hidden');
-    if (returnFocus) el.cmdPaletteTrigger.focus();
+    if (returnFocus) (state.cmdActiveOnly ? el.globalActiveBadge : el.cmdPaletteTrigger).focus();
   }
 
   async function executeCommandEntry(kind, id) {
@@ -1577,7 +1867,11 @@
     if (kind === 'project') {
       await loadRuns(id || null);
     } else if (kind === 'run' && id) {
-      await selectRun(id);
+      const run = [...state.runs, ...state.globalActiveRuns, ...state.globalSessions.flatMap((session) => session.runs)]
+        .find((r) => String(r.id) === String(id));
+      if (run?.mode && run.mode !== PAGE_MODE) state.allModes = true;
+      if (!run || state.runs.some((r) => String(r.id) === String(id))) await selectRun(id);
+      else await loadRuns(state.selectedProjectId === ALL_PROJECTS ? ALL_PROJECTS : canonicalRunProject(run), id, run);
     }
   }
 
@@ -1596,19 +1890,21 @@
       return;
     }
 
-    const current = state.projects.find((p) => String(p.id) === String(state.selectedProjectId));
-    el.projectSelect.innerHTML = (current ? '' : '<option value="">请选择项目</option>') + state.projects
+    const all = state.selectedProjectId === ALL_PROJECTS;
+    const current = projectFor(state.selectedProjectId);
+    el.projectSelect.innerHTML = (current || all ? '' : '<option value="">请选择项目</option>') +
+      `<option value="${ALL_PROJECTS}" ${all ? 'selected' : ''}>${ALL_PROJECTS_LABEL}</option>` + state.projects
       .map((p) => {
         const selected = String(p.id) === String(state.selectedProjectId) ? 'selected' : '';
         const kind = p.is_git ? 'Git' : '目录';
-        const label = `${p.name || p.root_path} [${kind}]`;
+        const label = `${projectName(p)} [${kind}]`;
         return `<option value="${escapeHtml(p.id)}" ${selected} title="${escapeHtml(p.root_path)}">${escapeHtml(label)}</option>`;
       })
       .join('');
 
-    el.projectPathSubtitle.textContent = current ? current.root_path : '未选择项目';
+    el.projectPathSubtitle.textContent = all ? ALL_PROJECTS_LABEL : current ? current.root_path : '未选择项目';
     el.projectPathSubtitle.title = current ? current.root_path : '';
-    const displayName = current ? (current.name || current.root_path) : '请选择项目';
+    const displayName = all ? ALL_PROJECTS_LABEL : current ? projectName(current) : '请选择项目';
     el.projectSwitcherName.textContent = displayName;
     el.projectSwitcherPath.textContent = current ? current.root_path : '';
     el.topbarContextProject.textContent = displayName;
@@ -1641,11 +1937,24 @@
       .join('');
 
     const currentRun = state.runs.find((r) => String(r.id) === String(state.selectedRunId));
-    el.topbarContextRun.textContent = currentRun ? (currentRun.title || `任务 ${shortId(currentRun.id)}`) : '选择任务';
+    el.topbarContextRun.textContent = currentRun ? runContextLabel(currentRun) : '选择任务';
     renderRunSidebar();
   }
 
+  function renderProjectWriteRisk() {
+    const warning = document.getElementById('projectWriteRisk');
+    const project = projectFor(state.selectedProjectId);
+    const id = project?.canonical_project_id || project?.id ||
+      (state.run ? canonicalRunProject(state.run) : state.selectedProjectId);
+    const risky = state.riskyProjectIds.has(id) ||
+      (state.selectedProjectId === ALL_PROJECTS && state.riskyProjectIds.size > 0) ||
+      state.run?.concurrent_local_write_risk;
+    warning.textContent = risky ? '并发写冲突风险' : '';
+    warning.classList.toggle('hidden', !risky);
+  }
+
   function updateTopRunControls() {
+    renderProjectWriteRisk();
     const run = state.run || state.runs.find((r) => String(r.id) === String(state.selectedRunId));
     const effectiveMode = String(run?.mode || PAGE_MODE || '').toLowerCase();
     if (effectiveMode && el.dashboardShell?.setAttribute) {
@@ -1677,10 +1986,14 @@
     el.runStatusBadge.className = `run-pill-status status-${escapeHtml(status)}`;
     el.runStatusBadge.textContent = labelRunStatus(status);
 
-    const runTitle = run.title || `任务 ${shortId(run.id)}`;
-    el.runTitleHeading.textContent = runTitle;
-    el.runTitleHeading.title = `${runTitle} (${run.id})`;
-    el.topbarContextRun.textContent = runTitle;
+    const title = runTitle(run);
+    el.runTitleHeading.textContent = title;
+    el.runTitleHeading.title = `${title} (${run.id})`;
+    el.topbarContextRun.textContent = runContextLabel(run);
+    if (run.session_id || state.selectedProjectId === ALL_PROJECTS) {
+      el.topbarContextProject.textContent = projectName(projectFor(canonicalRunProject(run))) ||
+        run.codex_project_name || el.projectSwitcherName.textContent;
+    }
 
     const ready = state.loadState === 'ready';
     el.exportMenuBtn.disabled = !ready;
@@ -2435,6 +2748,9 @@
       return;
     }
     const run = state.run;
+    const projectRoot = projectFor(canonicalRunProject(run))?.root_path;
+    const pathKey = (path) => /^[A-Z]:[\\/]|^\\\\/i.test(path) ? path.replaceAll('\\', '/').toLowerCase() : path;
+    const executionRoot = run.execution_root && pathKey(run.execution_root) !== pathKey(projectRoot || '') ? run.execution_root : '';
     const recent = state.messages.slice(-6).reverse();
     const retired = state.workers.filter((w) => ['stopped', 'killed'].includes(w.status));
     const current = state.workers.filter((w) => !['stopped', 'killed'].includes(w.status));
@@ -2444,6 +2760,14 @@
       counts.set(label, (counts.get(label) || 0) + 1);
     }
     el.overviewContent.innerHTML = `
+      ${run.concurrent_local_write_risk ? `<p class="banner banner-warning concurrent-write-warning" role="status"><strong>并发写冲突风险</strong> · 同一工作区有 ${escapeHtml(run.concurrent_project_active_count)} 个活跃任务，至少一个任务可能直接写入项目目录。</p>` : ''}
+      ${run.session_id || run.trigger_prompt || executionRoot ? `<div class="session-overview">
+        ${run.session_id ? `<strong>Codex 会话：${escapeHtml(sessionName(run))}</strong>
+        <span class="mono" title="${escapeHtml(run.session_id)}">${escapeHtml(run.session_id)}</span>
+        ${run.session_seq ? `<span class="chip-tag tint-primary tabular">#${escapeHtml(run.session_seq)}</span>` : ''}` : ''}
+        ${run.trigger_prompt ? `<p class="session-overview-detail"><strong>触发原话</strong> ${escapeHtml(run.trigger_prompt)}</p>` : ''}
+        ${executionRoot ? `<p class="session-overview-detail"><strong>执行目录</strong> <span class="mono">${escapeHtml(executionRoot)}</span></p>` : ''}
+      </div>` : ''}
       ${renderOverviewKpiStrip(run, current, retired)}
       <section class="overview-section overview-task">
         <h2>任务概况 <span class="pill-badge ${getModeTone(run.mode)}">${escapeHtml(labelMode(run.mode))}</span> <span class="pill-badge ${getRunStatusTone(run.status)}">${escapeHtml(labelRunStatus(run.status))}</span></h2>
@@ -2493,16 +2817,31 @@
       el.boardStatsSubtitle.classList.add('hidden');
     }
 
+    const turns = state.sessionTurns.map((turn) => ({ turn, time: parseTimestampMs(turn.created_at) }))
+      .filter(({ time }) => time !== null)
+      .sort((a, b) => a.time - b.time);
+    const renderTurn = ({ turn }, index) => `<div class="board-turn-divider">
+      <strong>对话轮次 ${index + 1}</strong>
+      <span class="mono" title="${escapeHtml(turn.turn_id)}">${escapeHtml(formatLocalTime(turn.created_at))}</span>
+      ${turn.prompt_preview ? `<span class="board-turn-prompt" title="${escapeHtml(turn.prompt_preview)}">${escapeHtml(turn.prompt_preview)}</span>` : ''}
+    </div>`;
     if (filtered.length === 0) {
       el.boardFeed.innerHTML =
         state.messages.length === 0
-          ? '<div class="empty-state empty-board">暂无消息，等待运行任务产生协作动态...</div>'
+          ? turns.map(renderTurn).join('') + '<div class="empty-state empty-board">暂无消息，等待运行任务产生协作动态...</div>'
           : '<div class="empty-state empty-board">没有匹配当前频道、@提及或关键词筛选条件的消息。</div>';
       return;
     }
 
+    let nextTurn = 0;
     el.boardFeed.innerHTML = filtered
       .map((msg) => {
+        const messageTime = parseTimestampMs(msg.created_at);
+        let dividers = '';
+        while (messageTime !== null && nextTurn < turns.length && turns[nextTurn].time <= messageTime) {
+          dividers += renderTurn(turns[nextTurn], nextTurn);
+          nextTurn += 1;
+        }
         const msgType = String(msg.msg_type || 'info').toLowerCase();
         const role = inferSenderRole(msg);
         const channel = normalizeChannel(msg.channel);
@@ -2516,7 +2855,7 @@
         const showChannelChip = channel !== 'main';
         const showTypeChip = msgType !== 'info';
 
-        return `
+        return `${dividers}
           <article class="feed-row ${rowClass}" data-seq="${escapeHtml(msg.seq)}">
             <div class="feed-row-head">
               <div class="feed-row-identity">
@@ -2553,7 +2892,7 @@
           </article>
         `;
       })
-      .join('');
+      .join('') + turns.slice(nextTurn).map((turn, offset) => renderTurn(turn, nextTurn + offset)).join('');
 
     if (state.autoScroll && (wasNearBottom || !opts.isLiveAppend)) {
       scrollFeedToBottom();
@@ -3757,6 +4096,7 @@
   // ---------- 事件绑定 ----------
 
   function bindEvents() {
+    renderRunModeToggle();
     el.overviewContent.addEventListener('toggle', (evt) => {
       const detail = evt.target;
       if (!detail.dataset.overviewDetail || !detail.isConnected) return;
@@ -3850,6 +4190,8 @@
     });
 
     el.projectPopoverList.addEventListener('click', async (evt) => {
+      const fixtures = evt.target.closest('summary')?.closest('[data-fixture-group]');
+      if (fixtures) state.projectFixturesOpen = !fixtures.open;
       const item = evt.target.closest('[data-select-project]');
       if (!item) return;
       const projectId = item.getAttribute('data-select-project');
@@ -3860,6 +4202,13 @@
     el.runSearchInput.addEventListener('input', () => {
       state.runSearchQuery = el.runSearchInput.value || '';
       renderRunSidebar();
+    });
+
+    el.runModeToggle.addEventListener('click', async () => {
+      state.allModes = !state.allModes;
+      const selected = state.run || state.runs.find((r) => r.id === state.selectedRunId);
+      const keepSelected = selected && (state.allModes || selected.mode === PAGE_MODE);
+      await loadRuns(state.selectedProjectId, keepSelected ? selected.id : null, keepSelected ? selected : null);
     });
 
     for (const pill of el.runFilterPills) {
@@ -3875,6 +4224,8 @@
     }
 
     el.runSidebarList.addEventListener('click', async (evt) => {
+      const group = evt.target.closest('summary')?.closest('[data-session-group]');
+      if (group) state.sessionOpenOverrides.set(group.dataset.sessionGroup, !group.open);
       const item = evt.target.closest('[data-select-run]');
       if (!item) return;
       const nextRunId = item.getAttribute('data-select-run');
@@ -3885,6 +4236,7 @@
     el.cmdPaletteTrigger.addEventListener('click', () => {
       openCommandPalette();
     });
+    el.globalActiveBadge.addEventListener('click', () => openCommandPalette(true));
 
     el.cmdPaletteBackdrop.addEventListener('click', (evt) => {
       if (evt.target === el.cmdPaletteBackdrop) closeCommandPalette(true);
@@ -3893,6 +4245,7 @@
     el.cmdPaletteInput.addEventListener('input', () => {
       state.cmdPaletteQuery = el.cmdPaletteInput.value || '';
       state.cmdPaletteIndex = 0;
+      state.cmdPaletteKeys = [];
       renderCommandPalette();
     });
 
@@ -4162,6 +4515,7 @@
 
     window.addEventListener('beforeunload', () => {
       closeEventSource();
+      state.globalEventSource?.close();
       stopGraphReplay();
     });
   }
@@ -4181,7 +4535,7 @@
       try {
         const run = await resolveRun(runId, params.get('project_id'), null);
         if (!run) return;
-        params.set('project_id', run.project_id);
+        params.set('project_id', params.get('project_id') || canonicalRunProject(run));
         params.set('run_id', run.id);
         window.location.replace(`/${run.mode}?${params}`);
       } catch (err) {
@@ -4203,6 +4557,7 @@
     } catch (err) {
       showToast('加载项目列表失败', err.message, 'error');
     }
+    connectGlobalEvents();
 
     setInterval(checkHealth, HEALTH_POLL_MS);
     setInterval(tickHeartbeats, HEARTBEAT_TICK_MS);

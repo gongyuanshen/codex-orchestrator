@@ -2,7 +2,15 @@
 
 面向 Codex 的自包含多代理编排插件，提供 **`$boost`**（极速模式）、**`$teamwork`**（协同模式）、**`$swarm`**（蜂窝模式）三种交互式原生 V2 子代理工作流，配套生命周期钩子（`SessionStart`、`PostCompact`、`UserPromptSubmit`、`Stop`），底层由本地单例 HTTP/SSE 守护进程、SQLite WAL `#seq` 消息板、`git clone --local` / 三方目录快照隔离工作区（含非破坏性冲突预检）以及极简中文 Web 控制台（`http://127.0.0.1:18790`）提供支撑。
 
-## 0.6.0 更新
+## 0.6.1 更新
+
+- **工作区、会话、任务三层视图：** 工作区切片归并到真实项目，Codex 会话内的任务按批次编号。控制台可用 `Ctrl+K` 搜索会话和触发提示词，跨项目、跨模式直达活跃任务。
+- **多轮与并发状态：** 日志区记录对话轮次，概况页展示执行目录及同项目并发直改提醒。Stop 钩子只检查当前根会话绑定的活跃任务。
+- **兼容升级（`schema 9` / `workflow5`）：** 保留旧项目 ID 和任务链接；没有会话绑定证据的历史任务仍显示为「未绑定会话任务」。
+
+数据库副本演练及复验方法见 [0.6.1 会话映射验收](docs/verification/v0.6.1-session-mapping.md)。
+
+## 0.6.0 历史更新
 
 - **原子宏工具与首轮直达（`workflow5` / `schema 8`）：** 新增 `workflow_prepare_dispatch`、`native_action_record_call`、`workflow_author_turn`、`workflow_verifier_turn`、`workflow_closeout_run` 与 `session_bind`，将工作区创建、派发登记、作者接收/提交、双层验收与全流程收尾压缩为原子事务，消除子代理首轮 `waiting-only` 空转，并将 `board_status(compact=True)` 轮询载荷缩减约 74%–82%。
 - **生命周期钩子与单一清单收敛（`tri-orchestrator-hook`）：** 移除旧版根级 `plugin/plugin.json`，统一收敛至 `plugin/.codex-plugin/plugin.json` 并声明 `plugin/hooks/hooks.json`，支持 `SessionStart`、`PostCompact`、`UserPromptSubmit`、`Stop` 四类钩子，实现冷启动本地 `session_id` 注入、上下文压缩后自动恢复与未收尾工作流单次防早退拦截；守护进程离线时静默零副作用退出，绝不自动拉起后台服务。
@@ -11,7 +19,7 @@
 
 发布与验证记录见 [0.6.0 发布记录](docs/verification/github-060-20261118/report.md)、[0.6.0 隔离验收报告](docs/verification/v0.6.0-isolated-acceptance.md)、[0.6.0 二阶段与深度审计验收](docs/verification/v0.6.0-phase2-supplement-acceptance.md)、[M9 生命周期钩子实测](docs/verification/m9-hooks-spike-0.6.0.md) 与 [0.6.0 正式升级回执](docs/verification/v0.6.0-production-upgrade-receipt.md)。
 
-## 0.5.0 历史更新（当前正式版本已升级 0.6.0）
+## 0.5.0 历史更新
 
 - **可靠派发：** 记录原生代理调用的领取、开始、结果和核对过程，区分“尚未调用”和“结果未知”。
 - **真实验收：** 新增命令行采集器 `tri-orchestrator-verify`，保存真实退出码、输出和绑定当前产物的验收回执。
@@ -23,7 +31,7 @@
 
 历史 0.5.0 发布记录见 [0.5.0 发布记录](docs/verification/github-050-20261117/report.md)。`tri-orchestrator-verify` 与 `tri-orchestrator-challenge` 均由宿主侧或验收者在终端运行，不通过后台服务执行任意命令。验收命令和工作目录由产物清单冻结，仅白名单环境变量键名（`env_profile`），绝不序列化环境变量值。
 
-## Route A 历史交付（0.3.0；当前正式版本已升级 0.6.0）
+## Route A 历史交付（0.3.0）
 
 正式服务新增可靠收件箱、版本绑定的候选／集成验收、步骤检查点和最多3轮自动返工。原生代理仍由根协调者投递、唤醒和中断；消息回执不是独立验收。
 
@@ -50,6 +58,8 @@
 
 ### 方式 A — 零脚本 GitHub 开箱即用安装
 
+以下零脚本流程适用于首次安装。已有旧 Schema 运行库时，先结束活跃任务，再按 `scripts/upgrade.py` 的受控流程备份并离线迁移；新守护进程不会在启动时迁移旧库。不要覆盖旧版本的 Codex 托管缓存。
+
 在 Windows、macOS 或 Linux 上直接通过 Codex CLI 从 GitHub 安装，无需运行任何本地脚本：
 
 ```bash
@@ -58,7 +68,7 @@ codex plugin add tri-orchestrator@tri-orchestrator
 ```
 
 安装后将自动完成以下过程：
-- Codex 按所选市场版本缓存 `./plugin/`；当前版本为 `0.6.0`，对应缓存 `~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.6.0/`。
+- Codex 按所选市场版本缓存 `./plugin/`；例如 `0.6.1` 对应缓存 `~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.6.1/`。
 - 首次触发 MCP 时，Codex 在插件缓存目录内自动执行 `uv run --quiet --project . python -m orchestrator.mcp_shim`，安装运行时依赖（`mcp`、`starlette`、`uvicorn`、`httpx`）并拉起后台单例守护进程。
 - **零脚本角色回退契约：** 若 `~/.codex/agents/*.toml` 中未安装专用角色配置，`$boost`、`$teamwork` 与 `$swarm` 在调用 `spawn_agent` 时会**省略 `agent_type` 参数**（不要传 `agent_type="default"`），同时**省略 `model` 与 `reasoning_effort`**（100% 继承当前主会话的模型与思考档位，绝不硬编码模型或思考档位），并在提示词中内联完整角色契约。
 
@@ -67,7 +77,7 @@ codex plugin add tri-orchestrator@tri-orchestrator
 克隆本仓库后运行平台安装脚本，可额外获得：
 1. 将全部 6 个专用角色配置（`plugin/agents/*.toml`，仅配置角色职责与只读角色 `sandbox_mode`）安装至 `~/.codex/agents/`（始终 100% 继承当前 Codex 主会话的模型与思考档位 `model_reasoning_effort`，不硬编码任何模型名或思考档位）；
 2. 创建带时间戳备份与基线备份后，安全合并 `[agents]` 并发限制（`max_threads = 6`、`max_depth = 2`）与 `[features]` 多代理开关（`multi_agent = true`、`multi_agent_v2 = true`）至 `~/.codex/config.toml`，并通过 `codex --strict-config` 校验；
-3. 在 Codex 插件缓存目录（`~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/0.6.0/`）中预热 `uv sync --no-dev`，生成全部 5 个 `tri-orchestrator-{mcp,daemon,verify,hook,challenge}` 可执行入口，同时不修改仓库内任何受追踪文件；
+3. 在对应版本的 Codex 插件缓存目录预热 `uv sync --no-dev`，生成全部 5 个 `tri-orchestrator-{mcp,daemon,verify,hook,challenge}` 可执行入口，同时不修改仓库内任何受追踪文件；
 4. 通过 `codex app-server --stdio` 执行 `hooks/list` 自检，核实 4 个生命周期钩子（`sessionStart`、`postCompact`、`userPromptSubmit`、`stop`）已被原生发现。默认保留 `untrusted` 状态供用户在 Codex 桌面端一键点击信任；自动化或纯 CLI 环境可显式附加 `-TrustPluginHooks`（PowerShell）或 `--trust-plugin-hooks`（Bash）将信任哈希写入 `[hooks.state]`。
 
 **Windows（PowerShell）：**
@@ -138,7 +148,7 @@ Codex CLI / V2 Subagents / Lifecycle Hooks
 ```text
 .
 ├── .agents/plugins/marketplace.json            # Codex 插件市场目录（指向 ./plugin）
-├── plugin/                                     # 自包含可分发插件包（v0.6.0）
+├── plugin/                                     # 自包含可分发插件包（v0.6.1）
 │   ├── .codex-plugin/plugin.json               # 唯一 Codex 插件清单（元数据、skills、hooks、mcpServers）
 │   ├── .mcp.json                               # Codex MCP 覆盖配置（env_vars、超时设置）
 │   ├── mcp.json                                # MCP 启动配置（${PLUGIN_ROOT}）
@@ -170,7 +180,7 @@ Codex CLI / V2 Subagents / Lifecycle Hooks
 
 ---
 
-## MCP 工具（当前源码与正式 0.6.0 安装版均为 35 个公开工具）
+## MCP 工具（35 个公开工具）
 
 > 注：除下方 35 个公开 MCP 工具外，`/api/rpc` 另保留 1 个内部只读/单次门禁查询接口 `session_hook_check` 供本地 `tri-orchestrator-hook` 调用，不向模型 `tools/list` 暴露以节省上下文。
 

@@ -442,3 +442,65 @@ def test_t5_stop_skips_other_roots_in_one_session_and_marks_by_default(env):
     assert db.get_session_binding("same-session", run_root)["last_stop_blocked_key"] == result["blocked_key"]
     assert db.get_session_binding("same-session", run_other)["last_stop_blocked_key"] is None
     assert not stop()["should_block_stop"]
+
+
+def test_t3_custom_slice_name_cannot_rename_registered_parent(env, monkeypatch):
+    root, db, rpc = env
+    child = root / "artifacts" / "slice"
+    child.mkdir(parents=True)
+    _codex_project(monkeypatch, root)
+    project = db.ensure_project(root, name="Codex Main")
+
+    run = _run(rpc, child, "custom-slice", project_name="Unrelated scratch label")
+
+    assert run["project_id"] == project["id"]
+    assert run["execution_root"] == str(child)
+    assert db.get_project(project["id"])["name"] == "Codex Main"
+
+
+def test_list_runs_orders_equal_timestamps_by_newest_insertion(env, monkeypatch):
+    root, db, _rpc = env
+    project = db.ensure_project(root)
+    monkeypatch.setattr(db_module.time, "time", lambda: 123.0)
+    runs = [db.create_run(project_id=project["id"], mode="swarm", title=str(i)) for i in range(3)]
+
+    assert db.list_runs(project_id=project["id"], limit=2) == [runs[2], runs[1]]
+
+
+def test_execution_root_rejects_outside_paths_atomically(env):
+    root, db, rpc = env
+    outside = root.with_name(root.name + "-sibling")
+    outside.mkdir()
+    with pytest.raises(ValueError, match="execution_root"):
+        _run(rpc, root, "outside", execution_root=str(outside))
+    assert db.list_projects() == []
+    project = db.ensure_project(root)
+    with pytest.raises(ValueError, match="execution_root"):
+        rpc("run_create", project_id=project["id"], mode="swarm", title="outside", execution_root=str(outside))
+    assert db.list_runs() == []
+
+
+def test_execution_root_rejects_historical_outside_workspace_placement(env):
+    root, db, rpc = env
+    outside = root.with_name(root.name + "-historical")
+    outside.mkdir()
+    run = _run(rpc, root, "historical")
+    with db.transaction() as conn:
+        conn.execute("UPDATE runs SET execution_root=? WHERE id=?", (str(outside), run["id"]))
+    with pytest.raises(ValueError, match="execution_root"):
+        rpc("workspace_create", run_id=run["id"], worker_name="worker")
+    assert not (outside / ".swarm-workspaces").exists()
+
+
+def test_execution_root_rejects_symlink_escape(env):
+    root, db, rpc = env
+    outside = root.with_name(root.name + "-outside")
+    outside.mkdir()
+    link = root / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("Directory symlink unavailable")
+    with pytest.raises(ValueError, match="execution_root"):
+        _run(rpc, root, "symlink", execution_root=str(link))
+    assert db.list_runs() == []

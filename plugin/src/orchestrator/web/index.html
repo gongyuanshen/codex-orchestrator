@@ -142,6 +142,10 @@
       </div>
 
       <div class="topbar-right">
+        <span id="projectWriteRisk" class="chip-tag tint-warning hidden" role="status"
+          title="至少一个活跃任务可能直接写入项目目录">并发写冲突风险</span>
+        <button id="globalActiveBadge" class="topbar-btn global-active-badge hidden" type="button"
+          aria-haspopup="dialog" aria-controls="cmdPaletteDialog" title="查看所有项目和模式中正在运行的任务">0 个会话运行中</button>
         <div id="healthBadge" class="live-pill" role="status" aria-live="polite" title="守护进程健康状态与实时端口">
           <span class="status-dot dot-pending"></span>
           <span class="status-text">检测中</span>
@@ -203,7 +207,7 @@
         <!-- Project Switcher Header + Searchable Popover -->
         <div class="sidebar-project-wrap">
           <div class="sidebar-section-label">工作区项目</div>
-          <button id="projectSwitcherBtn" class="project-switcher-btn" type="button" aria-haspopup="listbox" aria-expanded="false" aria-controls="projectPopover">
+          <button id="projectSwitcherBtn" class="project-switcher-btn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="projectPopover">
             <div class="project-switcher-main">
               <span class="project-switcher-icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -231,14 +235,14 @@
               </svg>
               <input id="projectSearchInput" class="popover-search-input" type="search" placeholder="筛选项目名或本地路径…" autocomplete="off">
             </div>
-            <div id="projectPopoverList" class="popover-list" role="listbox" aria-label="项目列表"></div>
+            <div id="projectPopoverList" class="popover-list" role="group" aria-label="项目列表"></div>
           </div>
         </div>
 
         <!-- Run / Conversation List with Filter & Grouping -->
         <div class="sidebar-runs-wrap">
           <div class="sidebar-runs-header">
-            <span class="sidebar-section-label">对话与运行任务</span>
+            <span class="sidebar-section-label">会话与任务</span>
             <span id="sidebarRunsCount" class="pill-badge tint-muted tabular">0</span>
           </div>
           <div class="sidebar-runs-controls">
@@ -247,16 +251,18 @@
                 <circle cx="11" cy="11" r="7"></circle>
                 <path d="m20 20-3.5-3.5"></path>
               </svg>
-              <input id="runSearchInput" class="sidebar-search-input" type="search" placeholder="搜索任务标题或 ID..." autocomplete="off">
+              <input id="runSearchInput" class="sidebar-search-input" type="search" placeholder="搜索会话、任务或触发原话…" autocomplete="off">
             </div>
             <div id="runFilterPills" class="run-filter-pills" role="group" aria-label="任务状态过滤">
               <button type="button" class="run-filter-pill active" data-run-filter="all" aria-pressed="true">全部</button>
               <button type="button" class="run-filter-pill" data-run-filter="active" aria-pressed="false">进行中</button>
               <button type="button" class="run-filter-pill" data-run-filter="done" aria-pressed="false">已完结</button>
             </div>
+            <button id="runModeToggle" class="btn btn-xs run-mode-toggle" type="button" aria-pressed="false"
+              aria-label="浏览全部模式" title="仅看本模式 / 全部模式">仅看本模式</button>
           </div>
 
-          <div id="runSidebarList" class="run-sidebar-list" role="listbox" aria-label="当前项目运行任务">
+          <div id="runSidebarList" class="run-sidebar-list" role="group" aria-label="会话与任务">
             <div class="empty-state">正在加载任务…</div>
           </div>
         </div>
@@ -488,7 +494,7 @@
           <circle cx="11" cy="11" r="7"></circle>
           <path d="m20 20-3.5-3.5"></path>
         </svg>
-        <input id="cmdPaletteInput" class="cmd-input" type="search" placeholder="输入项目名、路径或对话任务标题进行快速跳转..." autocomplete="off">
+        <input id="cmdPaletteInput" class="cmd-input" type="search" placeholder="搜索会话、触发原话、任务标题、项目名或路径…" autocomplete="off">
         <kbd class="kbd-hint">ESC</kbd>
       </div>
       <div id="cmdPaletteResults" class="cmd-results" role="listbox" aria-label="匹配结果"></div>
