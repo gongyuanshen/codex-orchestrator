@@ -183,6 +183,7 @@ def test_static_web_assets_and_health(
 def test_mode_entry_routes_share_dashboard_and_preserve_unknown_path_404(daemon_env):
     _, _, client = daemon_env
     root = client.get("/")
+    assert re.search(r'<a\b[^>]*\bid="brandHomeLink"[^>]*\bhref="/"', root.text)
     for mode in ("boost", "teamwork", "swarm"):
         response = client.get(f"/{mode}", params={"project_id": "p", "run_id": "r"})
         assert response.status_code == 200, response.text

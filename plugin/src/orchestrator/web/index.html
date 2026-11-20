@@ -105,7 +105,7 @@
           </svg>
         </button>
 
-        <div class="brand" title="三重编排器本地控制台">
+        <a id="brandHomeLink" href="/" class="brand" title="返回模式选择首页" aria-label="返回模式选择首页">
           <span class="brand-mark" aria-hidden="true">
             <svg class="brand-icon" viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="5" r="2.2"></circle>
@@ -115,7 +115,7 @@
             </svg>
           </span>
           <span class="brand-title">三重编排器</span>
-        </div>
+        </a>
 
         <nav class="mode-nav mode-bar" aria-label="工作模式">
           <a href="/boost" data-mode-link="boost" class="mode-seg" data-mode-key="boost">Boost <span>专注</span></a>
@@ -259,8 +259,10 @@
               <button type="button" class="run-filter-pill" data-run-filter="active" aria-pressed="false">进行中</button>
               <button type="button" class="run-filter-pill" data-run-filter="done" aria-pressed="false">已完结</button>
             </div>
-            <button id="runModeToggle" class="btn btn-xs run-mode-toggle" type="button" aria-pressed="false"
-              aria-label="浏览全部模式" title="仅看本模式 / 全部模式">仅看本模式</button>
+            <div id="runModeToggle" class="run-filter-pills run-mode-pills" role="group" aria-label="工作模式筛选">
+              <button type="button" id="runModeCurrentBtn" class="run-filter-pill active" data-run-mode="current" aria-pressed="true" title="仅显示当前工作模式下的任务">仅本模式</button>
+              <button type="button" id="runModeAllBtn" class="run-filter-pill" data-run-mode="all" aria-pressed="false" title="同时显示 Boost、Teamwork 与 Swarm 全部工作模式">全部工作模式</button>
+            </div>
           </div>
 
           <div id="runSidebarList" class="run-sidebar-list" role="group" aria-label="会话与任务">

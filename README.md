@@ -7,8 +7,9 @@
 - **三种编排工作流**：按任务规模选择 `$boost`（单目标极速执行）、`$teamwork`（澄清规划 + 分模块协同）或 `$swarm`（多成员并行 + 频道交接）。
 - **物理工作区隔离**：Git 仓库使用 `git clone --local` 隔离分支，非 Git 目录使用三方快照隔离；合入前执行非破坏性冲突预检（`workspace_merge_preview`）。
 - **硬验收与并发盲审**：通过 `tri-orchestrator-verify` 冻结产物清单与命令输出生成 SHA-256 验收回执，并支持 `tri-orchestrator-challenge` 只读并发盲审。
-- **Codex 原生会话对齐**：只读桥接本地 Codex 项目与会话标题，按「工作区项目 → Codex 会话 → 编排轮次」三层归并展示，隔离多会话并发与 `Stop` 钩子检查。
-- **实时中文 Web 控制台**：提供多模式控制台（`/boost`、`/teamwork`、`/swarm`）、`Ctrl+K` 跨项目跨模式检索、协作图回放、成员状态与工作区 Diff 检查器。
+- **Codex 本地目录与实时同步**：只读镜像本地 Codex 项目排序、置顶状态与非归档对话（含尚无编排的纯 Codex 对话），按「项目 → Codex 对话 → 编排轮次」三层展示，并通过文件指纹监听实时推送 `codex_catalog_updated` SSE 更新，隔离多会话并发与 `Stop` 钩子检查。
+- **模型追踪与辅助子代理观测**：`schema 10` 全链路记录主会话、轮次与子代理的 `model` / `reasoning_effort` / `model_provider`（含触发快照与会话切模对比），并只读解析 Codex `thread_spawn_edges` 派生树以追踪 L2+ 只读辅助子代理与主会话未登记原生子代理。
+- **实时中文 Web 控制台**：提供多模式控制台（`/boost`、`/teamwork`、`/swarm`）、`Ctrl+K` 跨项目跨模式与模型检索、含辅助子代理派生的协作图回放、成员检查器与工作区 Diff 检查器。
 
 ---
 
@@ -56,7 +57,7 @@ bash scripts/install.sh
 
 ### 旧版本运行库升级
 
-如果本地已存在旧版 Schema 运行库，需先结束全部活跃任务并停止守护进程，再使用 `scripts/upgrade.py` 执行受控备份与离线升级，最后通过 Codex 重新安装插件：
+如果本地已存在旧版 Schema 运行库（例如从 `schema <= 9` 升级至 `0.6.2` / `schema 10`），需先结束全部活跃任务并停止守护进程，再使用 `scripts/upgrade.py` 执行受控备份与离线升级，最后通过 Codex 重新安装插件：
 
 ```bash
 python scripts/upgrade.py prepare --source-plugin ./plugin --target-plugin <old-plugin-dir> --data-dir <data-dir> --backup-dir <backup-dir>
@@ -70,11 +71,110 @@ python scripts/upgrade.py verify --backup-dir <backup-dir>
 
 ## 编排工作流
 
-| 技能指令 | 编排定位 | 适用场景 |
-| :--- | :--- | :--- |
-| **`$boost`** | 单目标极速执行：路由单兵直达或定向委派，锁定契约、独立 `verifier` 验收与返工闭环。 | 聚焦修复、小中型功能或局部重构。 |
-| **`$teamwork`** | 结构化协同流水线：需求澄清（`interviewer`，支持 `[skip-interview]`）→ 规划与互斥文件所有权（`planner`）→ 隔离开发（`coder`）→ 双层验收（`verifier`）→ 逐里程碑合入。 | 需冻结规格且多模块并行、零文件写冲突的中大型任务。 |
-| **`$swarm`** | 基于 `#seq` 频道与持久游标的多成员并发协同、停滞分类与人工实时干预。 | 需要多成员点对点交接与实时协同观测的并行任务。 |
+| 技能指令 | 编排定位 | 核心角色与通道 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| **`$boost`** | 单目标极速执行：实证路由直达或定向委派，强制独立验收与返工闭环。 | `coordinator`、`coder` / `investigator`、`verifier` | 聚焦修复、小中型功能或局部重构。 |
+| **`$teamwork`** | 结构化协同流水线：澄清冻结 → 架构划分 → 隔离并行 → 双层验收 → 逐里程碑合入。 | `interviewer`、`planner`、`coder`、`verifier` | 需冻结规格且多模块并行、零文件写冲突的中大型任务。 |
+| **`$swarm`** | 基于 `#seq` 频道与持久游标的多成员并发协同、停滞恢复与人工实时干预。 | `planner`（可选）、`swarm_worker`、`verifier`、`#seq` 多频道 | 需要多成员点对点交接与实时协同观测的并行任务。 |
+
+### 三种工作流的通用构建架构
+
+`$boost`、`$teamwork` 与 `$swarm` 均基于同一套 `workflow5` 共享契约（`plugin/skills/route-a-workflow.md`）构建：由 Codex 主会话担任协调者，通过 **原生 V2 子代理工具** 与 **MCP 状态机/账本宏工具** 双向协同完成派发、隔离、验收与收尾：
+
+```mermaid
+flowchart TB
+    User["用户输入 $boost / $teamwork / $swarm"] --> Coord["Codex 主会话协调者"]
+    Coord -->|"1. 建单与契约冻结"| Ledger["MCP 状态机: run_create + task_packet_save"]
+    Coord -->|"2. 事务化预派发"| Prep["workflow_prepare_dispatch (建区/建步/入箱/领取)"]
+    Prep -->|"3. 1 轮直达派发"| Native["Codex V2: spawn_agent / followup_task"]
+    Native -->|"4. 绑定与摘要收据"| Rec["native_action_record_call (冻结 original_bindings)"]
+
+    Native -->|"depth-1 作者"| Author["coder / swarm_worker / Solo"]
+    Author -.->|"max_depth=2 只读查链"| Helper["只读 investigator 辅助子代理"]
+    Author -->|"隔离写入"| WS["WorkspaceManager (git_clone / snapshot)"]
+    Author -->|"accept / submit"| Board["SQLite WAL + #seq 消息板 + 持久收件箱"]
+
+    Coord -->|"5. 懒加载 / 复用验收"| Verifier["独立 verifier (fork_turns=none)"]
+    Verifier -->|"candidate / integrated"| VerCLI["宿主机终端: tri-orchestrator-verify / challenge"]
+    VerCLI -->|"SHA-256 receipt.json"| VerTurn["workflow_verifier_turn(prepare / record)"]
+
+    VerTurn -->|"FAIL (最多 3 轮)"| Coord
+    VerTurn -->|"PASS"| Merge["workspace_merge_preview -> workspace_merge -> closeout"]
+```
+
+### `$boost`：单目标极速闭环
+
+核心特点是**按实证复杂度选最小路径**，避免冗余规划开销，同时保留独立的候选验收（`candidate`）、高阶盲审挑战（`challenge`）与合入后主目录复验（`integrated`）：
+
+```mermaid
+flowchart LR
+    Start["run_create + task_packet_save"] --> Route{"实证路由决策 (route_decision)"}
+    Route -->|"已知局部改动"| Solo["Solo 模式: coordinator_local 无工作区直改"]
+    Route -->|"纯调研报告"| Inv["只读 investigator 调查 + Solo 报告契约"]
+    Route -->|"需独立隔离修改"| Del["Delegation: workflow_prepare_dispatch + spawn_agent(coder)"]
+
+    Solo --> CandPrep["懒加载 spawn_agent(verifier) + candidate 采集"]
+    Inv --> CandPrep
+    Del --> AuthorSub["workflow_author_turn(submit) + 并行 workspace_diff"] --> CandPrep
+
+    CandPrep --> Verify["tri-orchestrator-verify + Boost challenge 盲审"]
+    Verify --> Gate{"VERDICT"}
+    Gate -->|"FAIL (<= 3 轮)"| Rework["同线程 followup_task 原班返工"] --> CandPrep
+    Gate -->|"PASS"| Merge["workspace_merge_preview -> workspace_merge (若隔离)"]
+    Merge --> Int["integrated 主目录复验 -> workflow_closeout_run"]
+```
+
+1. **建单与实证路由**：通过 `run_create` 与 `task_packet_save` 冻结原始需求与验收标准；若存在未知调用链先派发只读 `investigator` 取证，再向 `#seq` 记录 `route_decision`，选择 **Solo**（`coordinator_local`）或 **Delegation**（`create_workspace=True` 隔离工作区）。
+2. **候选验收与独立挑战**：作者提交后，首轮候选审查才通过 `workflow_prepare_dispatch(..., dispatch_action="request_verify")` 懒加载实例化 `verifier`（强制 `fork_turns="none"` 保持盲审上下文隔离），运行 `tri-orchestrator-verify` 与 Boost `challenge` 校验，并由协调者对真实 diff 与测试输出做抽检。
+3. **同线程返工与一键收尾**：任一标准未过即沿原作者、原验收者线程（`followup_task`）返工，最多 3 轮；候选通过后执行 `workspace_merge_preview` → `workspace_merge`，在主目录完成 `scope="integrated"` 复验，最后调用 `workflow_closeout_run` 单次完成收尾与清理。
+
+### `$teamwork`：澄清规划 + 里程碑协同流水线
+
+核心特点是**角色严格隔离**与**互斥文件所有权矩阵**，确保多 `coder` 并行改码零冲突，并支持多里程碑按依赖序逐个合入与交接：
+
+```mermaid
+flowchart LR
+    Init["Step 0: run_create (支持 [skip-interview])"] --> Intv{"需求是否明确?"}
+    Intv -->|"否"| Ask["Step 1: interviewer 只读单轮问答冻结需求"] --> Plan
+    Intv -->|"是 / 跳过"| Plan["Step 2: planner 锁定接口与互斥 file_ownership -> task_packet_save"]
+    Plan --> Impl["Step 3: 多 coder 并行 (独立隔离工作区 + workflow_author_turn)"]
+    Impl --> Ver["Step 4: verifier 两阶段门禁 (Stage1 规格 + Stage2 代码/实测)"]
+    Ver --> Check{"VERDICT"}
+    Check -->|"FAIL (<= 3 轮)"| Fix["Step 5: 原班 coder 同线程返工"] --> Ver
+    Check -->|"PASS"| Seq["Step 6: 顺序 workspace_merge -> integrated 复验 -> handoff/ack_handoff"]
+    Seq -->|"下一里程碑"| Impl
+    Seq -->|"全部完成"| Close["workflow_closeout_run"]
+```
+
+1. **需求澄清与契约规划**：除非显式携带 `[skip-interview]`，否则先由只读 `interviewer` 逐轮澄清（每轮 1 个高杠杆问题）并冻结需求；随后 `planner` 输出不可重叠的 `file_ownership` 矩阵、验收标准与合并顺序并写入 `task_packet_save`。
+2. **隔离并行与双层门禁**：每个并行切片通过 `workflow_prepare_dispatch` 分配独立工作区与 `coder`；`verifier` 执行 Stage 1（需求规格符合性）与 Stage 2（代码质量及 `tri-orchestrator-verify` 实测，高复杂步骤追加 `workflow_review` / `tri-orchestrator-challenge` 四维审查：`specification` / `code` / `stress` / `evidence`）。
+3. **顺序合入与里程碑交接**：前置里程碑必须完成 `workspace_merge`、`integrated` 主目录复验及 `handoff` / `ack_handoff`（摘要校验），后续存在文件重叠依赖的里程碑方可准入。
+
+### `$swarm`：`#seq` 消息板高并发协同
+
+核心特点是**分频道异步协同**与**抗上下文爆炸纪律**，各成员将完整改动与日志写入消息板，主协调者仅通过短指针与增量游标保持全局掌控：
+
+```mermaid
+flowchart LR
+    Init["run_create + 初始化频道 (main / #backend / #ui / #verify) + 可选 planner"] --> Spawn["并发派发 swarm_worker 至独立 .swarm-workspaces"]
+    Spawn --> Work["各成员在域内实现 + workflow_author_turn(submit) 写详细报告到 #seq"]
+    Work -->|"仅回传 1 行 #seq 短指针"| CoordLoop["协调者: wait_agent(<=30s) + board_status(compact=True) + 增量 board_read"]
+    CoordLoop -->|"心跳异常 / 停滞"| Recover["list_agents 核验实态 -> 原线程 followup_task 唤醒"] --> Work
+    CoordLoop -->|"人工频道干预"| CoordLoop
+    Work -->|"@verifier (#verify)"| Ver["verifier 交叉核验 (tri-orchestrator-verify / challenge)"]
+    Ver -->|"FAIL (<= 3 轮)"| Rework["同线程返工"] --> Work
+    Ver -->|"PASS"| Final["并行只读预检 -> 顺序 workspace_merge -> integrated 复验 -> closeout"]
+```
+
+1. **频道化与短指针通信**：按领域划分 `main`、`#backend`、`#ui`、`#verify` 等频道；`swarm_worker` 将 Diff 摘要与测试证据通过 `workflow_author_turn(phase="submit", post_board_note=True)` 或 `board_post` 写入消息板，仅向协调者回复单行指针（如 `已完成：<任务>，详见 #14 (@verifier)`），防止多成员大段日志撑爆主会话上下文。
+2. **增量游标与停滞恢复**：协调者在 `wait_agent(timeout_ms=30000)` 前后用 `board_status(compact=True)` 与 `board_read(since_seq, advance_cursor=True)` 增量消费消息及 `human` 频道人工指令；遇到心跳告警时先通过原生 `list_agents` 核实真实状态，再在原线程 `followup_task` 唤醒，不凭心跳超时直接新建替代成员。
+3. **交叉核验与并发预检合并**：`verifier` 在 `#verify` 频道持续接收各流提交；合并前对多个已验证工作区并发发起只读 `workspace_status` / `workspace_diff` / `workspace_merge_preview`，随后顺序合入、主目录 `integrated` 复验并一键收尾。
+
+### 核心构建机制
+
+- **单轮直达与对账栅栏（`workflow5`）**：派发遵循 `workflow_prepare_dispatch` → 1 轮 `spawn_agent` → `native_action_record_call`，消除子代理首轮空等；若调用超时或中断，动作会锁入 `needs_reconciliation`，协调者必须先调用 `list_agents` 核实宿主状态再执行 `reconcile`，严禁盲目重放 `spawn_agent`。
+- **受控辅助子代理分层（`max_depth = 2`）**：仅深度 1 的 `planner`、`coder`、`swarm_worker` 与 `verifier` 可按需派生只读 `investigator` 辅助查链；`interviewer`、`investigator` 与盲审 `challenger` 禁止再派生子代理，确保拓扑可控、成本与权限边界清晰。
+- **原班返工上限与双门禁冻结**：首次候选绑定后即永久冻结 `original_bindings`，后续返工（最多 3 轮，超限自动转入 `needs_decision` 待人工决策）与 `integrated` 终验均强制复用同一作者与同一验收者，杜绝“换人重跑”掩盖缺陷。
 
 ---
 
@@ -83,10 +183,10 @@ python scripts/upgrade.py verify --backup-dir <backup-dir>
 守护进程启动后，在浏览器访问 **`http://127.0.0.1:18790`**（各模式共用同一服务与数据库，入口仅作展示分区）：
 
 - **模式入口**：[`/boost`](http://127.0.0.1:18790/boost)、[`/teamwork`](http://127.0.0.1:18790/teamwork)、[`/swarm`](http://127.0.0.1:18790/swarm)，支持携带 `run_id` 链接直达历史任务。
-- **三层导航与全局检索**：按「真实工作区 → Codex 会话 → 编排轮次」组织侧栏与顶部选择器；支持 `Ctrl+K` 跨项目、跨模式直达活跃任务，并标记同项目非隔离直改并发风险。
-- **概况与日志**：展示任务状态、触发原话、执行目录与轮次介入分隔，支持全文展开及 `.md` / `.json` 运行报告导出。
+- **三层导航与全局检索**：按「Codex 项目 → 对话（含无编排纯对话）→ 编排轮次」组织侧栏与项目选择器（Codex 目录不可用时自动回退至已登记项目与会话）；支持 `Ctrl+K` 跨项目、跨模式及按模型/推理强度检索，并标记同项目非隔离直改并发风险。
+- **概况与日志**：展示任务状态、主对话实时模型与触发快照对比（切模时标注 `⇄`）、模型分布汇总、触发原话、执行目录与带模型徽章的轮次分隔/消息流，支持全文展开及 `.md` / `.json` 运行报告导出（含模型与辅助子代理明细）。
 - **消息板与人工干预**：按频道、`@提及` 与关键词过滤 `#seq` 消息流，底部可向 `human` 频道发送人工指令。
-- **成员与协作图**：展示冻结任务契约、互斥文件矩阵、成员心跳/卡死分类与交互式 SVG 拓扑回放图。
+- **成员与协作图**：展示冻结任务契约、互斥文件矩阵、成员模型/线程信息、心跳/卡死分类、L2+ 辅助子代理树与主会话未登记原生子代理；交互式 SVG 协作图支持回放、节点模型展示及「显示辅助子代理」派生连线开关。
 - **工作区检查器**：查看文件变更与统一 Diff，执行冲突预检、打开本地目录、请求暂停/停止成员及受门禁保护的清理操作（`git push`、`reset` 与未合入强制删除端点均禁用并返回 `HTTP 403`）。
 
 ---
@@ -103,7 +203,8 @@ python scripts/upgrade.py verify --backup-dir <backup-dir>
   - `link_ro_cache` 为兼容历史保留的命名，底层采用目录链接/硬链接（失败时复制），属于**共享可写**依赖而非只读隔离；需要写入隔离时请改用 `copy` 或 `fresh_venv_uv`。
 - **控制、重试与结果传递语义**：
   - 守护进程与看门狗不会自动代调或重启原生代理，也不会自动跨步骤重放结果未知的写操作；人工文字消息不会自动投递给子代理，暂停/结束请求由协调者在工具边界读取并执行原生中断后回执。
-  - 成员状态由协调者登记，不通过后台扫描原生进程推断；守护进程不会修改 Codex 的模型或网络代理配置。
+  - 成员状态由协调者登记，不通过后台扫描原生进程推断；守护进程与钩子仅**只读**采集 Codex 本地目录、模型/推理强度与子代理派生树（离线时保留历史快照），绝不会修改 Codex 的模型或网络代理配置。
+  - L2+ 只读辅助子代理（`max_depth = 2`）仅允许深度 1 角色用于跨模块只读调查，不得编辑源码、不向编排器注册为作者/验收者，也不提交独立验收回执。
   - 当 MCP 单次返回体超过 stdio 内联预算时，完整 JSON 会原子落盘至运行时目录 `results/` 下，并返回含路径、字节数与 SHA-256 的 `delivery: "file"` 回执（直接读取结果文件，勿重复重放写操作）。
 
 ---
@@ -119,12 +220,13 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
    ▼
 单例 HTTP/SSE 守护进程（127.0.0.1:18790）
    ├── /api/rpc & /api/tools   ──► RpcDispatcher（35 个公开 MCP 工具 + 1 个内部钩子 RPC）
-   ├── /api/sessions, /projects, /runs & /api/events（SSE 实时流）
+   ├── /api/projects, /api/codex/catalog, /api/sessions, /api/runs & /api/events（SSE 实时流）
    ├── /, /boost, /teamwork, /swarm（中文 Web 控制台）
    ├── Watchdog Loop           ──► 进展分类与卡死/人工决策告警
-   ├── SQLite WAL Engine       ──► schema 9（projects, runs, session_turns,
+   ├── Codex Catalog Watcher   ──► 状态文件指纹监测与 codex_catalog_updated 推送
+   ├── SQLite WAL Engine       ──► schema 10（projects, runs, session_turns,
    │                               session_run_bindings, task_packets, workers,
-   │                               board_messages, workspaces 等）
+   │                               worker_subagents, board_messages, workspaces 等）
    └── WorkspaceManager        ──► .swarm-workspaces/<run>-<worker> + 端口池
 ```
 
@@ -185,7 +287,9 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
 | `TRI_ORCH_STALL_SEC` | `300` | 成员心跳停滞告警阈值（秒）。 |
 | `TRI_ORCH_WATCHDOG_INTERVAL_SEC` | `15` | 看门狗巡检间隔（秒）。 |
 | `TRI_ORCH_PORT_RANGE` | `18800..18999` | 隔离工作区测试端口池范围。 |
-| `TRI_ORCH_HOOK_TIMEOUT_SEC` | `1.5` | `tri-orchestrator-hook` 本地 RPC 超时上限（秒，最大 `1.5`）。 |
+| `TRI_ORCH_HOOK_TIMEOUT_SEC` | `1.2` | `tri-orchestrator-hook` 本地 RPC 默认超时（秒，硬上限 `1.5`）。 |
+| `TRI_ORCH_BASE_URL` | 空（按 `HOST`/`PORT` 拼装） | 可选显式覆盖 `tri-orchestrator-hook` 请求的守护进程基础 URL。 |
+| `CODEX_HOME` | `~/.codex` | Codex 本地目录路径；只读目录/模型桥接及安装卸载脚本据此定位状态库与 `agents/`。 |
 
 ---
 
