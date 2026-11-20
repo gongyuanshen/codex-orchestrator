@@ -121,11 +121,11 @@ def _rehearse(tmp_path: Path, target: Path, data: Path, codex_home: Path):
     )
     assert prepared["status"] == "prepared"
     assert prepared["target_identity"]["version"] == "0.6.0"
-    assert prepared["source_identity"]["version"] == "0.6.1"
+    assert prepared["source_identity"]["version"] == "0.6.2"
     assert prepared["database_before"]["schema_version"] == 8
     applied = upgrade("apply")
     assert applied["status"] == "applied_service_stopped"
-    assert applied["database_after"]["schema_version"] == 9
+    assert applied["database_after"]["schema_version"] == 10
 
     # The Windows venv launcher has a different PID from the Python it starts.
     daemon_python = sys.executable

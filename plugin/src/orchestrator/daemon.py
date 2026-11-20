@@ -12,6 +12,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -240,6 +241,14 @@ def _display_label(
     return mapping.get(raw, raw)
 
 
+def _format_model_effort(model: Any, effort: Any) -> str:
+    m = str(model or "").strip()
+    e = str(effort or "").strip()
+    if not m:
+        return "-"
+    return f"{m} ({e})" if e else m
+
+
 def build_markdown_report(bundle: dict[str, Any]) -> str:
     """Render a localized Chinese Markdown run report while preserving raw dynamic values."""
     run = bundle["run"]
@@ -248,6 +257,8 @@ def build_markdown_report(bundle: dict[str, Any]) -> str:
     workers = bundle.get("workers") or []
     workspaces = bundle.get("workspaces") or []
     messages = bundle.get("messages") or []
+    helper_subagents = bundle.get("helper_subagents") or []
+    session_subagents = bundle.get("session_subagents") or []
 
     lines: list[str] = [
         f"# 三重编排器运行报告：{run.get('title') or run['id']}",
@@ -256,6 +267,16 @@ def build_markdown_report(bundle: dict[str, Any]) -> str:
         f"- **编排模式**：`{_display_label(_RUN_MODE_LABELS, run.get('mode'))}`",
         f"- **运行状态**：`{_display_label(_RUN_STATUS_LABELS, run.get('status'))}`",
         f"- **所属项目**：`{project.get('name', '')}` (`{project.get('root_path', '')}`)",
+        *(
+            [f"- **主对话模型**：`{_format_model_effort(run.get('codex_model'), run.get('codex_reasoning_effort'))}`"]
+            if run.get("codex_model")
+            else []
+        ),
+        *(
+            [f"- **触发时模型快照**：`{_format_model_effort(run.get('trigger_model'), run.get('trigger_reasoning_effort'))}`"]
+            if run.get("trigger_model")
+            else []
+        ),
         f"- **创建时间 (UTC)**：`{_format_utc_iso(run.get('created_at'))}`",
         f"- **更新时间 (UTC)**：`{_format_utc_iso(run.get('updated_at'))}`",
         "",
@@ -303,11 +324,13 @@ def build_markdown_report(bundle: dict[str, Any]) -> str:
 
     lines.extend(["## 成员列表", ""])
     if workers:
-        lines.append("| 名称 | 职责角色 | 状态 | 工作区 ID | 当前任务 | 最近心跳 (UTC) |")
-        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        lines.append("| 名称 | 职责角色 | 模型 / 推理强度 | 状态 | 工作区 ID | 当前任务 | 最近心跳 (UTC) |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- | :--- |")
         for w in workers:
+            model_text = _format_model_effort(w.get("model"), w.get("reasoning_effort")).replace("|", "/")
             lines.append(
                 f"| `{w['name']}` | `{_display_label(_ROLE_LABELS, w.get('role'))}` | "
+                f"`{model_text}` | "
                 f"`{_display_label(_WORKER_STATUS_LABELS, w.get('status'))}` | "
                 f"`{w.get('workspace_id') or '-'}` | {str(w.get('current_task') or '').replace('|', '/')} | "
                 f"`{_format_utc_iso(w.get('last_heartbeat_at'))}` |"
@@ -315,6 +338,27 @@ def build_markdown_report(bundle: dict[str, Any]) -> str:
     else:
         lines.append("_暂无已注册成员。_")
     lines.append("")
+
+    if helper_subagents or session_subagents:
+        lines.extend(["## 辅助子代理（L2+ 与未登记原生子代理）", ""])
+        lines.append("| 归属 | 层级 | 路径 / 昵称 | 角色 | 模型 / 推理强度 |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- |")
+        for sub in (*helper_subagents, *session_subagents):
+            parent_name = sub.get("parent_worker_name") or "coordinator"
+            owner_text = (
+                "主会话（未登记）"
+                if sub.get("registered") is False and parent_name == "coordinator"
+                else f"`{str(parent_name).replace('|', '/')}`"
+            )
+            depth = sub.get("depth")
+            depth_text = f"L{depth}" if depth is not None else "-"
+            raw_path = str(sub.get("agent_path") or sub.get("thread_id") or "-").replace("|", "/")
+            nickname = str(sub.get("agent_nickname") or "").strip().replace("|", "/")
+            path_text = f"`{raw_path}` ({nickname})" if nickname else f"`{raw_path}`"
+            role_text = _display_label(_ROLE_LABELS, sub.get("agent_role"), fallback="-").replace("|", "/")
+            model_text = _format_model_effort(sub.get("model"), sub.get("reasoning_effort")).replace("|", "/")
+            lines.append(f"| {owner_text} | `{depth_text}` | {path_text} | `{role_text}` | `{model_text}` |")
+        lines.append("")
 
     lines.extend(["## 隔离工作区", ""])
     if workspaces:
@@ -361,6 +405,362 @@ def build_markdown_report(bundle: dict[str, Any]) -> str:
 _render_run_markdown = build_markdown_report
 
 
+def _resolve_live_model_fields(
+    live: dict[str, Any] | None,
+    stored: dict[str, Any],
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """Resolve model metadata preferring live Codex state, falling back safely to snapshots."""
+    stored_model = stored.get("model")
+    stored_effort = stored.get("reasoning_effort")
+    stored_provider = stored.get("model_provider")
+    if live is None:
+        return (
+            stored_model,
+            stored_effort,
+            stored_provider,
+            "snapshot" if stored_model else None,
+        )
+
+    live_model = live.get("model")
+    live_effort = live.get("reasoning_effort")
+    live_provider = live.get("model_provider")
+    model = live_model if live_model is not None else stored_model
+    same_or_fallback = live_model is None or stored_model is None or live_model == stored_model
+    reasoning_effort = live_effort if live_effort is not None else (stored_effort if same_or_fallback else None)
+    model_provider = live_provider if live_provider is not None else (stored_provider if same_or_fallback else None)
+    model_source = "live" if live_model else ("snapshot" if stored_model else None)
+    return model, reasoning_effort, model_provider, model_source
+
+
+def _pick_closest_subagent(
+    candidates: list[dict[str, Any]], worker_created_at: Any
+) -> dict[str, Any]:
+    if len(candidates) == 1 or worker_created_at is None:
+        return candidates[0]
+    target = float(worker_created_at)
+    return min(
+        candidates,
+        key=lambda node: (
+            0 if node.get("created_at") is not None else 1,
+            abs(float(node["created_at"]) - target) if node.get("created_at") is not None else 0.0,
+            float(node.get("created_at") or 0.0),
+            str(node.get("thread_id") or ""),
+        ),
+    )
+
+
+def _match_worker_live_node(
+    worker: dict[str, Any],
+    *,
+    session_id: str | None,
+    root_thread: dict[str, Any] | None,
+    by_id: dict[str, dict[str, Any]],
+    depth1_by_path: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    persisted_tid = worker.get("codex_thread_id")
+    agent_id = worker.get("agent_id")
+    agent_path = agent_id or worker.get("pending_agent_path")
+    is_root_worker = agent_path == "/root"
+
+    if persisted_tid and persisted_tid in by_id:
+        return by_id[persisted_tid], persisted_tid, is_root_worker
+    if is_root_worker and session_id and root_thread is not None:
+        return root_thread, session_id, True
+    if agent_path and agent_path in depth1_by_path:
+        matched = _pick_closest_subagent(depth1_by_path[agent_path], worker.get("created_at"))
+        return matched, matched["thread_id"], False
+    if isinstance(agent_id, str) and len(agent_id) == 36 and agent_id in by_id:
+        matched = by_id[agent_id]
+        return matched, matched["thread_id"], False
+    return None, persisted_tid, is_root_worker
+
+
+def _collect_worker_subagents(
+    worker_id: str,
+    worker_name: str,
+    worker_thread_id: str | None,
+    *,
+    children_by_parent: dict[str, list[dict[str, Any]]],
+    stored_for_worker: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    live_desc_by_id: dict[str, dict[str, Any]] = {}
+    if worker_thread_id:
+        queue = deque(children_by_parent.get(worker_thread_id, []))
+        seen = {worker_thread_id}
+        while queue:
+            child = queue.popleft()
+            tid = child["thread_id"]
+            if tid in seen:
+                continue
+            seen.add(tid)
+            if (child.get("depth") or 0) >= 2:
+                live_desc_by_id[tid] = child
+            queue.extend(children_by_parent.get(tid, []))
+
+    result: list[dict[str, Any]] = []
+    for tid in set(live_desc_by_id) | set(stored_for_worker):
+        live = live_desc_by_id.get(tid)
+        stored = stored_for_worker.get(tid) or {}
+        model, reasoning_effort, model_provider, model_source = _resolve_live_model_fields(live, stored)
+        src = live if live is not None else stored
+        edge_status = (
+            live.get("edge_status")
+            if live is not None and live.get("edge_status") is not None
+            else stored.get("edge_status")
+        )
+        result.append({
+            "thread_id": tid,
+            "parent_thread_id": src.get("parent_thread_id") if src.get("parent_thread_id") is not None else stored.get("parent_thread_id"),
+            "parent_worker_id": worker_id,
+            "parent_worker_name": worker_name,
+            "depth": src.get("depth") if src.get("depth") is not None else stored.get("depth"),
+            "agent_path": (src.get("agent_path") if src.get("agent_path") is not None else stored.get("agent_path")) or "",
+            "agent_role": src.get("agent_role") if src.get("agent_role") is not None else stored.get("agent_role"),
+            "agent_nickname": src.get("agent_nickname") if src.get("agent_nickname") is not None else stored.get("agent_nickname"),
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "model_provider": model_provider,
+            "edge_status": edge_status,
+            "status": edge_status,
+            "model_source": model_source,
+            "created_at": src.get("created_at") if src.get("created_at") is not None else stored.get("created_at"),
+            "updated_at": src.get("updated_at") if src.get("updated_at") is not None else stored.get("updated_at"),
+        })
+    result.sort(
+        key=lambda s: (
+            int(s.get("depth") or 0),
+            float(s.get("created_at") or 0.0),
+            str(s.get("thread_id") or ""),
+        )
+    )
+    return result
+
+
+def _collect_session_subagents(
+    database: Database,
+    dashboard_run: dict[str, Any],
+    session_id: str,
+    live_tree: list[dict[str, Any]],
+    *,
+    children_by_parent: dict[str, list[dict[str, Any]]],
+    matched_worker_thread_ids: set[str],
+) -> list[dict[str, Any]]:
+    registered_paths = database.list_session_registered_agent_paths(session_id)
+    ordered_runs = database.list_session_runs_ordered(session_id)
+    run_id = dashboard_run["id"]
+    idx = next((i for i, r in enumerate(ordered_runs) if r["id"] == run_id), None)
+    if idx is not None:
+        run_created = float(ordered_runs[idx]["created_at"])
+        win_start: float | None = run_created - 10.0 if idx == 0 else run_created
+        win_end: float | None = (
+            float(ordered_runs[idx + 1]["created_at"]) if idx + 1 < len(ordered_runs) else None
+        )
+    else:
+        raw_created = dashboard_run.get("created_at")
+        win_start = float(raw_created) - 10.0 if raw_created is not None else None
+        win_end = None
+
+    queue: deque[tuple[dict[str, Any], str]] = deque()
+    for node in live_tree:
+        if node.get("depth") != 1:
+            continue
+        npath = node.get("agent_path") or ""
+        ntid = node["thread_id"]
+        if npath in registered_paths or ntid in registered_paths or ntid in matched_worker_thread_ids:
+            continue
+        node_created = node.get("created_at")
+        if node_created is not None and win_start is not None:
+            ts = float(node_created)
+            if ts < win_start or (win_end is not None and ts >= win_end):
+                continue
+        queue.append((node, "coordinator"))
+
+    collected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    while queue:
+        node, parent_name = queue.popleft()
+        tid = node["thread_id"]
+        if tid in seen:
+            continue
+        seen.add(tid)
+        collected.append({
+            **node,
+            "registered": False,
+            "parent_worker_id": None,
+            "parent_worker_name": parent_name,
+            "status": node.get("edge_status"),
+            "model_source": "live" if node.get("model") else None,
+        })
+        next_parent = node.get("agent_path") or node.get("agent_nickname") or parent_name
+        for child in children_by_parent.get(tid, []):
+            if (child.get("depth") or 0) >= 2 and child["thread_id"] not in seen:
+                queue.append((child, next_parent))
+
+    collected.sort(
+        key=lambda s: (
+            int(s.get("depth") or 0),
+            float(s.get("created_at") or 0.0),
+            str(s.get("thread_id") or ""),
+        )
+    )
+    return collected
+
+
+def _build_model_summary(
+    dashboard_run: dict[str, Any],
+    enriched_workers: list[dict[str, Any]],
+    helper_subagents: list[dict[str, Any]],
+    session_subagents: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    roles_by_key: dict[tuple[str, str | None], set[str]] = {}
+    counts: dict[tuple[str, str | None], int] = {}
+
+    def _add(model_val: Any, effort_val: Any, role_val: str) -> None:
+        m = str(model_val or "").strip()
+        if not m:
+            return
+        e = str(effort_val).strip() or None if effort_val is not None else None
+        key = (m, e)
+        counts[key] = counts.get(key, 0) + 1
+        roles_by_key.setdefault(key, set()).add(role_val)
+
+    if dashboard_run.get("codex_model"):
+        root_model = dashboard_run["codex_model"]
+        root_effort = dashboard_run.get("codex_reasoning_effort")
+        if root_effort is None and dashboard_run.get("trigger_model") == root_model:
+            root_effort = dashboard_run.get("trigger_reasoning_effort")
+    elif dashboard_run.get("trigger_model"):
+        root_model = dashboard_run["trigger_model"]
+        root_effort = dashboard_run.get("trigger_reasoning_effort")
+    else:
+        root_model = None
+        root_effort = None
+
+    _add(root_model, root_effort, "coordinator")
+
+    session_id = dashboard_run.get("session_id")
+    for w in enriched_workers:
+        if (
+            w.get("agent_id") == "/root"
+            and session_id is not None
+            and w.get("codex_thread_id") == session_id
+            and root_model
+        ):
+            continue
+        _add(w.get("model"), w.get("reasoning_effort"), str(w.get("role") or "worker"))
+
+    for sub in helper_subagents:
+        _add(sub.get("model"), sub.get("reasoning_effort"), str(sub.get("agent_role") or "subagent"))
+
+    for sub in session_subagents:
+        _add(sub.get("model"), sub.get("reasoning_effort"), str(sub.get("agent_role") or "subagent"))
+
+    return [
+        {
+            "model": m,
+            "reasoning_effort": e,
+            "count": n,
+            "roles": sorted(roles_by_key[(m, e)]),
+        }
+        for (m, e), n in sorted(
+            counts.items(),
+            key=lambda item: (-item[1], item[0][0], item[0][1] or ""),
+        )
+    ]
+
+
+def _enrich_snapshot_agents(
+    database: Database,
+    dashboard_run: dict[str, Any],
+    workers: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read-only enrichment of workers, L2+ helper subagents, unregistered session subagents, and model summary."""
+    stored_subagents = database.list_worker_subagents(dashboard_run["id"])
+    stored_by_worker: dict[str, dict[str, dict[str, Any]]] = {}
+    for row in stored_subagents:
+        parent_wid = row.get("parent_worker_id")
+        tid = row.get("thread_id")
+        if parent_wid and tid:
+            stored_by_worker.setdefault(str(parent_wid), {})[str(tid)] = row
+
+    session_id = dashboard_run.get("session_id")
+    if session_id:
+        root_thread = codex_bridge.get_thread_meta(session_id)
+        live_tree = codex_bridge.get_session_subagents(session_id)
+    else:
+        root_thread = None
+        live_tree = []
+
+    by_id: dict[str, dict[str, Any]] = {}
+    depth1_by_path: dict[str, list[dict[str, Any]]] = {}
+    children_by_parent: dict[str, list[dict[str, Any]]] = {}
+    for node in live_tree:
+        tid = node["thread_id"]
+        by_id[tid] = node
+        if node.get("depth") == 1 and node.get("agent_path"):
+            depth1_by_path.setdefault(node["agent_path"], []).append(node)
+        parent_tid = node.get("parent_thread_id")
+        if parent_tid:
+            children_by_parent.setdefault(parent_tid, []).append(node)
+
+    enriched_workers: list[dict[str, Any]] = []
+    helper_subagents: list[dict[str, Any]] = []
+    matched_worker_thread_ids: set[str] = set()
+
+    for w in workers:
+        matched_live, codex_thread_id, is_root_worker = _match_worker_live_node(
+            w,
+            session_id=session_id,
+            root_thread=root_thread,
+            by_id=by_id,
+            depth1_by_path=depth1_by_path,
+        )
+        if matched_live is not None and codex_thread_id:
+            matched_worker_thread_ids.add(codex_thread_id)
+        model, reasoning_effort, model_provider, model_source = _resolve_live_model_fields(matched_live, w)
+        agent_nickname = matched_live.get("agent_nickname") if matched_live is not None else None
+
+        is_root_or_session = is_root_worker or (session_id is not None and codex_thread_id == session_id)
+        if is_root_or_session:
+            worker_subagents: list[dict[str, Any]] = []
+        else:
+            worker_subagents = _collect_worker_subagents(
+                w["id"],
+                w["name"],
+                codex_thread_id,
+                children_by_parent=children_by_parent,
+                stored_for_worker=stored_by_worker.get(w["id"], {}),
+            )
+            helper_subagents.extend(worker_subagents)
+
+        enriched_workers.append({
+            **w,
+            "codex_thread_id": codex_thread_id,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "model_provider": model_provider,
+            "agent_nickname": agent_nickname,
+            "model_source": model_source,
+            "subagents": worker_subagents,
+        })
+
+    session_subagents: list[dict[str, Any]] = []
+    if session_id and live_tree:
+        session_subagents = _collect_session_subagents(
+            database,
+            dashboard_run,
+            session_id,
+            live_tree,
+            children_by_parent=children_by_parent,
+            matched_worker_thread_ids=matched_worker_thread_ids,
+        )
+
+    model_summary = _build_model_summary(
+        dashboard_run, enriched_workers, helper_subagents, session_subagents
+    )
+    return enriched_workers, helper_subagents, session_subagents, model_summary
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -368,10 +768,16 @@ def create_app(
     start_watchdog: bool = True,
     keepalive_sec: float = 15.0,
     manage_pid_file: bool = False,
+    codex_watch_interval_sec: float | None = None,
 ) -> Starlette:
     """Build the Starlette HTTP/SSE application for tri-orchestrator."""
     cfg = settings or get_settings()
     owns_db = db is None
+    watch_interval = (
+        (1.0 if start_watchdog else 0.0)
+        if codex_watch_interval_sec is None
+        else float(codex_watch_interval_sec)
+    )
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -410,6 +816,32 @@ def create_app(
         if start_watchdog:
             watchdog_task = asyncio.create_task(watchdog.run())
 
+        async def _watch_codex_catalog() -> None:
+            last_fp = await asyncio.to_thread(codex_bridge.get_codex_state_fingerprint)
+            while not shutdown_event.is_set():
+                try:
+                    await asyncio.wait_for(shutdown_event.wait(), timeout=watch_interval)
+                    break
+                except asyncio.TimeoutError:
+                    pass
+                try:
+                    current_fp = await asyncio.to_thread(codex_bridge.get_codex_state_fingerprint)
+                except Exception:
+                    logger.exception("Failed to inspect Codex catalog fingerprint")
+                    continue
+                if current_fp != last_fp:
+                    last_fp = current_fp
+                    codex_bridge.invalidate_catalog_cache()
+                    event_bus.publish(
+                        "codex_catalog_updated",
+                        {"changed_at": time.time()},
+                        run_id=None,
+                    )
+
+        codex_watch_task: asyncio.Task[None] | None = None
+        if watch_interval > 0:
+            codex_watch_task = asyncio.create_task(_watch_codex_catalog())
+
         try:
             yield
         finally:
@@ -420,12 +852,13 @@ def create_app(
             # A cancelled short DB read must finish before its connection is closed.
             await asyncio.gather(*waiting, return_exceptions=True)
             watchdog.stop()
-            if watchdog_task is not None:
-                watchdog_task.cancel()
-                try:
-                    await watchdog_task
-                except asyncio.CancelledError:
-                    pass
+            for bg_task in (watchdog_task, codex_watch_task):
+                if bg_task is not None:
+                    bg_task.cancel()
+                    try:
+                        await bg_task
+                    except asyncio.CancelledError:
+                        pass
             if manage_pid_file:
                 _remove_pid_file_if_owner(cfg)
             if owns_db:
@@ -491,6 +924,8 @@ def create_app(
                     "compact_board_v1",
                     "workflow5_direct_spawn_v1",
                     "session_hooks_v1",
+                    "agent_model_tracking_v1",
+                    "codex_catalog_sync_v1",
                 ],
             }
         )
@@ -555,7 +990,7 @@ def create_app(
         for run in runs:
             project = projects[run["project_id"]]
             canonical = projects[project["canonical_project_id"] or project["id"]]
-            thread = threads.get(run["session_id"], {})
+            thread = threads.get(run["session_id"]) or {}
             thread_name = thread.get("title")
             enriched.append({
                 **run,
@@ -564,16 +999,197 @@ def create_app(
                 "codex_project_name": canonical["codex_project_name"] or project["codex_project_name"]
                 or thread.get("codex_project_name"),
                 "session_display_name": thread_name or (run["title"] if run["session_id"] else None),
+                "codex_model": thread.get("model"),
+                "codex_reasoning_effort": thread.get("reasoning_effort"),
+                "codex_model_provider": thread.get("model_provider"),
             })
         return enriched
+
+    def _build_codex_catalog_projection(
+        database: Database, *, mode: str | None = None
+    ) -> dict[str, Any] | None:
+        raw = codex_bridge.get_codex_catalog()
+        if raw is None:
+            return None
+
+        effective_mode = None if mode in {None, "all"} else mode
+        db_projects = database.list_projects()
+        activity = database.dashboard_project_activity()
+        db_by_root: dict[str, dict[str, Any]] = {}
+        db_with_keys: list[tuple[str, dict[str, Any]]] = []
+        for proj in db_projects:
+            key = codex_bridge._path_key(proj["root_path"])
+            db_with_keys.append((key, proj))
+            existing = db_by_root.get(key)
+            if existing is None or (
+                existing["canonical_project_id"] is not None
+                and proj["canonical_project_id"] is None
+            ):
+                db_by_root[key] = proj
+
+        all_runs = database.list_runs(limit=None)
+        enriched_runs = _enrich_runs(database, all_runs, activity)
+        runs_by_session: dict[str, list[dict[str, Any]]] = {}
+        for run in enriched_runs:
+            sid = run.get("session_id")
+            if sid:
+                runs_by_session.setdefault(str(sid), []).append(run)
+
+        projected_projects: list[dict[str, Any]] = []
+        global_active_runs: list[dict[str, Any]] = []
+        concurrent_risks: list[dict[str, Any]] = []
+
+        for cp in raw["projects"]:
+            root_key = codex_bridge._path_key(cp["root_path"])
+            root_prefix = root_key.rstrip("/") + "/"
+            db_proj = db_by_root.get(root_key)
+            proj_id = db_proj["id"] if db_proj else f"codex:{cp['codex_project_id']}"
+            db_project_id = db_proj["id"] if db_proj else None
+
+            matching_activity_ids: set[str] = {
+                str(proj["canonical_project_id"] or proj["id"])
+                for p_key, proj in db_with_keys
+                if p_key == root_key or p_key.startswith(root_prefix)
+            }
+
+            threads_out: list[dict[str, Any]] = []
+            proj_all_runs: list[dict[str, Any]] = []
+            proj_active_runs_all_modes = 0
+            proj_active_sessions: set[str] = set()
+            proj_total_runs = 0
+
+            for ct in cp["threads"]:
+                raw_thread_runs = sorted(
+                    runs_by_session.get(ct["session_id"], []),
+                    key=lambda r: (r.get("session_seq") or 0, r.get("updated_at") or 0.0),
+                    reverse=True,
+                )
+                decorated_all: list[dict[str, Any]] = []
+                for r in raw_thread_runs:
+                    orig_canonical = r.get("canonical_project_id")
+                    if r.get("status") == "active" and orig_canonical:
+                        matching_activity_ids.add(str(orig_canonical))
+                    copy_r = {
+                        **r,
+                        "canonical_project_id": proj_id,
+                        "codex_project_id": cp["codex_project_id"],
+                        "codex_project_name": cp["name"],
+                        "codex_thread_name": ct["title"],
+                        "session_display_name": ct["title"],
+                        "codex_model": ct["model"] if ct["model"] is not None else r.get("codex_model"),
+                        "codex_reasoning_effort": (
+                            ct["reasoning_effort"]
+                            if ct["reasoning_effort"] is not None
+                            else r.get("codex_reasoning_effort")
+                        ),
+                        "codex_model_provider": (
+                            ct["model_provider"]
+                            if ct["model_provider"] is not None
+                            else r.get("codex_model_provider")
+                        ),
+                    }
+                    decorated_all.append(copy_r)
+
+                active_in_thread = [r for r in decorated_all if r.get("status") == "active"]
+                active_count = len(active_in_thread)
+                if active_count > 0:
+                    proj_active_sessions.add(ct["session_id"])
+                    proj_active_runs_all_modes += active_count
+                global_active_runs.extend(active_in_thread)
+
+                visible_runs = (
+                    decorated_all
+                    if effective_mode is None
+                    else [r for r in decorated_all if r.get("mode") == effective_mode]
+                )
+                proj_total_runs += len(visible_runs)
+                proj_all_runs.extend(decorated_all)
+
+                threads_out.append({
+                    **ct,
+                    "project_id": proj_id,
+                    "active_count": active_count,
+                    "runs": visible_runs,
+                })
+
+            has_local_writer = any(
+                bool(activity.get(cid, {}).get("has_local_writer"))
+                for cid in matching_activity_ids
+            )
+            concurrent_risk = proj_active_runs_all_modes > 1 and has_local_writer
+            for r in proj_all_runs:
+                r["concurrent_project_active_count"] = proj_active_runs_all_modes
+                r["concurrent_local_write_risk"] = concurrent_risk
+            if concurrent_risk:
+                concurrent_risks.append({
+                    "canonical_project_id": proj_id,
+                    "concurrent_project_active_count": proj_active_runs_all_modes,
+                    "concurrent_local_write_risk": True,
+                })
+
+            projected_projects.append({
+                "id": proj_id,
+                "codex_project_id": cp["codex_project_id"],
+                "db_project_id": db_project_id,
+                "name": cp["name"],
+                "display_name": cp["name"],
+                "root_path": cp["root_path"],
+                "position": cp["position"],
+                "is_git": cp["is_git"],
+                "project_kind": "workspace",
+                "canonical_project_id": None,
+                "active_run_count": proj_active_runs_all_modes,
+                "active_session_count": len(proj_active_sessions),
+                "total_run_count": proj_total_runs,
+                "thread_count": len(threads_out),
+                "threads": threads_out,
+            })
+
+        global_active_runs.sort(
+            key=lambda r: (r.get("updated_at") or 0.0, r.get("created_at") or 0.0),
+            reverse=True,
+        )
+        return {
+            "available": True,
+            "projects": projected_projects,
+            "global_active_runs": global_active_runs,
+            "concurrent_risks": concurrent_risks,
+        }
+
+    async def api_codex_catalog(request: Request) -> JSONResponse:
+        database: Database = request.app.state.db
+        mode = request.query_params.get("mode") or "all"
+        if mode != "all" and mode not in VALID_RUN_MODES:
+            return _json_error(400, f"Invalid mode: {mode!r}", error_type="ValueError")
+
+        def build() -> dict[str, Any]:
+            projection = _build_codex_catalog_projection(database, mode=mode)
+            if projection is None:
+                return {
+                    "available": False,
+                    "projects": [],
+                    "global_active_runs": [],
+                    "concurrent_risks": [],
+                }
+            return projection
+
+        return JSONResponse(await asyncio.to_thread(build))
 
     async def api_projects(request: Request) -> JSONResponse:
         database: Database = request.app.state.db
         include_merged = request.query_params.get("include_merged", "1")
         if include_merged not in {"0", "1"}:
             return _json_error(400, "include_merged must be 0 or 1", error_type="ValueError")
-        projects = await asyncio.to_thread(_dashboard_projects, database, include_merged == "1")
-        return JSONResponse({"projects": projects})
+
+        def build() -> dict[str, Any]:
+            projects = _dashboard_projects(database, include_merged == "1")
+            payload: dict[str, Any] = {"projects": projects}
+            codex_catalog = _build_codex_catalog_projection(database)
+            if codex_catalog is not None:
+                payload["codex_catalog"] = codex_catalog
+            return payload
+
+        return JSONResponse(await asyncio.to_thread(build))
 
     async def api_runs(request: Request) -> JSONResponse:
         database: Database = request.app.state.db
@@ -588,11 +1204,51 @@ def create_app(
             return _json_error(400, f"Invalid limit: {raw_limit!r}", error_type="ValueError")
 
         def build() -> dict[str, Any]:
+            effective_mode = None if mode == "all" else mode
+            if project_id and project_id.startswith("codex:"):
+                projection = _build_codex_catalog_projection(database, mode=mode or "all")
+                matched: list[dict[str, Any]] = []
+                if projection is not None:
+                    for proj in projection["projects"]:
+                        if proj["id"] == project_id:
+                            for thread in proj["threads"]:
+                                for run in thread["runs"]:
+                                    if status is not None and run.get("status") != status:
+                                        continue
+                                    matched.append(run)
+                            break
+                matched.sort(
+                    key=lambda r: (r.get("updated_at") or 0.0, r.get("created_at") or 0.0),
+                    reverse=True,
+                )
+                return {"runs": matched[: max(1, limit)]}
+
             runs = database.list_runs(
-                project_id=project_id, status=status, mode=None if mode == "all" else mode,
+                project_id=project_id, status=status, mode=effective_mode,
                 limit=limit, include_merged=True,
             )
-            return {"runs": _enrich_runs(database, runs, database.dashboard_project_activity())}
+            enriched = _enrich_runs(database, runs, database.dashboard_project_activity())
+            if project_id is not None:
+                projection = _build_codex_catalog_projection(database, mode=mode or "all")
+                if projection is not None:
+                    existing_ids = {r["id"] for r in enriched}
+                    for proj in projection["projects"]:
+                        if proj["id"] == project_id or proj.get("db_project_id") == project_id:
+                            for thread in proj["threads"]:
+                                for run in thread["runs"]:
+                                    if run["id"] in existing_ids:
+                                        continue
+                                    if status is not None and run.get("status") != status:
+                                        continue
+                                    enriched.append(run)
+                                    existing_ids.add(run["id"])
+                            enriched.sort(
+                                key=lambda r: (r.get("updated_at") or 0.0, r.get("created_at") or 0.0),
+                                reverse=True,
+                            )
+                            enriched = enriched[: max(1, limit)]
+                            break
+            return {"runs": enriched}
 
         return JSONResponse(await asyncio.to_thread(build))
 
@@ -632,6 +1288,9 @@ def create_app(
                     "session_id": session_id if session_id is not None else "unbound",
                     "codex_thread_name": run["codex_thread_name"],
                     "session_display_name": run["session_display_name"],
+                    "codex_model": run.get("codex_model"),
+                    "codex_reasoning_effort": run.get("codex_reasoning_effort"),
+                    "codex_model_provider": run.get("codex_model_provider"),
                     "runs": [],
                     "active_count": 0,
                 })
@@ -644,7 +1303,11 @@ def create_app(
             )
             for group in sessions:
                 group["runs"].sort(key=lambda run: (run["session_seq"], run["updated_at"]), reverse=True)
-            return {
+                model_run = next((r for r in group["runs"] if r.get("codex_model") is not None), group["runs"][0])
+                group["codex_model"] = model_run.get("codex_model")
+                group["codex_reasoning_effort"] = model_run.get("codex_reasoning_effort")
+                group["codex_model_provider"] = model_run.get("codex_model_provider")
+            payload: dict[str, Any] = {
                 "sessions": sessions,
                 "global_active_runs": [enriched[run["id"]] for run in global_active],
                 "concurrent_risks": [
@@ -652,6 +1315,10 @@ def create_app(
                     if (risk := _concurrent_risk(canonical_id, activity))["concurrent_local_write_risk"]
                 ],
             }
+            codex_catalog = _build_codex_catalog_projection(database, mode=mode)
+            if codex_catalog is not None:
+                payload["codex_catalog"] = codex_catalog
+            return payload
 
         return JSONResponse(await asyncio.to_thread(build))
 
@@ -684,7 +1351,9 @@ def create_app(
         # Disk checks are explicitly requested through workspace diff/status.
         # An omitted count means not inspected, never a fabricated clean result.
         workspaces = status_summary["workspaces"]
-        workers = status_summary["workers"]
+        enriched_workers, helper_subagents, session_subagents, model_summary = _enrich_snapshot_agents(
+            database, dashboard_run, status_summary["workers"]
+        )
 
         channels = [ch["channel"] for ch in status_summary["channels"]]
         for default_ch in ("main", "human"):
@@ -697,7 +1366,10 @@ def create_app(
             "project": project,
             "task_packet": latest_packet,
             "task_packets": packets,
-            "workers": workers,
+            "workers": enriched_workers,
+            "helper_subagents": helper_subagents,
+            "session_subagents": session_subagents,
+            "model_summary": model_summary,
             "workspaces": workspaces,
             "messages": messages,
             "channels": channels,
@@ -796,7 +1468,8 @@ def create_app(
                                 data = {**data, "run": {
                                     key: value for key, value in data["run"].items()
                                     if key in {"id", "project_id", "mode", "title", "status", "session_id",
-                                               "session_seq", "created_at", "updated_at", "workflow_version"}
+                                               "session_seq", "created_at", "updated_at", "workflow_version",
+                                               "trigger_model", "trigger_reasoning_effort"}
                                 }}
                             data_json = json.dumps(data, ensure_ascii=False)
                             yield f"event: {item['event']}\ndata: {data_json}\n\n"
@@ -1058,6 +1731,7 @@ def create_app(
         Route("/api/tools", api_tools, methods=["GET"]),
         Route("/api/rpc", api_rpc, methods=["POST"]),
         Route("/api/projects", api_projects, methods=["GET"]),
+        Route("/api/codex/catalog", api_codex_catalog, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
         Route("/api/runs", api_runs, methods=["GET"]),
         Route("/api/runs/{run_id}", api_run, methods=["GET"]),

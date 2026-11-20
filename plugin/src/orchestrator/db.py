@@ -12,14 +12,15 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from orchestrator import codex_bridge
 from orchestrator.config import Settings, get_settings
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 TASK_NAME_RE = re.compile(r"^[a-z0-9_-]{1,48}$")
 PENDING_AGENT_PATH_RE = re.compile(r"^/root/[a-z0-9_-]{1,48}$")
@@ -67,6 +68,9 @@ def require_runtime_schema(db_path: Path) -> None:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+_clean_opt_str = codex_bridge._clean_opt_str
 
 
 def _json_dumps(value: Any, default_empty: str) -> str:
@@ -211,6 +215,8 @@ def _run_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "session_seq": row["session_seq"],
         "trigger_prompt": row["trigger_prompt"],
         "execution_root": row["execution_root"],
+        "trigger_model": row["trigger_model"],
+        "trigger_reasoning_effort": row["trigger_reasoning_effort"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -241,12 +247,35 @@ def _worker_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "role": row["role"],
         "agent_id": row["agent_id"],
         "pending_agent_path": row["pending_agent_path"] if "pending_agent_path" in keys else None,
+        "codex_thread_id": row["codex_thread_id"],
+        "model": row["model"],
+        "reasoning_effort": row["reasoning_effort"],
+        "model_provider": row["model_provider"],
         "status": row["status"],
         "workspace_id": row["workspace_id"],
         "current_task": row["current_task"],
         "last_heartbeat_at": row["last_heartbeat_at"],
         "stall_threshold_sec": row["stall_threshold_sec"],
         "stalled_alerted": bool(row["stalled_alerted"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _worker_subagent_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "run_id": row["run_id"],
+        "thread_id": row["thread_id"],
+        "parent_worker_id": row["parent_worker_id"],
+        "parent_thread_id": row["parent_thread_id"],
+        "depth": int(row["depth"]),
+        "agent_path": row["agent_path"],
+        "agent_role": row["agent_role"],
+        "agent_nickname": row["agent_nickname"],
+        "model": row["model"],
+        "reasoning_effort": row["reasoning_effort"],
+        "model_provider": row["model_provider"],
+        "edge_status": row["edge_status"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
@@ -304,6 +333,30 @@ CREATE INDEX IF NOT EXISTS idx_session_run_bindings_run
     ON session_run_bindings (run_id, updated_at DESC)
 """
 
+_WORKER_SUBAGENTS_SQL = """
+CREATE TABLE IF NOT EXISTS worker_subagents (
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    thread_id TEXT NOT NULL,
+    parent_worker_id TEXT REFERENCES workers(id) ON DELETE CASCADE,
+    parent_thread_id TEXT NOT NULL,
+    depth INTEGER NOT NULL DEFAULT 2,
+    agent_path TEXT NOT NULL DEFAULT '',
+    agent_role TEXT,
+    agent_nickname TEXT,
+    model TEXT,
+    reasoning_effort TEXT,
+    model_provider TEXT,
+    edge_status TEXT,
+    created_at REAL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (run_id, thread_id)
+)
+"""
+_WORKER_SUBAGENTS_INDEX_SQL = """
+CREATE INDEX IF NOT EXISTS idx_worker_subagents_run_parent
+    ON worker_subagents (run_id, parent_worker_id, depth, created_at)
+"""
+
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
@@ -335,7 +388,9 @@ CREATE TABLE IF NOT EXISTS runs (
     turn_id TEXT,
     session_seq INTEGER NOT NULL DEFAULT 0,
     trigger_prompt TEXT NOT NULL DEFAULT '',
-    execution_root TEXT NOT NULL DEFAULT ''
+    execution_root TEXT NOT NULL DEFAULT '',
+    trigger_model TEXT,
+    trigger_reasoning_effort TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_packets (
@@ -375,6 +430,10 @@ CREATE TABLE IF NOT EXISTS workers (
     role TEXT NOT NULL CHECK (role IN ('interviewer', 'planner', 'investigator', 'coder', 'verifier', 'swarm_worker')),
     agent_id TEXT,
     pending_agent_path TEXT,
+    codex_thread_id TEXT,
+    model TEXT,
+    reasoning_effort TEXT,
+    model_provider TEXT,
     status TEXT NOT NULL DEFAULT 'waiting' CHECK (status IN ('waiting', 'working', 'stopped', 'killed')),
     workspace_id TEXT,
     current_task TEXT NOT NULL DEFAULT '',
@@ -386,7 +445,7 @@ CREATE TABLE IF NOT EXISTS workers (
     UNIQUE (run_id, name)
 );
 
-""" + _SESSION_BINDINGS_SQL + """;
+""" + _SESSION_BINDINGS_SQL + ";\n" + _WORKER_SUBAGENTS_SQL + """;
 
 CREATE TABLE IF NOT EXISTS session_turns (
     session_id TEXT NOT NULL,
@@ -394,6 +453,8 @@ CREATE TABLE IF NOT EXISTS session_turns (
     cwd TEXT NOT NULL,
     prompt_preview TEXT NOT NULL,
     active_run_id TEXT,
+    model TEXT,
+    reasoning_effort TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     PRIMARY KEY (session_id, turn_id)
@@ -439,29 +500,39 @@ CREATE INDEX IF NOT EXISTS idx_board_messages_run_seq
     ON board_messages (run_id, seq);
 CREATE INDEX IF NOT EXISTS idx_board_messages_run_channel_seq
     ON board_messages (run_id, channel, seq);
-""" + _SESSION_BINDINGS_INDEX_SQL + ";"
+""" + _SESSION_BINDINGS_INDEX_SQL + ";\n" + _WORKER_SUBAGENTS_INDEX_SQL + ";"
 
 
-def _migrate_session_metadata(conn: sqlite3.Connection, version: int) -> None:
-    for table, additions in (
-        ("projects", {
-            "codex_project_id": "TEXT",
-            "codex_project_name": "TEXT",
-            "project_kind": "TEXT NOT NULL DEFAULT 'workspace' CHECK (project_kind IN ('workspace', 'fixture', 'temp'))",
-            "canonical_project_id": "TEXT",
-        }),
-        ("runs", {
-            "session_id": "TEXT",
-            "turn_id": "TEXT",
-            "session_seq": "INTEGER NOT NULL DEFAULT 0",
-            "trigger_prompt": "TEXT NOT NULL DEFAULT ''",
-            "execution_root": "TEXT NOT NULL DEFAULT ''",
-        }),
-    ):
+def _add_missing_columns(
+    conn: sqlite3.Connection,
+    table_additions: Iterable[tuple[str, dict[str, str]]],
+) -> None:
+    for table, additions in table_additions:
         columns = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
         for name, declaration in additions.items():
             if name not in columns:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+
+def _migrate_session_metadata(conn: sqlite3.Connection, version: int) -> None:
+    _add_missing_columns(
+        conn,
+        (
+            ("projects", {
+                "codex_project_id": "TEXT",
+                "codex_project_name": "TEXT",
+                "project_kind": "TEXT NOT NULL DEFAULT 'workspace' CHECK (project_kind IN ('workspace', 'fixture', 'temp'))",
+                "canonical_project_id": "TEXT",
+            }),
+            ("runs", {
+                "session_id": "TEXT",
+                "turn_id": "TEXT",
+                "session_seq": "INTEGER NOT NULL DEFAULT 0",
+                "trigger_prompt": "TEXT NOT NULL DEFAULT ''",
+                "execution_root": "TEXT NOT NULL DEFAULT ''",
+            }),
+        ),
+    )
 
     bindings = {r["name"]: r["pk"] for r in conn.execute("PRAGMA table_info(session_run_bindings)")}
     if bindings["run_id"] != 2:
@@ -497,6 +568,31 @@ def _migrate_session_metadata(conn: sqlite3.Connection, version: int) -> None:
             )
         """)
         conn.execute("UPDATE runs SET session_seq = 1 WHERE session_id <> '' AND session_seq = 0")
+
+
+def _migrate_model_metadata(conn: sqlite3.Connection) -> None:
+    """Idempotently add Schema 10 model metadata columns and worker_subagents table."""
+    _add_missing_columns(
+        conn,
+        (
+            ("runs", {
+                "trigger_model": "TEXT",
+                "trigger_reasoning_effort": "TEXT",
+            }),
+            ("session_turns", {
+                "model": "TEXT",
+                "reasoning_effort": "TEXT",
+            }),
+            ("workers", {
+                "codex_thread_id": "TEXT",
+                "model": "TEXT",
+                "reasoning_effort": "TEXT",
+                "model_provider": "TEXT",
+            }),
+        ),
+    )
+    conn.execute(_WORKER_SUBAGENTS_SQL)
+    conn.execute(_WORKER_SUBAGENTS_INDEX_SQL)
 
 
 class Database:
@@ -660,6 +756,7 @@ class Database:
             if "workflow_version" not in {r["name"] for r in conn.execute("PRAGMA table_info(runs)")}:
                 conn.execute("ALTER TABLE runs ADD COLUMN workflow_version INTEGER NOT NULL DEFAULT 0")
             _migrate_session_metadata(conn, version)
+            _migrate_model_metadata(conn)
             from orchestrator.workflow import install_schema
             install_schema(conn)
             from orchestrator.native_actions import install_schema as install_native_schema
@@ -807,6 +904,8 @@ class Database:
         turn_id: str | None = None,
         trigger_prompt: str = "",
         execution_root: str = "",
+        trigger_model: str | None = None,
+        trigger_reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         """Create a new orchestration run, auto-registering the project when project_root is given."""
         if mode not in VALID_RUN_MODES:
@@ -823,6 +922,8 @@ class Database:
             raise ValueError("session_id must be a non-empty string when provided")
 
         clean_session = session_id.strip() if session_id is not None else None
+        clean_trigger_model = _clean_opt_str(trigger_model)
+        clean_trigger_effort = _clean_opt_str(trigger_reasoning_effort)
         meta_json = _json_dumps(metadata, "{}")
         rid = run_id or _new_id("run")
 
@@ -850,10 +951,12 @@ class Database:
             conn.execute("""
                 INSERT INTO runs
                     (id, project_id, mode, title, status, metadata_json, created_at, updated_at, workflow_version,
-                     session_id, turn_id, session_seq, trigger_prompt, execution_root)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 5, ?, ?, ?, ?, ?)
+                     session_id, turn_id, session_seq, trigger_prompt, execution_root,
+                     trigger_model, trigger_reasoning_effort)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 5, ?, ?, ?, ?, ?, ?, ?)
             """, (rid, resolved_project_id, mode, title, status, meta_json, now, now,
-                  clean_session, turn_id, session_seq, trigger_prompt, execution_root))
+                  clean_session, turn_id, session_seq, trigger_prompt, execution_root,
+                  clean_trigger_model, clean_trigger_effort))
             if clean_session is not None:
                 self._upsert_session_binding_in_tx(
                     conn,
@@ -870,6 +973,79 @@ class Database:
             row = conn.execute("SELECT * FROM runs WHERE id = ?;", (rid,)).fetchone()
             assert row is not None
             return _run_from_row(row)
+
+    def update_run_trigger_model(
+        self,
+        run_id: str,
+        *,
+        trigger_model: str | None = None,
+        trigger_reasoning_effort: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Backfill missing trigger model / reasoning effort without overwriting an existing model."""
+        clean_model = _clean_opt_str(trigger_model)
+        clean_effort = _clean_opt_str(trigger_reasoning_effort)
+        with self.transaction() as conn:
+            existing = conn.execute("SELECT * FROM runs WHERE id = ?;", (run_id,)).fetchone()
+            if existing is None:
+                return None
+            cur_model = _clean_opt_str(existing["trigger_model"])
+            cur_effort = _clean_opt_str(existing["trigger_reasoning_effort"])
+            new_model = cur_model if cur_model is not None else clean_model
+            model_matches = cur_model is None or clean_model is None or cur_model == clean_model
+            new_effort = (
+                clean_effort
+                if (cur_effort is None and clean_effort is not None and model_matches)
+                else cur_effort
+            )
+            if new_model == existing["trigger_model"] and new_effort == existing["trigger_reasoning_effort"]:
+                return _run_from_row(existing)
+            now = time.time()
+            conn.execute(
+                """
+                UPDATE runs
+                SET trigger_model = ?, trigger_reasoning_effort = ?, updated_at = ?
+                WHERE id = ?;
+                """,
+                (new_model, new_effort, now, run_id),
+            )
+            row = conn.execute("SELECT * FROM runs WHERE id = ?;", (run_id,)).fetchone()
+            assert row is not None
+            return _run_from_row(row)
+
+    def list_session_runs_ordered(self, session_id: str) -> list[dict[str, Any]]:
+        if not isinstance(session_id, str) or not session_id.strip():
+            return []
+        with self.read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE session_id = ?
+                ORDER BY created_at ASC, session_seq ASC, rowid ASC;
+                """,
+                (session_id.strip(),),
+            ).fetchall()
+            return [_run_from_row(r) for r in rows]
+
+    def list_session_registered_agent_paths(self, session_id: str) -> set[str]:
+        if not isinstance(session_id, str) or not session_id.strip():
+            return set()
+        with self.read_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT w.agent_id, w.pending_agent_path
+                FROM workers AS w
+                JOIN runs AS r ON r.id = w.run_id
+                WHERE r.session_id = ?;
+                """,
+                (session_id.strip(),),
+            ).fetchall()
+            paths: set[str] = set()
+            for row in rows:
+                if agent_id := _clean_opt_str(row["agent_id"]):
+                    paths.add(agent_id)
+                if pending := _clean_opt_str(row["pending_agent_path"]):
+                    paths.add(pending)
+            return paths
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         with self.read_connection() as conn:
@@ -1840,6 +2016,145 @@ class Database:
             assert row is not None
             return _worker_from_row(row)
 
+    def update_worker_model_meta(
+        self,
+        worker_id: str,
+        *,
+        codex_thread_id: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        model_provider: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Update non-null Codex thread/model metadata on a worker without clearing existing values."""
+        clean_thread_id = _clean_opt_str(codex_thread_id)
+        clean_model = _clean_opt_str(model)
+        clean_effort = _clean_opt_str(reasoning_effort)
+        clean_provider = _clean_opt_str(model_provider)
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM workers WHERE id = ?;", (worker_id,)
+            ).fetchone()
+            if existing is None:
+                return None
+            new_thread_id = clean_thread_id if clean_thread_id is not None else existing["codex_thread_id"]
+            new_model = clean_model if clean_model is not None else existing["model"]
+            new_effort = clean_effort if clean_effort is not None else existing["reasoning_effort"]
+            new_provider = clean_provider if clean_provider is not None else existing["model_provider"]
+            if (
+                new_thread_id == existing["codex_thread_id"]
+                and new_model == existing["model"]
+                and new_effort == existing["reasoning_effort"]
+                and new_provider == existing["model_provider"]
+            ):
+                return _worker_from_row(existing)
+            now = time.time()
+            conn.execute(
+                """
+                UPDATE workers
+                SET codex_thread_id = ?, model = ?, reasoning_effort = ?, model_provider = ?, updated_at = ?
+                WHERE id = ?;
+                """,
+                (new_thread_id, new_model, new_effort, new_provider, now, worker_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM workers WHERE id = ?;", (worker_id,)
+            ).fetchone()
+            assert row is not None
+            return _worker_from_row(row)
+
+    @staticmethod
+    def _list_worker_subagents_in_tx(
+        conn: sqlite3.Connection, run_id: str,
+    ) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """
+            SELECT * FROM worker_subagents
+            WHERE run_id = ?
+            ORDER BY depth ASC, COALESCE(created_at, 0) ASC, thread_id ASC;
+            """,
+            (run_id,),
+        ).fetchall()
+        return [_worker_subagent_from_row(r) for r in rows]
+
+    def upsert_worker_subagents(
+        self,
+        run_id: str,
+        subagents: Iterable[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Upsert L2+ helper subagent snapshots for run_id, preserving non-null fields."""
+        items = list(subagents)
+        with self.transaction() as conn:
+            run_row = conn.execute(
+                "SELECT 1 FROM runs WHERE id = ?;", (run_id,)
+            ).fetchone()
+            if run_row is None:
+                raise NotFoundError(f"Run not found: {run_id}")
+            now = time.time()
+            for item in items:
+                thread_id = _clean_opt_str(item.get("thread_id"))
+                parent_thread_id = _clean_opt_str(item.get("parent_thread_id"))
+                if not thread_id or not parent_thread_id:
+                    raise ValueError("Subagent thread_id and parent_thread_id must be non-empty strings")
+                parent_worker_id = _clean_opt_str(item.get("parent_worker_id"))
+                depth = int(item.get("depth", 2))
+                agent_path = _clean_opt_str(item.get("agent_path")) or ""
+                agent_role = _clean_opt_str(item.get("agent_role"))
+                agent_nickname = _clean_opt_str(item.get("agent_nickname"))
+                model = _clean_opt_str(item.get("model"))
+                reasoning_effort = _clean_opt_str(item.get("reasoning_effort"))
+                model_provider = _clean_opt_str(item.get("model_provider"))
+                edge_status = _clean_opt_str(item.get("edge_status"))
+                raw_created = item.get("created_at")
+                created_at = float(raw_created) if raw_created is not None else None
+                raw_updated = item.get("updated_at")
+                updated_at = float(raw_updated) if raw_updated is not None else now
+                conn.execute(
+                    """
+                    INSERT INTO worker_subagents (
+                        run_id, thread_id, parent_worker_id, parent_thread_id,
+                        depth, agent_path, agent_role, agent_nickname,
+                        model, reasoning_effort, model_provider, edge_status,
+                        created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (run_id, thread_id) DO UPDATE SET
+                        parent_worker_id = COALESCE(excluded.parent_worker_id, worker_subagents.parent_worker_id),
+                        parent_thread_id = excluded.parent_thread_id,
+                        depth = excluded.depth,
+                        agent_path = CASE WHEN excluded.agent_path != '' THEN excluded.agent_path
+                                          ELSE worker_subagents.agent_path END,
+                        agent_role = COALESCE(excluded.agent_role, worker_subagents.agent_role),
+                        agent_nickname = COALESCE(excluded.agent_nickname, worker_subagents.agent_nickname),
+                        model = COALESCE(excluded.model, worker_subagents.model),
+                        reasoning_effort = COALESCE(excluded.reasoning_effort, worker_subagents.reasoning_effort),
+                        model_provider = COALESCE(excluded.model_provider, worker_subagents.model_provider),
+                        edge_status = COALESCE(excluded.edge_status, worker_subagents.edge_status),
+                        created_at = COALESCE(excluded.created_at, worker_subagents.created_at),
+                        updated_at = excluded.updated_at;
+                    """,
+                    (
+                        run_id,
+                        thread_id,
+                        parent_worker_id,
+                        parent_thread_id,
+                        depth,
+                        agent_path,
+                        agent_role,
+                        agent_nickname,
+                        model,
+                        reasoning_effort,
+                        model_provider,
+                        edge_status,
+                        created_at,
+                        updated_at,
+                    ),
+                )
+            return self._list_worker_subagents_in_tx(conn, run_id)
+
+    def list_worker_subagents(self, run_id: str) -> list[dict[str, Any]]:
+        with self.read_connection() as conn:
+            return self._list_worker_subagents_in_tx(conn, run_id)
+
     # ------------------------------------------------------------------
     # Board Messages & Read Cursors
     # ------------------------------------------------------------------
@@ -2169,12 +2484,16 @@ class Database:
         cwd: str,
         prompt_preview: str,
         active_run_id: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> dict[str, Any]:
         if not isinstance(session_id, str) or not session_id.strip():
             raise ValueError("session_id must be a non-empty string")
         if not isinstance(turn_id, str) or not turn_id.strip():
             raise ValueError("turn_id must be a non-empty string")
         clean_session, clean_turn = session_id.strip(), turn_id.strip()
+        clean_model = _clean_opt_str(model)
+        clean_effort = _clean_opt_str(reasoning_effort)
         with self.transaction() as conn:
             now = time.time()
             claimed_by = conn.execute("""
@@ -2185,16 +2504,69 @@ class Database:
                 active_run_id = claimed_by["id"]
             conn.execute("""
                 INSERT INTO session_turns
-                    (session_id, turn_id, cwd, prompt_preview, active_run_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (session_id, turn_id, cwd, prompt_preview, active_run_id, model, reasoning_effort, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (session_id, turn_id) DO UPDATE SET
                     cwd = excluded.cwd, prompt_preview = excluded.prompt_preview,
                     active_run_id = CASE WHEN ? THEN excluded.active_run_id
                                          ELSE COALESCE(session_turns.active_run_id, excluded.active_run_id) END,
+                    model = COALESCE(excluded.model, session_turns.model),
+                    reasoning_effort = COALESCE(excluded.reasoning_effort, session_turns.reasoning_effort),
                     updated_at = excluded.updated_at
-            """, (clean_session, clean_turn, cwd, prompt_preview, active_run_id, now, now, claimed_by is not None))
+            """, (clean_session, clean_turn, cwd, prompt_preview, active_run_id,
+                  clean_model, clean_effort, now, now, claimed_by is not None))
             row = conn.execute(
                 "SELECT * FROM session_turns WHERE session_id = ? AND turn_id = ?",
+                (clean_session, clean_turn),
+            ).fetchone()
+            assert row is not None
+            return dict(row)
+
+    def update_session_turn_model(
+        self,
+        session_id: str,
+        turn_id: str,
+        *,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Fill missing model / reasoning_effort on an existing session_turns row."""
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            return None
+        clean_session, clean_turn = session_id.strip(), turn_id.strip()
+        clean_model = _clean_opt_str(model)
+        clean_effort = _clean_opt_str(reasoning_effort)
+        with self.transaction() as conn:
+            existing = conn.execute(
+                "SELECT * FROM session_turns WHERE session_id = ? AND turn_id = ?;",
+                (clean_session, clean_turn),
+            ).fetchone()
+            if existing is None:
+                return None
+            cur_model = _clean_opt_str(existing["model"])
+            cur_effort = _clean_opt_str(existing["reasoning_effort"])
+            new_model = cur_model if cur_model is not None else clean_model
+            model_matches = cur_model is None or clean_model is None or cur_model == clean_model
+            new_effort = (
+                clean_effort
+                if (cur_effort is None and clean_effort is not None and model_matches)
+                else cur_effort
+            )
+            if new_model == existing["model"] and new_effort == existing["reasoning_effort"]:
+                return dict(existing)
+            now = time.time()
+            conn.execute(
+                """
+                UPDATE session_turns
+                SET model = ?, reasoning_effort = ?, updated_at = ?
+                WHERE session_id = ? AND turn_id = ?;
+                """,
+                (new_model, new_effort, now, clean_session, clean_turn),
+            )
+            row = conn.execute(
+                "SELECT * FROM session_turns WHERE session_id = ? AND turn_id = ?;",
                 (clean_session, clean_turn),
             ).fetchone()
             assert row is not None

@@ -119,7 +119,7 @@ class _MockRpcServer:
 
 def test_m9_manifests_entrypoints_and_spike_report_validity() -> None:
     pyproject = tomllib.loads((PLUGIN_DIR / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["version"] == "0.6.1"
+    assert pyproject["project"]["version"] == "0.6.2"
     scripts = pyproject["project"]["scripts"]
     assert scripts["tri-orchestrator-hook"] == "orchestrator.hook_runner:main"
     assert scripts["tri-orchestrator-challenge"] == "orchestrator.challenge_runner:main"
@@ -128,7 +128,7 @@ def test_m9_manifests_entrypoints_and_spike_report_validity() -> None:
         (PLUGIN_DIR / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
     )
     assert codex_manifest["name"] == "tri-orchestrator"
-    assert codex_manifest["version"] == "0.6.1"
+    assert codex_manifest["version"] == "0.6.2"
     assert codex_manifest["hooks"] == "./hooks/hooks.json"
 
     # M9b single-manifest convergence: root plugin/plugin.json must not exist so Codex loads .codex-plugin/plugin.json
@@ -861,10 +861,10 @@ def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
     upgrade_mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(upgrade_mod)
 
-    assert upgrade_mod.supported_schema(PLUGIN_DIR) == 9
+    assert upgrade_mod.supported_schema(PLUGIN_DIR) == 10
     assert upgrade_mod.package_identity(PLUGIN_DIR) == {
         "name": "tri-orchestrator",
-        "version": "0.6.1",
+        "version": "0.6.2",
     }
 
     backup_dir = tmp_path / "backup"
@@ -890,6 +890,7 @@ def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
         "compact_board_v1",
         "workflow5_direct_spawn_v1",
         "session_hooks_v1",
+        "agent_model_tracking_v1",
     ]
 
     state = {"capabilities": list(base_caps)}
@@ -900,8 +901,8 @@ def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
                 "status": "ok",
                 "ok": True,
                 "pid": os.getpid(),
-                "software_version": "0.6.1",
-                "schema_version": 9,
+                "software_version": "0.6.2",
+                "schema_version": 10,
                 "data_dir": str(data_dir.resolve()),
                 "port": self.server.server_port,  # type: ignore[attr-defined]
                 "capabilities": state["capabilities"],
@@ -921,8 +922,8 @@ def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
                 {
                     "data_dir": str(data_dir.resolve()),
                     "port": srv.server_port,
-                    "source_identity": {"name": "tri-orchestrator", "version": "0.6.1"},
-                    "supported_schema": 9,
+                    "source_identity": {"name": "tri-orchestrator", "version": "0.6.2"},
+                    "supported_schema": 10,
                 }
             ),
             encoding="utf-8",
@@ -930,7 +931,7 @@ def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
         th = threading.Thread(target=srv.serve_forever, daemon=True)
         th.start()
         try:
-            # Missing 0.6.0 capabilities must fail verification on schema 9
+            # Missing 0.6.x capabilities must fail verification on schema 10
             with pytest.raises(upgrade_mod.UpgradeError, match="mismatch"):
                 upgrade_mod.verify(backup_dir)
 
@@ -938,7 +939,7 @@ def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
             with pytest.raises(upgrade_mod.UpgradeError, match="mismatch"):
                 upgrade_mod.verify(backup_dir)
 
-            # With all 4 new capabilities (15 total) present, verification succeeds
+            # With all required capabilities (16 total) present, verification succeeds
             state["capabilities"] = base_caps + new_060_caps
             verified = upgrade_mod.verify(backup_dir)
             assert verified["status"] == "backend_verified"

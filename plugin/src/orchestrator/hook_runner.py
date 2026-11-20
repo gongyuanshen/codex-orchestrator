@@ -478,6 +478,8 @@ def build_hook_stdout_json(
 
     cwd = str(payload.get("cwd") or "").strip()
     stop_hook_active = bool(payload.get("stop_hook_active"))
+    model = str(payload.get("model") or "").strip()
+    turn_id = str(payload.get("turn_id") or "").strip()
 
     # Event-specific local fast-paths (zero network I/O when unneeded)
     if event_name == "Stop" and stop_hook_active:
@@ -489,7 +491,6 @@ def build_hook_stdout_json(
             return None
 
     if event_name == "UserPromptSubmit":
-        turn_id = str(payload.get("turn_id") or "").strip()
         prompt = str(payload.get("prompt") or "")
         invoked_mode = detect_explicit_mode_invocation(prompt)
         if invoked_mode is None and not turn_id:
@@ -498,17 +499,20 @@ def build_hook_stdout_json(
         rpc_url = resolve_rpc_url(env)
         turn_result = None
         if rpc_url:
+            rpc_args: dict[str, Any] = {
+                "session_id": session_id,
+                "event_name": event_name,
+                "cwd": cwd,
+                "turn_id": turn_id,
+                "prompt_preview": truncate_chars(" ".join(prompt.split()), MAX_PROMPT_PREVIEW_CHARS),
+                "has_mode_invocation": invoked_mode is not None,
+            }
+            if model:
+                rpc_args["model"] = model
             turn_result = call_daemon_rpc(
                 rpc_url,
                 "session_hook_check",
-                {
-                    "session_id": session_id,
-                    "event_name": event_name,
-                    "cwd": cwd,
-                    "turn_id": turn_id,
-                    "prompt_preview": truncate_chars(" ".join(prompt.split()), MAX_PROMPT_PREVIEW_CHARS),
-                    "has_mode_invocation": invoked_mode is not None,
-                },
+                rpc_args,
                 timeout_sec=clamp_timeout(timeout_sec, env),
             )
         if invoked_mode is None:
@@ -550,16 +554,22 @@ def build_hook_stdout_json(
     deadline_timeout = clamp_timeout(timeout_sec, env)
     started = time.monotonic()
 
+    main_rpc_args: dict[str, Any] = {
+        "session_id": session_id,
+        "event_name": event_name,
+        "cwd": cwd,
+        "stop_hook_active": stop_hook_active,
+        "mark_stop_blocked": bool(event_name == "Stop" and not stop_hook_active),
+    }
+    if turn_id:
+        main_rpc_args["turn_id"] = turn_id
+    if model:
+        main_rpc_args["model"] = model
+
     rpc_result = call_daemon_rpc(
         rpc_url,
         "session_hook_check",
-        {
-            "session_id": session_id,
-            "event_name": event_name,
-            "cwd": cwd,
-            "stop_hook_active": stop_hook_active,
-            "mark_stop_blocked": bool(event_name == "Stop" and not stop_hook_active),
-        },
+        main_rpc_args,
         timeout_sec=deadline_timeout,
     )
 

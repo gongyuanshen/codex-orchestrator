@@ -99,6 +99,10 @@
     runStatusFilter: 'all',
     allModes: false,
     sessionOpenOverrides: new Map(),
+    codexProjectOpenOverrides: new Map(),
+    codexCatalogAvailable: false,
+    codexProjects: [],
+    selectedSessionId: null,
     cmdPaletteOpen: false,
     cmdPaletteQuery: '',
     cmdPaletteIndex: 0,
@@ -132,6 +136,9 @@
     resumeContext: null,
     planReadiness: null,
     workers: [],
+    helperSubagents: [],
+    sessionSubagents: [],
+    modelSummary: [],
     controlRequests: [],
     workspaces: [],
     messages: [],
@@ -150,6 +157,7 @@
     inspectorBannerByWorkspace: new Map(),
     diffWrap: false,
     actionBusy: false,
+    workerModelRetryTimer: null,
 
     healthOk: null,
     healthPort: null,
@@ -164,6 +172,7 @@
     graphPlayTimer: null,
     graphHideInactive: false,
     graphExpandAll: true,
+    graphShowHelpers: true,
     graphSelectedNode: null,
     graphHoverNode: null,
   };
@@ -200,6 +209,7 @@
     cmdPaletteInput: document.getElementById('cmdPaletteInput'),
     cmdPaletteResults: document.getElementById('cmdPaletteResults'),
     runMetaPill: document.getElementById('runMetaPill'),
+    runModelBadge: document.getElementById('runModelBadge'),
     modeBadge: document.getElementById('modeBadge'),
     runStatusBadge: document.getElementById('runStatusBadge'),
     healthBadge: document.getElementById('healthBadge'),
@@ -259,6 +269,7 @@
     graphReadout: document.getElementById('graphReadout'),
     graphHideInactiveToggle: document.getElementById('graphHideInactiveToggle'),
     graphExpandAllToggle: document.getElementById('graphExpandAllToggle'),
+    graphShowHelpersToggle: document.getElementById('graphShowHelpersToggle'),
     graphCanvasHost: document.getElementById('graphCanvasHost'),
     graphDetailBar: document.getElementById('graphDetailBar'),
 
@@ -554,6 +565,170 @@
 
   function renderAppServerBadge() {
     return '<span class="pill-badge badge-appserver" title="由宿主终端 tri-orchestrator-pipeline 驱动的独立 App-Server 管线线程（appserver://），非聊天内原生 V2 子代理（/root/...）">App-Server 管线</span>';
+  }
+
+  function formatModelText(model, effort) {
+    const m = String(model || '').trim();
+    if (!m) return '';
+    const e = String(effort || '').trim();
+    return e ? `${m} · ${e}` : m;
+  }
+
+  function modelSourceLabel(source) {
+    if (source === 'live') return 'Codex 实时';
+    if (source === 'trigger_snapshot') return '触发快照';
+    if (source === 'snapshot') return '历史快照';
+    return '未观测';
+  }
+
+  function renderModelBadge(model, effort, opts = {}) {
+    const m = String(model || '').trim();
+    const e = String(effort || '').trim();
+    const compactCls = opts.compact ? ' model-badge-compact' : '';
+    if (!m) {
+      if (!opts.showEmpty) return '';
+      const emptyTip = opts.extraTitle ? String(opts.extraTitle).trim() : '未观测到 Codex 模型元数据';
+      return `<span class="chip-tag model-badge model-badge-empty${compactCls}" title="${escapeHtml(emptyTip)}">${escapeHtml(opts.emptyText || '模型未观测')}</span>`;
+    }
+    const cls = `chip-tag model-badge${compactCls}${opts.switched ? ' model-badge-mismatch' : ''}`;
+    const titleParts = [
+      `模型：${m}`,
+      e ? `推理强度：${e}` : '',
+      opts.provider ? `Provider：${String(opts.provider).trim()}` : '',
+      `来源：${modelSourceLabel(opts.source)}`,
+      opts.threadId ? `线程：${String(opts.threadId).trim()}` : '',
+      opts.extraTitle ? String(opts.extraTitle).trim() : '',
+    ].filter(Boolean);
+    const effortHtml = e ? `<span class="model-badge-effort">· ${escapeHtml(e)}</span>` : '';
+    const switchHtml = opts.switched ? '<span class="model-badge-switch-flag" title="会话中模型已切换">⇄</span>' : '';
+    return `<span class="${cls}" title="${escapeHtml(titleParts.join(' · '))}"><span>${escapeHtml(m)}</span>${effortHtml}${switchHtml}</span>`;
+  }
+
+  function resolveRunModels(run) {
+    if (!run || typeof run !== 'object') {
+      return {
+        primaryModel: null,
+        primaryEffort: null,
+        primarySource: null,
+        liveModel: null,
+        liveEffort: null,
+        switched: false,
+      };
+    }
+    const liveModel = run.codex_model || null;
+    const liveEffort = run.codex_reasoning_effort || null;
+    if (run.trigger_model) {
+      const switched = Boolean(
+        liveModel && (
+          liveModel !== run.trigger_model ||
+          (liveEffort && run.trigger_reasoning_effort && liveEffort !== run.trigger_reasoning_effort)
+        )
+      );
+      return {
+        primaryModel: run.trigger_model,
+        primaryEffort: run.trigger_reasoning_effort || null,
+        primarySource: 'trigger_snapshot',
+        liveModel,
+        liveEffort,
+        switched,
+      };
+    }
+    if (liveModel) {
+      return {
+        primaryModel: liveModel,
+        primaryEffort: liveEffort,
+        primarySource: 'live',
+        liveModel,
+        liveEffort,
+        switched: false,
+      };
+    }
+    return {
+      primaryModel: null,
+      primaryEffort: null,
+      primarySource: null,
+      liveModel: null,
+      liveEffort: null,
+      switched: false,
+    };
+  }
+
+  function resolveSenderModel(msg) {
+    if (!msg) return null;
+    const sender = normalizeHandle(msg.sender).toLowerCase();
+    const role = String(msg.sender_role || '').toLowerCase();
+    if (
+      ['human', 'system', 'watchdog', 'workflow'].includes(sender) ||
+      ['human', 'system', 'watchdog', 'workflow'].includes(role)
+    ) {
+      return null;
+    }
+    if (sender === 'coordinator' || role === 'coordinator') {
+      if (!state.run) return null;
+      const rm = resolveRunModels(state.run);
+      const model = rm.liveModel || rm.primaryModel;
+      const effort = rm.liveModel ? rm.liveEffort : rm.primaryEffort;
+      if (!model) return null;
+      return {
+        model,
+        reasoning_effort: effort,
+        model_provider: state.run.codex_model_provider || null,
+        codex_thread_id: state.run.session_id || null,
+        model_source: rm.liveModel ? 'live' : rm.primarySource,
+      };
+    }
+    const worker = state.workers.find((w) => w.name && normalizeHandle(w.name).toLowerCase() === sender);
+    if (!worker || !worker.model) return null;
+    return {
+      model: worker.model,
+      reasoning_effort: worker.reasoning_effort || null,
+      model_provider: worker.model_provider || null,
+      codex_thread_id: worker.codex_thread_id || null,
+      model_source: worker.model_source || (worker.codex_thread_id ? 'snapshot' : null),
+    };
+  }
+
+  function subagentDisplayLabel(sub) {
+    if (!sub) return 'helper';
+    return sub.agent_path || sub.agent_nickname || shortId(sub.thread_id) || 'helper';
+  }
+
+  function labelSubagentRole(role) {
+    if (!role) return '辅助子代理';
+    const key = String(role).toLowerCase();
+    return ROLE_LABELS[key] || String(role);
+  }
+
+  function renderSubagentTree(subagents, compact = false) {
+    if (!Array.isArray(subagents) || subagents.length === 0) return '';
+    const rows = subagents.map((sub) => {
+      const depth = Number(sub.depth || 2);
+      const label = subagentDisplayLabel(sub);
+      const nickname = sub.agent_nickname && sub.agent_path && sub.agent_nickname !== sub.agent_path
+        ? ` (${sub.agent_nickname})`
+        : '';
+      const roleText = labelSubagentRole(sub.agent_role);
+      const edgeStatus = sub.edge_status || sub.status || '';
+      const badge = renderModelBadge(sub.model, sub.reasoning_effort, {
+        source: sub.model_source || (sub.model ? 'live' : null),
+        provider: sub.model_provider,
+        threadId: sub.thread_id,
+        compact: true,
+        showEmpty: true,
+      });
+      return `
+        <div class="subagent-tree-item" data-subagent-thread="${escapeHtml(sub.thread_id || '')}">
+          <div class="subagent-tree-left">
+            <span class="subagent-depth-tag">L${escapeHtml(depth)} 辅助</span>
+            <span class="subagent-path mono" title="${escapeHtml(sub.agent_path || sub.thread_id || '')}">${escapeHtml(label)}${escapeHtml(nickname)}</span>
+            <span class="chip-tag tint-muted">${escapeHtml(roleText)}</span>
+            ${edgeStatus ? `<span class="chip-tag tint-muted">${escapeHtml(edgeStatus)}</span>` : ''}
+          </div>
+          <div class="subagent-tree-right">${badge}</div>
+        </div>
+      `;
+    }).join('');
+    return `<div class="member-subagents-tree${compact ? ' is-compact' : ''}">${rows}</div>`;
   }
 
   function isWorkerStalled(worker) {
@@ -945,6 +1120,68 @@
     }
   }
 
+  function applyCodexCatalog(catalog) {
+    if (!catalog || !catalog.available || !Array.isArray(catalog.projects)) {
+      return false;
+    }
+    state.codexCatalogAvailable = true;
+    state.codexProjects = catalog.projects;
+    state.projects = catalog.projects;
+    return true;
+  }
+
+  function collectCodexRuns(projectId = ALL_PROJECTS, mode = null) {
+    const runs = [];
+    for (const proj of state.codexProjects) {
+      if (projectId && projectId !== ALL_PROJECTS && String(proj.id) !== String(projectId)) {
+        continue;
+      }
+      for (const thread of proj.threads || []) {
+        for (const run of thread.runs || []) {
+          if (!mode || run.mode === mode) {
+            runs.push(run);
+          }
+        }
+      }
+    }
+    runs.sort((a, b) => Number(b.status === 'active') - Number(a.status === 'active') || runUpdatedMs(b) - runUpdatedMs(a));
+    return runs;
+  }
+
+  function findCodexThread(sessionId) {
+    if (!sessionId) return null;
+    for (const proj of state.codexProjects) {
+      for (const thread of proj.threads || []) {
+        if (String(thread.session_id) === String(sessionId)) {
+          return { project: proj, thread };
+        }
+      }
+    }
+    return null;
+  }
+
+  async function selectCodexThread(projectId, sessionId) {
+    if (state.selectedProjectId !== ALL_PROJECTS && projectId && String(state.selectedProjectId) !== String(projectId)) {
+      state.selectedProjectId = projectId;
+    }
+    state.selectedSessionId = sessionId;
+    const mode = state.allModes ? null : PAGE_MODE;
+    const scope = state.selectedProjectId === ALL_PROJECTS ? ALL_PROJECTS : (projectId || state.selectedProjectId || ALL_PROJECTS);
+    const threadRuns = collectCodexRuns(scope, mode).filter((r) => String(r.session_id) === String(sessionId));
+    if (threadRuns.length > 0) {
+      await selectRun(threadRuns[0].id);
+      return;
+    }
+    state.selectedRunId = null;
+    clearRunState();
+    state.loadState = 'idle';
+    syncUrlParams();
+    renderProjectSelector();
+    renderRunSelector();
+    updateTopRunControls();
+    renderAll();
+  }
+
   function projectFor(id) {
     return state.projects.find((p) => String(p.id) === String(id));
   }
@@ -954,8 +1191,14 @@
   }
 
   function inRunProject(run, projectId) {
-    return !projectId || projectId === ALL_PROJECTS ||
-      String(run.project_id) === String(projectId) || String(canonicalRunProject(run)) === String(projectId);
+    if (!projectId || projectId === ALL_PROJECTS) return true;
+    if (String(run.project_id) === String(projectId) || String(canonicalRunProject(run)) === String(projectId)) {
+      return true;
+    }
+    if (state.codexCatalogAvailable) {
+      return collectCodexRuns(projectId, null).some((r) => String(r.id) === String(run.id));
+    }
+    return false;
   }
 
   function validateRunContext(run, runId = null, projectId = null, mode = PAGE_MODE) {
@@ -973,7 +1216,13 @@
     if (version !== state.contextVersion) return null;
     validateRunContext(data.run, runId, null, mode);
     if (String(data.project?.id) !== String(data.run.project_id)) throw new Error('任务与项目元数据不匹配');
-    const run = { ...data.run, canonical_project_id: data.project.canonical_project_id || data.run.project_id };
+    const codexMatch = state.codexCatalogAvailable
+      ? collectCodexRuns(ALL_PROJECTS, null).find((r) => String(r.id) === String(runId))
+      : null;
+    const run = {
+      ...data.run,
+      canonical_project_id: codexMatch?.canonical_project_id || data.project.canonical_project_id || data.run.project_id,
+    };
     validateRunContext(run, runId, projectId, mode);
     return run;
   }
@@ -983,6 +1232,7 @@
     state.allModes = params.get('mode') === 'all';
     const requestedProject = state.selectedProjectId || params.get('project_id');
     const requestedRun = state.selectedRunId || params.get('run_id');
+    const requestedSession = state.selectedSessionId;
     state.selectedProjectId = requestedProject || null;
     state.selectedRunId = requestedRun || null;
     state.runs = [];
@@ -994,6 +1244,63 @@
     try {
       const data = await apiRequest('/api/projects');
       if (version !== state.contextVersion) return;
+      const usedCodex = applyCodexCatalog(data?.codex_catalog);
+      if (usedCodex) {
+        if (Array.isArray(data.codex_catalog.global_active_runs)) {
+          state.globalActiveRuns = data.codex_catalog.global_active_runs;
+          const activeIds = new Set(state.globalActiveRuns.map((r) => r.session_id).filter(Boolean));
+          el.globalActiveBadge.textContent = `${activeIds.size} 个会话运行中`;
+          el.globalActiveBadge.classList.remove('hidden');
+          el.globalActiveBadge.classList.toggle('has-active', activeIds.size > 0);
+        }
+        if (Array.isArray(data.codex_catalog.concurrent_risks)) {
+          state.riskyProjectIds = new Set(
+            data.codex_catalog.concurrent_risks
+              .filter((risk) => risk.concurrent_local_write_risk)
+              .map((risk) => risk.canonical_project_id)
+          );
+        }
+        renderProjectSelector();
+        let projectId = requestedProject;
+        let runId = requestedRun;
+        let exactRun = null;
+        if (requestedRun) {
+          const catalogMatch = collectCodexRuns(ALL_PROJECTS, null).find((r) => String(r.id) === String(requestedRun));
+          if (catalogMatch) {
+            validateRunContext(catalogMatch, requestedRun, requestedProject, state.allModes ? null : PAGE_MODE);
+            exactRun = catalogMatch;
+            projectId = requestedProject || canonicalRunProject(catalogMatch);
+          } else {
+            exactRun = await resolveRun(requestedRun, requestedProject, state.allModes ? null : PAGE_MODE);
+            if (!exactRun) return;
+            projectId = requestedProject || canonicalRunProject(exactRun);
+          }
+        } else if (requestedProject) {
+          projectId = requestedProject === ALL_PROJECTS || projectFor(requestedProject)
+            ? requestedProject
+            : ALL_PROJECTS;
+          state.selectedSessionId = requestedSession && findCodexThread(requestedSession) ? requestedSession : null;
+        } else {
+          projectId = ALL_PROJECTS;
+          const modeFilter = state.allModes ? null : PAGE_MODE;
+          if (requestedSession && findCodexThread(requestedSession)) {
+            state.selectedSessionId = requestedSession;
+            const threadRuns = collectCodexRuns(ALL_PROJECTS, modeFilter)
+              .filter((r) => String(r.session_id) === String(requestedSession));
+            runId = (threadRuns.find((r) => r.status === 'active') || threadRuns[0])?.id || null;
+          } else {
+            const catalogRuns = collectCodexRuns(ALL_PROJECTS, modeFilter);
+            const preferred = catalogRuns.find((r) => r.status === 'active') || catalogRuns[0] || null;
+            runId = preferred?.id || null;
+          }
+        }
+        await loadRuns(projectId, runId, exactRun);
+        void refreshGlobalSessions().then((supported) => {
+          if (supported) connectGlobalEvents();
+        });
+        return;
+      }
+
       state.projects = Array.isArray(data) ? data : data.projects;
       renderProjectSelector();
       let projectId = requestedProject;
@@ -1054,6 +1361,40 @@
     syncUrlParams();
     if (!projectId) return;
     try {
+      if (state.codexCatalogAvailable) {
+        const mode = state.allModes ? null : PAGE_MODE;
+        const runs = collectCodexRuns(projectId, mode);
+        if (preferredRunId && !runs.some((r) => String(r.id) === String(preferredRunId))) {
+          const selectedRun = exactRun || await resolveRun(preferredRunId, projectId, mode);
+          if (!selectedRun) return;
+          validateRunContext(selectedRun, preferredRunId, projectId, mode);
+          runs.push(selectedRun);
+        }
+        runs.sort((a, b) => Number(b.status === 'active') - Number(a.status === 'active') || runUpdatedMs(b) - runUpdatedMs(a));
+        state.runs = runs;
+        state.runListVersion += 1;
+        renderRunSelector();
+        let runId = preferredRunId;
+        if (!runId && state.selectedSessionId && findCodexThread(state.selectedSessionId)) {
+          const sessionRuns = runs.filter((r) => String(r.session_id) === String(state.selectedSessionId));
+          runId = sessionRuns[0]?.id || null;
+        } else if (!runId) {
+          runId = runs[0]?.id || null;
+        }
+        if (runId) {
+          const picked = runs.find((r) => String(r.id) === String(runId));
+          if (picked?.session_id) state.selectedSessionId = picked.session_id;
+          await selectRun(runId);
+        } else {
+          state.loadState = 'idle';
+          syncUrlParams();
+          renderRunSelector();
+          updateTopRunControls();
+          renderAll();
+        }
+        return;
+      }
+
       const mode = state.allModes ? null : PAGE_MODE;
       const scope = projectId === ALL_PROJECTS ? '' : `project_id=${encodeURIComponent(projectId)}&`;
       const data = await apiRequest(`/api/runs?${scope}mode=${mode || 'all'}`);
@@ -1105,6 +1446,10 @@
     state.inspectorBannerByWorkspace.clear();
     closeEventSource();
     stopGraphReplay();
+    if (state.workerModelRetryTimer !== null) {
+      clearTimeout(state.workerModelRetryTimer);
+      state.workerModelRetryTimer = null;
+    }
     state.run = null;
     state.taskPacket = null;
     state.workflow = null;
@@ -1114,6 +1459,9 @@
     state.resumeContext = null;
     state.planReadiness = null;
     state.workers = [];
+    state.helperSubagents = [];
+    state.sessionSubagents = [];
+    state.modelSummary = [];
     state.controlRequests = [];
     state.workspaces = [];
     state.messages = [];
@@ -1133,6 +1481,10 @@
     }
     state.selectedRunId = runId;
     clearRunState();
+    if (state.codexCatalogAvailable) {
+      const catalogRun = collectCodexRuns(ALL_PROJECTS, null).find((r) => String(r.id) === String(runId));
+      if (catalogRun?.session_id) state.selectedSessionId = catalogRun.session_id;
+    }
     const version = state.contextVersion;
     state.loadState = 'loading';
     syncUrlParams();
@@ -1171,7 +1523,23 @@
 
 
   function applySnapshot(snap) {
-    state.run = snap.run;
+    let run = snap.run;
+    if (state.codexCatalogAvailable && run?.id) {
+      const catalogRun = collectCodexRuns(ALL_PROJECTS, null).find((r) => String(r.id) === String(run.id));
+      if (catalogRun) {
+        run = {
+          ...run,
+          canonical_project_id: catalogRun.canonical_project_id,
+          codex_project_name: catalogRun.codex_project_name || run.codex_project_name,
+          codex_thread_name: catalogRun.codex_thread_name || run.codex_thread_name,
+          session_display_name: catalogRun.session_display_name || run.session_display_name,
+        };
+      }
+    }
+    state.run = run;
+    if (run?.session_id) {
+      state.selectedSessionId = run.session_id;
+    }
     state.sessionTurns = snap.session_turns ?? [];
     state.workflow = snap.workflow ?? null;
     state.inbox = snap.inbox ?? null;
@@ -1189,6 +1557,9 @@
 
     state.controlRequests = Array.isArray(snap.control_requests) ? snap.control_requests : [];
     state.workers = Array.isArray(snap.workers) ? snap.workers : [];
+    state.helperSubagents = Array.isArray(snap.helper_subagents) ? snap.helper_subagents : [];
+    state.sessionSubagents = Array.isArray(snap.session_subagents) ? snap.session_subagents : [];
+    state.modelSummary = Array.isArray(snap.model_summary) ? snap.model_summary : [];
     state.workspaces = Array.isArray(snap.workspaces) ? snap.workspaces : [];
 
     const rawMessages = Array.isArray(snap.messages)
@@ -1264,7 +1635,72 @@
       // Older daemons can still serve the project and run selectors.
       return;
     }
-    if (version !== state.globalSessionsVersion || !Array.isArray(data?.sessions) || !Array.isArray(data.global_active_runs)) return;
+    if (version !== state.globalSessionsVersion) return;
+    if (data?.codex_catalog?.available && applyCodexCatalog(data.codex_catalog)) {
+      state.globalSessions = Array.isArray(data.sessions) ? data.sessions : [];
+      state.globalActiveRuns = Array.isArray(data.codex_catalog.global_active_runs)
+        ? data.codex_catalog.global_active_runs
+        : (Array.isArray(data.global_active_runs) ? data.global_active_runs : []);
+      const risks = Array.isArray(data.codex_catalog.concurrent_risks)
+        ? data.codex_catalog.concurrent_risks
+        : (Array.isArray(data.concurrent_risks) ? data.concurrent_risks : []);
+      state.riskyProjectIds = new Set(
+        risks.filter((risk) => risk.concurrent_local_write_risk).map((risk) => risk.canonical_project_id)
+      );
+      const activeIds = new Set(state.globalActiveRuns.map((run) => run.session_id).filter(Boolean));
+      el.globalActiveBadge.textContent = `${activeIds.size} 个会话运行中`;
+      el.globalActiveBadge.classList.remove('hidden');
+      el.globalActiveBadge.classList.toggle('has-active', activeIds.size > 0);
+
+      if (state.selectedProjectId && state.selectedProjectId !== ALL_PROJECTS && !projectFor(state.selectedProjectId)) {
+        state.selectedProjectId = ALL_PROJECTS;
+        syncUrlParams();
+      }
+      const selectedThreadId = state.selectedSessionId || state.run?.session_id || null;
+      const threadStillExists = selectedThreadId ? Boolean(findCodexThread(selectedThreadId)) : true;
+      let clearedSelection = false;
+
+      if (listVersion === state.runListVersion && state.selectedProjectId &&
+          (state.loadState === 'idle' || state.loadState === 'ready')) {
+        const listed = collectCodexRuns(state.selectedProjectId, state.allModes ? null : PAGE_MODE);
+        const current = state.run ? listed.find((run) => String(run.id) === String(state.run.id)) : null;
+        if (state.run && !threadStillExists) {
+          state.selectedRunId = null;
+          state.selectedSessionId = null;
+          clearRunState();
+          syncUrlParams();
+          clearedSelection = true;
+        } else if (state.run && !current) {
+          if (inRunProject(state.run, state.selectedProjectId) && (state.allModes || state.run.mode === PAGE_MODE)) {
+            listed.push(state.run);
+          }
+        }
+        state.runs = listed;
+        if (current) {
+          state.run = { ...state.run, ...current };
+          renderOverview();
+        } else if (!state.run && !threadStillExists) {
+          state.selectedSessionId = null;
+          state.selectedRunId = null;
+          clearedSelection = true;
+        }
+      } else if (!threadStillExists) {
+        state.selectedSessionId = null;
+        clearedSelection = true;
+      }
+
+      renderProjectSelector();
+      renderRunSelector();
+      updateTopRunControls();
+      renderProjectWriteRisk();
+      if (clearedSelection || (!state.run && state.selectedSessionId)) {
+        renderOverview();
+      }
+      if (state.cmdPaletteOpen) renderCommandPalette();
+      return true;
+    }
+
+    if (!Array.isArray(data?.sessions) || !Array.isArray(data.global_active_runs)) return;
     const runs = data.sessions.flatMap((session) => session.runs);
     let projectsChanged = false;
     if (runs.some((run) => !projectFor(canonicalRunProject(run)))) {
@@ -1383,7 +1819,7 @@
 
   function attachRunEvents(es, currentRunId, refreshCatalog = null) {
     const handleEvent = (eventType, rawData) => {
-      if (refreshCatalog && ['run_updated', 'session_updated', 'workspace_updated'].includes(eventType)) {
+      if (refreshCatalog && ['run_updated', 'session_updated', 'workspace_updated', 'codex_catalog_updated'].includes(eventType)) {
         void refreshCatalog();
       }
       const runId = currentRunId();
@@ -1437,6 +1873,7 @@
       'workspace_updated',
       'run_updated',
       'session_updated',
+      'codex_catalog_updated',
       'task_packet_updated',
       'stall_alert',
       'workflow_updated',
@@ -1482,15 +1919,38 @@
     renderGraph();
   }
 
+  const WORKER_MODEL_PRESERVED_FIELDS = [
+    'model',
+    'reasoning_effort',
+    'model_provider',
+    'codex_thread_id',
+    'agent_nickname',
+    'model_source',
+    'subagents',
+  ];
+
+  function mergeWorkerPreserveModel(existing, incoming) {
+    const merged = { ...existing, ...incoming };
+    for (const field of WORKER_MODEL_PRESERVED_FIELDS) {
+      if ((incoming[field] === undefined || incoming[field] === null) && existing[field] !== undefined && existing[field] !== null) {
+        merged[field] = existing[field];
+      }
+    }
+    return merged;
+  }
+
   function upsertWorker(worker) {
     if (!worker) return;
     const idx = state.workers.findIndex(
       (w) => (worker.id && String(w.id) === String(worker.id)) || (worker.name && w.name === worker.name)
     );
+    let mergedWorker;
     if (idx >= 0) {
-      state.workers[idx] = { ...state.workers[idx], ...worker };
+      mergedWorker = mergeWorkerPreserveModel(state.workers[idx], worker);
+      state.workers[idx] = mergedWorker;
     } else {
-      state.workers.push(worker);
+      mergedWorker = worker;
+      state.workers.push(mergedWorker);
     }
     renderWorkers();
     renderTaskPacket();
@@ -1498,8 +1958,20 @@
     renderTabCounts();
     renderOverview();
     renderGraph();
-    if (String(state.selectedWorkerId) === String(worker.id)) {
+    if (String(state.selectedWorkerId) === String(mergedWorker.id)) {
       renderInspector();
+    }
+    if (worker.agent_id && !mergedWorker.model && state.run?.session_id && state.selectedRunId) {
+      if (state.workerModelRetryTimer !== null) {
+        clearTimeout(state.workerModelRetryTimer);
+      }
+      const targetRunId = state.selectedRunId;
+      state.workerModelRetryTimer = setTimeout(() => {
+        state.workerModelRetryTimer = null;
+        if (state.selectedRunId === targetRunId) {
+          void refreshSnapshot(targetRunId, { silent: true });
+        }
+      }, 1000);
     }
   }
 
@@ -1618,11 +2090,15 @@
         .filter(([, value]) => value !== null)
         .map(([key, value]) => `[${key}="${CSS.escape(value)}"]`).join('');
       if (!selector && focused.tagName === 'SUMMARY') {
-        const group = focused.closest('[data-session-group], [data-fixture-group]');
+        const group = focused.closest('[data-session-group], [data-fixture-group], [data-codex-project]');
         if (group) {
-          const id = group.getAttribute('data-session-group');
-          selector = id === null ? '[data-fixture-group] > summary' :
-            `[data-session-group="${CSS.escape(id)}"] > summary`;
+          const sid = group.getAttribute('data-session-group');
+          const cpid = group.getAttribute('data-codex-project');
+          selector = sid !== null
+            ? `[data-session-group="${CSS.escape(sid)}"] > summary`
+            : cpid !== null
+              ? `[data-codex-project="${CSS.escape(cpid)}"] > summary`
+              : '[data-fixture-group] > summary';
         }
       }
     }
@@ -1635,6 +2111,39 @@
 
   function renderProjectPopover() {
     const q = state.projectSearchQuery.trim().toLowerCase();
+    if (state.codexCatalogAvailable) {
+      const allLabel = '全部项目（Codex 目录）';
+      const list = state.codexProjects.filter((p) => `${projectName(p)} ${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q));
+      const renderCodexItem = (p, isAll = false) => {
+        const selected = String(p.id) === String(state.selectedProjectId);
+        const threadBadge = !isAll
+          ? (p.thread_count > 0
+              ? `<span class="chip-tag tabular tint-muted">${escapeHtml(p.thread_count)} 个对话</span>`
+              : '<span class="chip-tag tint-muted">暂无聊天</span>')
+          : '';
+        return `
+          <button type="button" class="popover-item ${selected ? 'is-selected' : ''}" aria-current="${selected}" data-select-project="${escapeHtml(p.id)}">
+            <div class="popover-item-top">
+              <span class="popover-item-title">${escapeHtml(projectName(p))}</span>
+              ${p.active_run_count > 0 ? `<span class="chip-tag tabular tint-success">${escapeHtml(p.active_run_count)} 个活跃</span>` : ''}
+              ${threadBadge}
+              ${p.is_git ? '<span class="chip-tag tint-primary">[Git]</span>' : ''}
+            </div>
+            ${p.root_path ? `<span class="popover-item-path mono" title="${escapeHtml(p.root_path)}">${escapeHtml(p.root_path)}</span>` : ''}
+          </button>`;
+      };
+      const showAll = !q || allLabel.toLowerCase().includes(q) || ALL_PROJECTS_LABEL.toLowerCase().includes(q);
+      replaceSelectorMarkup(
+        el.projectPopoverList,
+        (showAll ? renderCodexItem({ id: ALL_PROJECTS, name: allLabel }, true) : '') +
+        list.map((p) => renderCodexItem(p, false)).join('') +
+        (!showAll && list.length === 0 ? `<div class="empty-state">${state.codexProjects.length ? '未匹配到相关 Codex 项目' : '暂无 Codex 项目'}</div>` : ''),
+        ['data-select-project'],
+        el.projectSearchInput
+      );
+      return;
+    }
+
     const list = state.projects.filter((p) => `${projectName(p)} ${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q));
     const renderItem = (p) => {
       const selected = String(p.id) === String(state.selectedProjectId);
@@ -1680,12 +2189,214 @@
     el.runModeToggle.setAttribute('aria-pressed', String(state.allModes));
   }
 
+  function renderRunSidebarCard(r, withSession = false) {
+    const selected = String(r.id) === String(state.selectedRunId);
+    const status = String(r.status || 'unknown').toLowerCase();
+    const updated = formatRelativeTimeShort(r.updated_at || r.created_at);
+    const rm = resolveRunModels(r);
+    const runModelHtml = rm.primaryModel
+      ? renderModelBadge(rm.primaryModel, rm.primaryEffort, {
+          source: rm.primarySource,
+          provider: r.codex_model_provider,
+          threadId: r.session_id,
+          switched: rm.switched,
+          compact: true,
+          extraTitle: rm.switched ? `会话已切换为 ${formatModelText(rm.liveModel, rm.liveEffort)}` : undefined,
+        })
+      : '';
+    const title = `
+        <div class="run-sidebar-item-top">
+          <span class="run-sidebar-title">${escapeHtml(runTitle(r))}</span>
+          ${!withSession && status === 'active' ? '<span class="status-dot dot-ok" aria-hidden="true"></span>' : ''}
+        </div>`;
+    const metadata = `
+        <div class="run-sidebar-meta">
+          ${withSession && r.session_seq ? `<span class="mono tabular">#${escapeHtml(r.session_seq)}</span>` : ''}
+          ${withSession && r.mode ? `<span class="chip-tag ${getModeTone(r.mode)}">${escapeHtml(MODE_BADGES[r.mode])}</span>` : ''}
+          <span class="chip-tag ${getRunStatusTone(status)}">${escapeHtml(labelRunStatus(status))}</span>
+          ${runModelHtml}
+          <span class="mono tabular">${escapeHtml(updated || shortId(r.id))}</span>
+        </div>`;
+    return `
+      <button type="button" class="run-sidebar-item ${selected ? 'is-selected' : ''}" aria-current="${selected}" data-select-run="${escapeHtml(r.id)}">
+        ${withSession ? metadata + title : title + metadata}
+        ${withSession && r.trigger_prompt ? `<span class="run-trigger-preview" title="${escapeHtml(r.trigger_prompt)}">触发：${escapeHtml(r.trigger_prompt)}</span>` : ''}
+      </button>
+    `;
+  }
+
+  function renderCodexSidebar(q, filter) {
+    const replace = (html) => replaceSelectorMarkup(
+      el.runSidebarList, html, ['data-select-run', 'data-select-thread'], el.runSearchInput
+    );
+    const targetProjects = state.selectedProjectId === ALL_PROJECTS
+      ? state.codexProjects
+      : state.codexProjects.filter((p) => String(p.id) === String(state.selectedProjectId));
+
+    if (targetProjects.length === 0) {
+      el.sidebarRunsCount.textContent = '0';
+      const msg = state.loadState === 'loading' ? '正在加载 Codex 目录…' : state.loadState === 'error' ? '目录未加载' : '暂无 Codex 项目';
+      replace(`<div class="empty-state">${escapeHtml(msg)}</div>`);
+      return;
+    }
+
+    const mode = state.allModes ? null : PAGE_MODE;
+    const folderSvg = '<svg class="codex-project-folder-icon" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>';
+    const pinSvg = '<svg class="codex-pin-icon" viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 17v5"></path><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"></path></svg>';
+
+    const visibleProjects = [];
+    let totalThreads = 0;
+
+    for (const p of targetProjects) {
+      const pName = projectName(p);
+      const projectMatches = !q || [pName, p.name, p.root_path].join(' ').toLowerCase().includes(q);
+      const visibleThreads = [];
+
+      for (const thread of p.threads || []) {
+        const modeRuns = mode
+          ? (thread.runs || []).filter((r) => r.mode === mode)
+          : [...(thread.runs || [])];
+        const statusRuns = modeRuns.filter((r) => {
+          const st = String(r.status || '').toLowerCase();
+          if (filter === 'active') return st === 'active';
+          if (filter === 'done') return st !== 'active';
+          return true;
+        });
+        const threadHay = [
+          thread.title, thread.session_id, thread.cwd, thread.model, thread.reasoning_effort,
+        ].join(' ').toLowerCase();
+        const threadMatches = !q || projectMatches || threadHay.includes(q);
+        const matchedRuns = statusRuns.filter((r) => {
+          if (!q || threadMatches) return true;
+          const hay = [
+            r.title, r.id, r.session_id, labelRunStatus(r.status), thread.title, r.trigger_prompt,
+            r.codex_model, r.codex_reasoning_effort, r.trigger_model, r.trigger_reasoning_effort,
+          ].join(' ').toLowerCase();
+          return hay.includes(q);
+        });
+
+        const includeThread = filter === 'all'
+          ? (!q || matchedRuns.length > 0 || (threadMatches && modeRuns.length === 0))
+          : matchedRuns.length > 0;
+        if (!includeThread) continue;
+
+        visibleThreads.push({
+          thread,
+          runs: matchedRuns,
+        });
+      }
+
+      const includeProject = filter === 'all'
+        ? (!q || visibleThreads.length > 0 || projectMatches)
+        : visibleThreads.length > 0;
+      if (!includeProject) continue;
+
+      totalThreads += visibleThreads.length;
+      visibleProjects.push({ project: p, threads: visibleThreads });
+    }
+
+    el.sidebarRunsCount.textContent = String(totalThreads);
+    if (visibleProjects.length === 0) {
+      replace('<div class="empty-state">没有匹配的 Codex 项目或对话</div>');
+      return;
+    }
+
+    const renderThread = (p, t) => {
+      if (t.runs.length === 0) {
+        const isSelectedThread = String(state.selectedSessionId) === String(t.thread.session_id) && !state.selectedRunId;
+        const badge = t.thread.model
+          ? renderModelBadge(t.thread.model, t.thread.reasoning_effort, {
+              source: 'live',
+              provider: t.thread.model_provider,
+              threadId: t.thread.session_id,
+              compact: true,
+            })
+          : '';
+        return `
+          <button type="button" class="codex-thread-leaf ${isSelectedThread ? 'is-selected' : ''}" aria-current="${isSelectedThread}" data-select-thread="${escapeHtml(t.thread.session_id)}" data-thread-project="${escapeHtml(p.id)}">
+            <span class="codex-thread-leaf-main">
+              ${t.thread.is_pinned ? pinSvg : ''}
+              <span class="codex-thread-leaf-title" title="${escapeHtml(t.thread.title)}">${escapeHtml(t.thread.title)}</span>
+            </span>
+            ${badge ? `<span class="codex-thread-leaf-meta">${badge}</span>` : ''}
+          </button>`;
+      }
+
+      const ordered = [...t.runs].sort((a, b) => Number(b.session_seq || 0) - Number(a.session_seq || 0) || runUpdatedMs(b) - runUpdatedMs(a));
+      const groupKey = `${p.id}:${t.thread.session_id}`;
+      const selected = ordered.some((r) => String(r.id) === String(state.selectedRunId)) ||
+        String(state.selectedSessionId) === String(t.thread.session_id);
+      const active = ordered.some((r) => r.status === 'active');
+      const expanded = Boolean(q) || (state.sessionOpenOverrides.get(groupKey) ?? (active || selected));
+      const modelRun = ordered.find((r) => r.codex_model) || ordered.find((r) => r.trigger_model) || ordered[0];
+      const sessionModel = t.thread.model || modelRun?.codex_model || modelRun?.trigger_model || null;
+      const sessionEffort = t.thread.model
+        ? t.thread.reasoning_effort
+        : (modelRun?.codex_model ? modelRun.codex_reasoning_effort : modelRun?.trigger_reasoning_effort);
+      const sessionModelBadge = sessionModel
+        ? renderModelBadge(sessionModel, sessionEffort, {
+            source: (t.thread.model || modelRun?.codex_model) ? 'live' : 'trigger_snapshot',
+            provider: t.thread.model_provider || modelRun?.codex_model_provider,
+            threadId: t.thread.session_id,
+            compact: true,
+          })
+        : '';
+
+      return `<details class="selector-disclosure session-group codex-thread-group" data-session-group="${escapeHtml(groupKey)}" ${expanded ? 'open' : ''}>
+        <summary>
+          <span class="session-group-heading">
+            <span class="session-group-title-row">
+              ${active ? '<span class="status-dot dot-ok session-pulse" role="img" aria-label="有任务正在运行"></span>' : ''}
+              ${t.thread.is_pinned ? pinSvg : ''}
+              <span class="session-group-name" title="${escapeHtml(t.thread.title)}">${escapeHtml(t.thread.title)}</span>
+            </span>
+            <span class="session-group-meta-row">
+              ${sessionModelBadge}
+              <span class="chip-tag tint-muted tabular">${ordered.length} 次</span>
+            </span>
+          </span>
+        </summary>
+        ${ordered.map((run) => renderRunSidebarCard(run, true)).join('')}
+      </details>`;
+    };
+
+    if (state.selectedProjectId !== ALL_PROJECTS && visibleProjects.length === 1) {
+      const { project: p, threads } = visibleProjects[0];
+      const body = threads.length > 0
+        ? threads.map((t) => renderThread(p, t)).join('')
+        : '<div class="codex-empty-chats">暂无聊天</div>';
+      replace(`<div class="codex-single-project-children">${body}</div>`);
+      return;
+    }
+
+    replace(visibleProjects.map(({ project: p, threads }) => {
+      const isOpen = Boolean(q) || (state.codexProjectOpenOverrides.get(p.id) ?? true);
+      const body = threads.length > 0
+        ? threads.map((t) => renderThread(p, t)).join('')
+        : '<div class="codex-empty-chats">暂无聊天</div>';
+      return `<details class="codex-project-group" data-codex-project="${escapeHtml(p.id)}" ${isOpen ? 'open' : ''}>
+        <summary class="codex-project-summary">
+          ${folderSvg}
+          <span class="codex-project-name" title="${escapeHtml(p.root_path)}">${escapeHtml(projectName(p))}</span>
+          ${p.active_run_count > 0 ? `<span class="chip-tag tint-success tabular">${escapeHtml(p.active_run_count)}</span>` : ''}
+        </summary>
+        <div class="codex-project-children">${body}</div>
+      </details>`;
+    }).join(''));
+  }
+
   function renderRunSidebar() {
-    const replace = (html) => replaceSelectorMarkup(el.runSidebarList, html, ['data-select-run'], el.runSearchInput);
     const q = state.runSearchQuery.trim().toLowerCase();
     const filter = state.runStatusFilter;
-    el.sidebarRunsCount.textContent = String(state.runs.length);
     renderRunModeToggle();
+
+    if (state.codexCatalogAvailable) {
+      renderCodexSidebar(q, filter);
+      return;
+    }
+
+    const replace = (html) => replaceSelectorMarkup(el.runSidebarList, html, ['data-select-run'], el.runSearchInput);
+    el.sidebarRunsCount.textContent = String(state.runs.length);
 
     if (state.runs.length === 0) {
       const msg = state.loadState === 'loading' ? '正在加载任务…' : state.loadState === 'error' ? '任务未加载' : `当前项目暂无 ${MODE_NAMES[PAGE_MODE] || ''} 任务`;
@@ -1698,7 +2409,10 @@
       if (filter === 'active' && status !== 'active') return false;
       if (filter === 'done' && status === 'active') return false;
       if (q) {
-        const hay = [r.title, r.id, r.session_id, labelRunStatus(r.status), sessionName(r), r.trigger_prompt].join(' ').toLowerCase();
+        const hay = [
+          r.title, r.id, r.session_id, labelRunStatus(r.status), sessionName(r), r.trigger_prompt,
+          r.codex_model, r.codex_reasoning_effort, r.trigger_model, r.trigger_reasoning_effort,
+        ].join(' ').toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -1708,30 +2422,6 @@
       replace('<div class="empty-state">没有匹配的对话或任务</div>');
       return;
     }
-
-    const renderItem = (r, withSession = false) => {
-      const selected = String(r.id) === String(state.selectedRunId);
-      const status = String(r.status || 'unknown').toLowerCase();
-      const updated = formatRelativeTimeShort(r.updated_at || r.created_at);
-      const title = `
-          <div class="run-sidebar-item-top">
-            <span class="run-sidebar-title">${escapeHtml(runTitle(r))}</span>
-            ${!withSession && status === 'active' ? '<span class="status-dot dot-ok" aria-hidden="true"></span>' : ''}
-          </div>`;
-      const metadata = `
-          <div class="run-sidebar-meta">
-            ${withSession && r.session_seq ? `<span class="mono tabular">#${escapeHtml(r.session_seq)}</span>` : ''}
-            ${withSession && r.mode ? `<span class="chip-tag ${getModeTone(r.mode)}">${escapeHtml(MODE_BADGES[r.mode])}</span>` : ''}
-            <span class="chip-tag ${getRunStatusTone(status)}">${escapeHtml(labelRunStatus(status))}</span>
-            <span class="mono tabular">${escapeHtml(updated || shortId(r.id))}</span>
-          </div>`;
-      return `
-        <button type="button" class="run-sidebar-item ${selected ? 'is-selected' : ''}" aria-current="${selected}" data-select-run="${escapeHtml(r.id)}">
-          ${withSession ? metadata + title : title + metadata}
-          ${withSession && r.trigger_prompt ? `<span class="run-trigger-preview" title="${escapeHtml(r.trigger_prompt)}">触发：${escapeHtml(r.trigger_prompt)}</span>` : ''}
-        </button>
-      `;
-    };
 
     if (state.runs.some((r) => Object.hasOwn(r, 'session_id'))) {
       const sessions = new Map();
@@ -1750,16 +2440,32 @@
         const selected = ordered.some((r) => String(r.id) === String(state.selectedRunId));
         const expanded = Boolean(q) || (state.sessionOpenOverrides.get(id) ?? (active || selected));
         const head = ordered.find((r) => r.codex_thread_name) || ordered[0];
+        const modelRun = ordered.find((r) => r.codex_model) || ordered.find((r) => r.trigger_model) || head;
+        const sessionModel = modelRun?.codex_model || modelRun?.trigger_model || null;
+        const sessionEffort = modelRun?.codex_model ? modelRun.codex_reasoning_effort : modelRun?.trigger_reasoning_effort;
+        const sessionModelBadge = sessionModel
+          ? renderModelBadge(sessionModel, sessionEffort, {
+              source: modelRun?.codex_model ? 'live' : 'trigger_snapshot',
+              provider: modelRun?.codex_model_provider,
+              threadId: modelRun?.session_id,
+              compact: true,
+            })
+          : '';
         const name = head.session_id ? sessionName(head) : '未绑定会话任务';
         const project = state.selectedProjectId === ALL_PROJECTS ? projectName(projectFor(projectId)) || head.codex_project_name : '';
         const title = project ? `${project} · ${name}` : name;
         return `<details class="selector-disclosure session-group" data-session-group="${escapeHtml(id)}" ${expanded ? 'open' : ''}>
           <summary><span class="session-group-heading">
-            ${active ? '<span class="status-dot dot-ok session-pulse" role="img" aria-label="有任务正在运行"></span>' : ''}
-            <span class="session-group-name" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
-            <span class="chip-tag tint-muted tabular">${ordered.length} 次</span>
+            <span class="session-group-title-row">
+              ${active ? '<span class="status-dot dot-ok session-pulse" role="img" aria-label="有任务正在运行"></span>' : ''}
+              <span class="session-group-name" title="${escapeHtml(title)}">${escapeHtml(title)}</span>
+            </span>
+            <span class="session-group-meta-row">
+              ${sessionModelBadge}
+              <span class="chip-tag tint-muted tabular">${ordered.length} 次</span>
+            </span>
           </span></summary>
-          ${ordered.map((run) => renderItem(run, true)).join('')}
+          ${ordered.map((run) => renderRunSidebarCard(run, true)).join('')}
         </details>`;
       }).join(''));
       return;
@@ -1769,10 +2475,10 @@
     const otherRuns = filtered.filter((r) => r.status !== 'active');
     const groups = [];
     if (activeRuns.length > 0) {
-      groups.push(`<div class="run-group"><div class="run-group-label"><span>进行中</span><span class="tabular">${activeRuns.length}</span></div>${activeRuns.map((run) => renderItem(run)).join('')}</div>`);
+      groups.push(`<div class="run-group"><div class="run-group-label"><span>进行中</span><span class="tabular">${activeRuns.length}</span></div>${activeRuns.map((run) => renderRunSidebarCard(run)).join('')}</div>`);
     }
     if (otherRuns.length > 0) {
-      groups.push(`<div class="run-group"><div class="run-group-label"><span>历史任务</span><span class="tabular">${otherRuns.length}</span></div>${otherRuns.map((run) => renderItem(run)).join('')}</div>`);
+      groups.push(`<div class="run-group"><div class="run-group-label"><span>历史任务</span><span class="tabular">${otherRuns.length}</span></div>${otherRuns.map((run) => renderRunSidebarCard(run)).join('')}</div>`);
     }
     replace(groups.join(''));
   }
@@ -1780,20 +2486,89 @@
   function getCommandPaletteEntries() {
     const q = state.cmdPaletteQuery.trim().toLowerCase();
     const items = [];
-    const entries = new Map();
-    const allRuns = [...state.globalSessions.flatMap((session) => session.runs), ...state.runs];
-    for (const run of allRuns) entries.set(run.id, run);
-    const active = new Map([...state.globalActiveRuns, ...state.runs].map((run) => [run.id, run]).filter(([, run]) => run.status === 'active'));
     const addRun = (r, group) => {
       const title = runTitle(r);
       const status = labelRunStatus(r.status);
       const project = projectFor(canonicalRunProject(r));
       const name = projectName(project) || r.codex_project_name;
-      const terms = [title, r.id, r.session_id, status, sessionName(r), r.trigger_prompt, name, project?.name, project?.root_path, r.execution_root];
+      const rm = resolveRunModels(r);
+      const modelLabel = formatModelText(rm.primaryModel, rm.primaryEffort);
+      const liveLabel = rm.switched ? formatModelText(rm.liveModel, rm.liveEffort) : '';
+      const terms = [
+        title, r.id, r.session_id, status, sessionName(r), r.trigger_prompt,
+        name, project?.name, project?.root_path, r.execution_root,
+        r.codex_model, r.codex_reasoning_effort, r.trigger_model, r.trigger_reasoning_effort,
+      ];
       if (!terms.join(' ').toLowerCase().includes(q)) return;
-      const sub = [name, r.session_id ? runContextLabel(r) : shortId(r.id), MODE_BADGES[r.mode]].filter(Boolean).join(' · ');
+      const sub = [
+        name,
+        r.session_id ? runContextLabel(r) : shortId(r.id),
+        MODE_BADGES[r.mode],
+        modelLabel,
+        liveLabel ? `已切换→${liveLabel}` : '',
+      ].filter(Boolean).join(' · ');
       items.push({ kind: 'run', group, id: r.id, title, sub, tone: getRunStatusTone(r.status), badge: status, active: String(r.id) === String(state.selectedRunId) });
     };
+
+    if (state.codexCatalogAvailable) {
+      const catalogRuns = collectCodexRuns(ALL_PROJECTS, null);
+      const activeIds = new Set();
+      for (const r of catalogRuns) {
+        if (r.status === 'active') {
+          activeIds.add(r.id);
+          addRun(r, 'active');
+        }
+      }
+      if (!state.cmdActiveOnly) {
+        for (const p of state.codexProjects) {
+          const pName = projectName(p);
+          for (const thread of p.threads || []) {
+            const runs = thread.runs || [];
+            for (const r of runs) {
+              if (!activeIds.has(r.id)) addRun(r, 'sessions');
+            }
+            if (runs.length === 0) {
+              const terms = [thread.title, thread.session_id, pName, p.root_path, thread.model, thread.reasoning_effort];
+              if (terms.join(' ').toLowerCase().includes(q)) {
+                const modelText = formatModelText(thread.model, thread.reasoning_effort);
+                items.push({
+                  kind: 'thread',
+                  group: 'sessions',
+                  id: thread.session_id,
+                  projectId: p.id,
+                  title: thread.title,
+                  sub: [pName, 'Codex 对话', modelText || '暂无编排'].filter(Boolean).join(' · '),
+                  tone: 'tint-muted',
+                  badge: '对话',
+                  active: String(state.selectedSessionId) === String(thread.session_id) && !state.selectedRunId,
+                });
+              }
+            }
+          }
+        }
+        for (const p of state.codexProjects) {
+          const name = projectName(p);
+          if (`${name} ${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q)) {
+            items.push({
+              kind: 'project',
+              group: 'projects',
+              id: p.id,
+              title: name,
+              sub: p.root_path || '',
+              tone: p.is_git ? 'tint-primary' : 'tint-muted',
+              badge: p.is_git ? 'Git' : '目录',
+              active: String(p.id) === String(state.selectedProjectId),
+            });
+          }
+        }
+      }
+      return items;
+    }
+
+    const entries = new Map();
+    const allRuns = [...state.globalSessions.flatMap((session) => session.runs), ...state.runs];
+    for (const run of allRuns) entries.set(run.id, run);
+    const active = new Map([...state.globalActiveRuns, ...state.runs].map((run) => [run.id, run]).filter(([, run]) => run.status === 'active'));
     for (const r of active.values()) addRun(r, 'active');
     if (!state.cmdActiveOnly) {
       for (const r of entries.values()) if (!active.has(r.id)) addRun(r, 'sessions');
@@ -1833,7 +2608,11 @@
         </button>
       `;
     };
-    const groups = { active: '正在运行', sessions: 'Codex 会话与轮次', projects: '切换真实项目' };
+    const groups = {
+      active: '正在运行',
+      sessions: 'Codex 会话与轮次',
+      projects: state.codexCatalogAvailable ? 'Codex 项目' : '切换真实项目',
+    };
     replace(Object.entries(groups).map(([key, label]) => {
       const matches = items.filter((item) => item.group === key);
       return matches.length ? `<div><div class="cmd-group-label">${label}</div>${matches.map(renderBtn).join('')}</div>` : '';
@@ -1865,11 +2644,18 @@
   async function executeCommandEntry(kind, id) {
     closeCommandPalette(false);
     if (kind === 'project') {
+      state.selectedSessionId = null;
       await loadRuns(id || null);
+    } else if (kind === 'thread' && id) {
+      const found = findCodexThread(id);
+      if (found) await selectCodexThread(found.project.id, id);
     } else if (kind === 'run' && id) {
-      const run = [...state.runs, ...state.globalActiveRuns, ...state.globalSessions.flatMap((session) => session.runs)]
-        .find((r) => String(r.id) === String(id));
+      const pool = state.codexCatalogAvailable
+        ? collectCodexRuns(ALL_PROJECTS, null)
+        : [...state.runs, ...state.globalActiveRuns, ...state.globalSessions.flatMap((session) => session.runs)];
+      const run = pool.find((r) => String(r.id) === String(id));
       if (run?.mode && run.mode !== PAGE_MODE) state.allModes = true;
+      if (run?.session_id) state.selectedSessionId = run.session_id;
       if (!run || state.runs.some((r) => String(r.id) === String(id))) await selectRun(id);
       else await loadRuns(state.selectedProjectId === ALL_PROJECTS ? ALL_PROJECTS : canonicalRunProject(run), id, run);
     }
@@ -1890,10 +2676,11 @@
       return;
     }
 
+    const allLabel = state.codexCatalogAvailable ? '全部项目（Codex 目录）' : ALL_PROJECTS_LABEL;
     const all = state.selectedProjectId === ALL_PROJECTS;
     const current = projectFor(state.selectedProjectId);
     el.projectSelect.innerHTML = (current || all ? '' : '<option value="">请选择项目</option>') +
-      `<option value="${ALL_PROJECTS}" ${all ? 'selected' : ''}>${ALL_PROJECTS_LABEL}</option>` + state.projects
+      `<option value="${ALL_PROJECTS}" ${all ? 'selected' : ''}>${allLabel}</option>` + state.projects
       .map((p) => {
         const selected = String(p.id) === String(state.selectedProjectId) ? 'selected' : '';
         const kind = p.is_git ? 'Git' : '目录';
@@ -1902,9 +2689,9 @@
       })
       .join('');
 
-    el.projectPathSubtitle.textContent = all ? ALL_PROJECTS_LABEL : current ? current.root_path : '未选择项目';
+    el.projectPathSubtitle.textContent = all ? allLabel : current ? current.root_path : '未选择项目';
     el.projectPathSubtitle.title = current ? current.root_path : '';
-    const displayName = all ? ALL_PROJECTS_LABEL : current ? projectName(current) : '请选择项目';
+    const displayName = all ? allLabel : current ? projectName(current) : '请选择项目';
     el.projectSwitcherName.textContent = displayName;
     el.projectSwitcherPath.textContent = current ? current.root_path : '';
     el.topbarContextProject.textContent = displayName;
@@ -1920,7 +2707,16 @@
   function renderRunSelector() {
     el.runSelect.disabled = state.runs.length === 0;
     if (state.runs.length === 0) {
-      const label = state.loadState === 'loading' ? '正在加载任务…' : state.loadState === 'error' ? '任务未加载' : `该项目暂无 ${MODE_NAMES[PAGE_MODE]} 任务`;
+      const foundThread = state.codexCatalogAvailable && state.selectedSessionId
+        ? findCodexThread(state.selectedSessionId)
+        : null;
+      const label = state.loadState === 'loading'
+        ? '正在加载任务…'
+        : state.loadState === 'error'
+          ? '任务未加载'
+          : foundThread
+            ? foundThread.thread.title
+            : `该项目暂无 ${MODE_NAMES[PAGE_MODE]} 任务`;
       el.runSelect.innerHTML = `<option value="">${escapeHtml(label)}</option>`;
       el.topbarContextRun.textContent = label;
       renderRunSidebar();
@@ -1964,12 +2760,43 @@
     el.contextStatus.classList.toggle('hidden', !el.contextStatus.textContent);
     el.contextStatus.classList.toggle('is-error', state.loadState === 'error');
     if (!run) {
+      const foundThread = state.codexCatalogAvailable && state.selectedSessionId
+        ? findCodexThread(state.selectedSessionId)
+        : null;
       el.modeBadge.className = 'run-pill-mode badge-mode-none';
       el.modeBadge.textContent = '—';
       el.runStatusBadge.className = 'run-pill-status';
       el.runStatusBadge.textContent = '—';
-      el.runTitleHeading.textContent = '未选择运行任务';
-      el.runTitleHeading.title = '';
+      if (el.runModelBadge) {
+        if (foundThread?.thread.model) {
+          el.runModelBadge.className = 'chip-tag model-badge';
+          el.runModelBadge.classList?.remove('hidden');
+          el.runModelBadge.classList?.remove('model-badge-mismatch');
+          el.runModelBadge.innerHTML = `${escapeHtml(foundThread.thread.model)}${foundThread.thread.reasoning_effort ? `<span class="model-badge-effort">· ${escapeHtml(foundThread.thread.reasoning_effort)}</span>` : ''}`;
+          el.runModelBadge.title = [
+            `模型：${foundThread.thread.model}`,
+            foundThread.thread.reasoning_effort ? `推理强度：${foundThread.thread.reasoning_effort}` : '',
+            '来源：Codex 实时',
+          ].filter(Boolean).join(' · ');
+        } else {
+          el.runModelBadge.className = 'chip-tag model-badge hidden';
+          el.runModelBadge.classList?.add('hidden');
+          el.runModelBadge.classList?.remove('model-badge-mismatch');
+          el.runModelBadge.innerHTML = '';
+          el.runModelBadge.title = '当前任务使用的模型与推理强度';
+        }
+      }
+      if (foundThread) {
+        el.runTitleHeading.textContent = foundThread.thread.title;
+        el.runTitleHeading.title = foundThread.thread.title;
+        el.projectPathSubtitle.textContent = foundThread.project.root_path || projectName(foundThread.project);
+        el.projectPathSubtitle.title = foundThread.project.root_path || '';
+        el.topbarContextProject.textContent = projectName(foundThread.project);
+        el.topbarContextRun.textContent = foundThread.thread.title;
+      } else {
+        el.runTitleHeading.textContent = '未选择运行任务';
+        el.runTitleHeading.title = '';
+      }
       el.exportMenuBtn.disabled = true;
       el.exportMdBtn.disabled = true;
       el.exportJsonBtn.disabled = true;
@@ -1985,6 +2812,30 @@
 
     el.runStatusBadge.className = `run-pill-status status-${escapeHtml(status)}`;
     el.runStatusBadge.textContent = labelRunStatus(status);
+
+    if (el.runModelBadge) {
+      const rm = resolveRunModels(run);
+      if (rm.primaryModel) {
+        el.runModelBadge.className = `chip-tag model-badge${rm.switched ? ' model-badge-mismatch' : ''}`;
+        el.runModelBadge.classList?.remove('hidden');
+        el.runModelBadge.classList?.toggle('model-badge-mismatch', Boolean(rm.switched));
+        el.runModelBadge.innerHTML = `${escapeHtml(rm.primaryModel)}${rm.primaryEffort ? `<span class="model-badge-effort">· ${escapeHtml(rm.primaryEffort)}</span>` : ''}${rm.switched ? '<span class="model-badge-switch-flag" title="会话中模型已切换">⇄</span>' : ''}`;
+        const titleParts = [
+          `模型：${rm.primaryModel}`,
+          rm.primaryEffort ? `推理强度：${rm.primaryEffort}` : '',
+          run.codex_model_provider ? `Provider：${run.codex_model_provider}` : '',
+          `来源：${modelSourceLabel(rm.primarySource)}`,
+          rm.switched ? `当前会话已切换为 ${formatModelText(rm.liveModel, rm.liveEffort)}` : '',
+        ].filter(Boolean);
+        el.runModelBadge.title = titleParts.join(' · ');
+      } else {
+        el.runModelBadge.className = 'chip-tag model-badge hidden';
+        el.runModelBadge.classList?.add('hidden');
+        el.runModelBadge.classList?.remove('model-badge-mismatch');
+        el.runModelBadge.innerHTML = '';
+        el.runModelBadge.title = '当前任务使用的模型与推理强度';
+      }
+    }
 
     const title = runTitle(run);
     el.runTitleHeading.textContent = title;
@@ -2234,6 +3085,16 @@
     `;
   }
 
+  function renderSessionSubagentsSection() {
+    if (!state.sessionSubagents.length) return '';
+    return `
+      <div class="member-group-block unregistered-subagents-wrap">
+        <div class="member-group-label tabular">主会话未登记原生子代理 · ${state.sessionSubagents.length}</div>
+        ${renderSubagentTree(state.sessionSubagents, false)}
+      </div>
+    `;
+  }
+
   function renderMemberRow(w) {
     const isSelected = String(w.id) === String(state.selectedWorkerId);
     const stalled = isWorkerStalled(w);
@@ -2243,6 +3104,15 @@
     const unmergedCount = getWorkspaceUnmergedCount(ws, w);
     const status = String(w.status || 'unknown').toLowerCase();
     const role = String(w.role || 'unknown').toLowerCase();
+    const modelBadge = renderModelBadge(w.model, w.reasoning_effort, {
+      source: w.model_source || (w.model ? 'snapshot' : null),
+      provider: w.model_provider,
+      threadId: w.codex_thread_id,
+      compact: true,
+    });
+    const subTree = Array.isArray(w.subagents) && w.subagents.length > 0
+      ? renderSubagentTree(w.subagents, false)
+      : '';
 
     return `
       <div class="member-list-item" role="listitem">
@@ -2257,6 +3127,7 @@
             <div class="member-top-line">
               <span class="member-name">@${escapeHtml(normalizeHandle(w.name))}</span>
               <span class="member-role">${escapeHtml(labelRole(role))}</span>
+              ${modelBadge}
               ${isAppServerWorker(w) ? renderAppServerBadge() : ''}
               <span class="pill-badge ${getWorkerStatusTone(status, false)}">登记：${escapeHtml(labelWorkerStatus(status))}</span>
               ${stalled ? '<span class="pill-badge tint-danger">心跳超时告警</span>' : ''}
@@ -2283,6 +3154,7 @@
           <span class="member-open-cue">检查 →</span>
         </div>
       </button>
+      ${subTree}
       </div>
     `;
   }
@@ -2292,13 +3164,15 @@
       ? document.activeElement.closest('.member-row')?.getAttribute('data-worker-id') : null;
     const workers = state.workers;
     const stalledCount = workers.filter(isWorkerStalled).length;
+    const totalHelpers = state.helperSubagents.length + state.sessionSubagents.length;
     el.workersSummaryMeta.innerHTML = `
       <span class="pill-badge tint-muted tabular">共 ${workers.length} 名</span>
+      ${totalHelpers > 0 ? `<span class="pill-badge tint-cyan tabular">辅助子代理 ${totalHelpers} 名</span>` : ''}
       ${stalledCount > 0 ? `<span class="pill-badge tint-danger tabular">${stalledCount} 名心跳异常</span>` : ''}
     `;
 
     if (workers.length === 0) {
-      el.workersList.innerHTML = '<div class="empty-state">当前运行任务尚未注册成员。</div>';
+      el.workersList.innerHTML = '<div class="empty-state">当前运行任务尚未注册成员。</div>' + renderSessionSubagentsSection();
       if (focusedWorker) el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'members').focus();
       return;
     }
@@ -2345,6 +3219,7 @@
 
     const unknownWorkers = workers.filter((w) => !['waiting', 'working', 'stopped', 'killed'].includes(w.status));
     if (unknownWorkers.length) blocks.push(`<div class="member-group-block"><div class="member-group-label">其他 / 未记录状态</div><div class="member-list-card" role="list">${unknownWorkers.map(renderMemberRow).join('')}</div></div>`);
+    if (state.sessionSubagents.length > 0) blocks.push(renderSessionSubagentsSection());
     el.workersList.innerHTML = blocks.join('');
     if (focusedWorker) {
       const row = el.workersList.querySelector(`[data-worker-id="${CSS.escape(focusedWorker)}"]`);
@@ -2666,11 +3541,21 @@
 
   function renderOverviewMember(w) {
     const statusTone = getWorkerStatusTone(w.status, isWorkerStalled(w));
-    return `          <button type="button" class="overview-member" data-worker-id="${escapeHtml(w.id)}">
+    const modelBadge = renderModelBadge(w.model, w.reasoning_effort, {
+      source: w.model_source || (w.model ? 'snapshot' : null),
+      provider: w.model_provider,
+      threadId: w.codex_thread_id,
+      compact: true,
+    });
+    const subTree = Array.isArray(w.subagents) && w.subagents.length > 0
+      ? renderSubagentTree(w.subagents, true)
+      : '';
+    const btn = `          <button type="button" class="overview-member" data-worker-id="${escapeHtml(w.id)}">
             <span class="overview-member-role">${renderRoleBadge(w.role, false)}<span>${escapeHtml(labelRole(w.role))}<small>@${escapeHtml(w.name)}</small></span></span>
             <span class="overview-member-work"><span>${escapeHtml(roleResponsibility(w.role))}</span><span class="overview-current-task">最近登记工作：${escapeHtml(w.current_task || '尚未记录')}</span></span>
-            <span class="overview-member-state">${isAppServerWorker(w) ? renderAppServerBadge() : ''}<span class="pill-badge ${statusTone}">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
+            <span class="overview-member-state">${modelBadge}${isAppServerWorker(w) ? renderAppServerBadge() : ''}<span class="pill-badge ${statusTone}">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
           </button>`;
+    return subTree ? `<div class="overview-member-wrap">${btn}${subTree}</div>` : btn;
   }
 
   function renderNativeActions() {
@@ -2743,7 +3628,20 @@
     const focusSelector = focusKey ? `[${focusKey}="${CSS.escape(focused.getAttribute(focusKey))}"]`
       : detail ? `[data-overview-detail="${CSS.escape(detail.getAttribute('data-overview-detail'))}"] > summary` : null;
     if (state.loadState !== 'ready') {
-      el.overviewContent.innerHTML = `<div class="empty-state">${state.loadState === 'loading' ? '正在加载任务概况…' : state.loadState === 'error' ? '任务数据未加载，请查看上方错误并重试。' : `当前项目暂无 ${escapeHtml(MODE_NAMES[PAGE_MODE])} 任务，可切换项目或点击「立即同步」。`}</div>`;
+      let emptyMsg;
+      if (state.loadState === 'loading') {
+        emptyMsg = '正在加载任务概况…';
+      } else if (state.loadState === 'error') {
+        emptyMsg = '任务数据未加载，请查看上方错误并重试。';
+      } else {
+        const foundThread = state.codexCatalogAvailable && state.selectedSessionId
+          ? findCodexThread(state.selectedSessionId)
+          : null;
+        emptyMsg = foundThread
+          ? `Codex 对话「${foundThread.thread.title}」在 ${MODE_NAMES[PAGE_MODE] || ''} 下暂无编排任务，可点击左侧「全部模式」或在该对话中发起编排。`
+          : `当前项目暂无 ${MODE_NAMES[PAGE_MODE]} 任务，可切换项目或点击「立即同步」。`;
+      }
+      el.overviewContent.innerHTML = `<div class="empty-state">${escapeHtml(emptyMsg)}</div>`;
       if (focused) el.tabButtons.find((btn) => btn.getAttribute('data-tab') === 'overview').focus();
       return;
     }
@@ -2754,6 +3652,36 @@
     const recent = state.messages.slice(-6).reverse();
     const retired = state.workers.filter((w) => ['stopped', 'killed'].includes(w.status));
     const current = state.workers.filter((w) => !['stopped', 'killed'].includes(w.status));
+    const rm = resolveRunModels(run);
+    const hasSessionOverview = Boolean(
+      run.session_id || run.trigger_prompt || executionRoot ||
+      rm.primaryModel || rm.liveModel || state.modelSummary.length > 0
+    );
+    const liveModelHtml = rm.liveModel
+      ? renderModelBadge(rm.liveModel, rm.liveEffort, {
+          source: 'live',
+          provider: run.codex_model_provider,
+          threadId: run.session_id,
+          switched: rm.switched,
+        })
+      : (rm.primaryModel ? renderModelBadge(null, null, { showEmpty: true, emptyText: '实时未知' }) : '');
+    const triggerModelHtml = (rm.switched || (!rm.liveModel && rm.primaryModel))
+      ? ` <strong style="margin-left:8px;">触发时模型</strong> ${renderModelBadge(rm.primaryModel, rm.primaryEffort, {
+          source: 'trigger_snapshot',
+          threadId: run.session_id,
+        })}`
+      : '';
+    const modelSummaryHtml = state.modelSummary.length > 0
+      ? `<div class="session-model-summary" aria-label="模型分布汇总">
+          <strong>模型分布</strong>
+          ${state.modelSummary.map((entry) => {
+            const roles = Array.isArray(entry.roles) && entry.roles.length
+              ? `（${entry.roles.map((r) => labelSubagentRole(r)).join(' / ')}）`
+              : '';
+            return `<span class="metric-chip tabular">${renderModelBadge(entry.model, entry.reasoning_effort, { compact: true })} <span>×${escapeHtml(entry.count)}${escapeHtml(roles)}</span></span>`;
+          }).join('')}
+        </div>`
+      : '';
     const counts = new Map();
     for (const worker of state.workers) {
       const label = labelWorkerStatus(worker.status);
@@ -2761,10 +3689,12 @@
     }
     el.overviewContent.innerHTML = `
       ${run.concurrent_local_write_risk ? `<p class="banner banner-warning concurrent-write-warning" role="status"><strong>并发写冲突风险</strong> · 同一工作区有 ${escapeHtml(run.concurrent_project_active_count)} 个活跃任务，至少一个任务可能直接写入项目目录。</p>` : ''}
-      ${run.session_id || run.trigger_prompt || executionRoot ? `<div class="session-overview">
+      ${hasSessionOverview ? `<div class="session-overview">
         ${run.session_id ? `<strong>Codex 会话：${escapeHtml(sessionName(run))}</strong>
         <span class="mono" title="${escapeHtml(run.session_id)}">${escapeHtml(run.session_id)}</span>
         ${run.session_seq ? `<span class="chip-tag tint-primary tabular">#${escapeHtml(run.session_seq)}</span>` : ''}` : ''}
+        ${rm.liveModel || rm.primaryModel ? `<p class="session-overview-detail"><strong>主对话模型</strong> ${liveModelHtml}${triggerModelHtml}</p>` : ''}
+        ${modelSummaryHtml}
         ${run.trigger_prompt ? `<p class="session-overview-detail"><strong>触发原话</strong> ${escapeHtml(run.trigger_prompt)}</p>` : ''}
         ${executionRoot ? `<p class="session-overview-detail"><strong>执行目录</strong> <span class="mono">${escapeHtml(executionRoot)}</span></p>` : ''}
       </div>` : ''}
@@ -2787,6 +3717,7 @@
         <div class="overview-section-heading"><h2>成员分工</h2><button type="button" class="btn btn-accent btn-xs" data-view="members">查看任务包与全部成员</button></div>
         <div class="overview-members">${current.length ? current.map(renderOverviewMember).join('') : '<p class="muted-caption">没有登记为执行中或待命的成员。</p>'}</div>
         ${retired.length ? `<details class="retired-members" data-overview-detail="retired" ${state.overviewExpanded.has('retired') ? 'open' : ''}><summary>已暂停 / 终止成员（${retired.length}）</summary>${retired.map(renderOverviewMember).join('')}</details>` : ''}
+        ${state.sessionSubagents.length ? `<details class="retired-members unregistered-subagents-wrap" data-overview-detail="session-subagents" ${state.overviewExpanded.has('session-subagents') ? 'open' : ''}><summary>主会话未登记原生子代理（${state.sessionSubagents.length}）</summary>${renderSubagentTree(state.sessionSubagents, true)}</details>` : ''}
       </section>
       <section class="overview-section">
         <div class="overview-section-heading"><h2>最近动态</h2><button type="button" class="btn btn-accent btn-xs" data-view="board">查看全部 ${state.messages.length} 条日志</button></div>
@@ -2823,6 +3754,7 @@
     const renderTurn = ({ turn }, index) => `<div class="board-turn-divider">
       <strong>对话轮次 ${index + 1}</strong>
       <span class="mono" title="${escapeHtml(turn.turn_id)}">${escapeHtml(formatLocalTime(turn.created_at))}</span>
+      ${turn.model ? renderModelBadge(turn.model, turn.reasoning_effort, { source: 'trigger_snapshot', compact: true }) : ''}
       ${turn.prompt_preview ? `<span class="board-turn-prompt" title="${escapeHtml(turn.prompt_preview)}">${escapeHtml(turn.prompt_preview)}</span>` : ''}
     </div>`;
     if (filtered.length === 0) {
@@ -2852,6 +3784,15 @@
         const bodyMd = msg.body_md ? String(msg.body_md) : '';
         const expanded = state.expandedMessages.has(String(msg.seq));
         const senderHandle = normalizeHandle(msg.sender || 'unknown');
+        const senderModel = resolveSenderModel(msg);
+        const senderModelHtml = senderModel
+          ? renderModelBadge(senderModel.model, senderModel.reasoning_effort, {
+              source: senderModel.model_source,
+              provider: senderModel.model_provider,
+              threadId: senderModel.codex_thread_id,
+              compact: true,
+            })
+          : '';
         const showChannelChip = channel !== 'main';
         const showTypeChip = msgType !== 'info';
 
@@ -2863,6 +3804,7 @@
                 <div class="feed-meta-line">
                   <span class="feed-sender">@${escapeHtml(senderHandle)}</span>
                   <span class="feed-role-name">${escapeHtml(labelRole(role))}</span>
+                  ${senderModelHtml}
                   ${
                     mentions.length > 0
                       ? `<span class="feed-arrow" aria-hidden="true">→</span>
@@ -2989,6 +3931,15 @@
         if (defaults.status) existing.status = defaults.status;
         if (defaults.stalled !== undefined) existing.stalled = defaults.stalled;
         if (defaults.worker) existing.worker = defaults.worker;
+        if (defaults.model && !existing.model) existing.model = defaults.model;
+        if (defaults.reasoning_effort && !existing.reasoning_effort) existing.reasoning_effort = defaults.reasoning_effort;
+        if (defaults.model_provider && !existing.model_provider) existing.model_provider = defaults.model_provider;
+        if (defaults.codex_thread_id && !existing.codex_thread_id) existing.codex_thread_id = defaults.codex_thread_id;
+        if (defaults.model_source && !existing.model_source) existing.model_source = defaults.model_source;
+        if (defaults.isHelper !== undefined) existing.isHelper = defaults.isHelper;
+        if (defaults.isUnregistered !== undefined) existing.isUnregistered = defaults.isUnregistered;
+        if (defaults.helper) existing.helper = defaults.helper;
+        if (defaults.depth !== undefined) existing.depth = defaults.depth;
         return existing;
       }
       const role = defaults.role || 'unknown';
@@ -2998,6 +3949,15 @@
         status: defaults.status || 'active',
         stalled: Boolean(defaults.stalled),
         worker: defaults.worker || null,
+        model: defaults.model || null,
+        reasoning_effort: defaults.reasoning_effort || null,
+        model_provider: defaults.model_provider || null,
+        codex_thread_id: defaults.codex_thread_id || null,
+        model_source: defaults.model_source || null,
+        isHelper: Boolean(defaults.isHelper),
+        isUnregistered: Boolean(defaults.isUnregistered),
+        helper: defaults.helper || null,
+        depth: defaults.depth ?? null,
         sentCount: 0,
         recvCount: 0,
         broadcastCount: 0,
@@ -3007,14 +3967,23 @@
       return node;
     }
 
+    const workerNodeIdByThread = new Map();
     for (const w of state.workers) {
       if (!w.name) continue;
-      ensureNode(w.name, {
+      const wNode = ensureNode(w.name, {
         role: String(w.role || 'unknown').toLowerCase(),
         status: String(w.status || 'unknown').toLowerCase(),
         stalled: isWorkerStalled(w),
         worker: w,
+        model: w.model || null,
+        reasoning_effort: w.reasoning_effort || null,
+        model_provider: w.model_provider || null,
+        codex_thread_id: w.codex_thread_id || null,
+        model_source: w.model_source || (w.model ? 'snapshot' : null),
       });
+      if (wNode && w.codex_thread_id) {
+        workerNodeIdByThread.set(w.codex_thread_id, wNode.id);
+      }
     }
 
     for (const m of slice) {
@@ -3035,6 +4004,23 @@
       }
     }
 
+    const rm = resolveRunModels(state.run);
+    const coordModel = rm.liveModel || rm.primaryModel || null;
+    const coordEffort = rm.liveModel ? rm.liveEffort : rm.primaryEffort;
+    const coordSource = rm.liveModel ? 'live' : rm.primarySource;
+    const coordProvider = state.run?.codex_model_provider || null;
+    const coordThreadId = state.run?.session_id || null;
+
+    for (const node of nodesMap.values()) {
+      if ((node.id === 'coordinator' || node.role === 'coordinator') && !node.model && coordModel) {
+        node.model = coordModel;
+        node.reasoning_effort = coordEffort;
+        node.model_provider = coordProvider;
+        node.codex_thread_id = coordThreadId;
+        node.model_source = coordSource;
+      }
+    }
+
     const edgeMap = new Map();
     const lastSliceMsg = slice.length > 0 ? slice[slice.length - 1] : null;
     const allIds = Array.from(nodesMap.keys());
@@ -3051,8 +4037,24 @@
           from,
           to,
           isBroadcast,
+          isSpawn: false,
           count: 1,
           lastSeq: seq,
+        });
+      }
+    }
+
+    function addSpawnEdge(from, to) {
+      if (!from || !to || from === to) return;
+      const key = `${from}:::${to}:::spawn`;
+      if (!edgeMap.has(key)) {
+        edgeMap.set(key, {
+          from,
+          to,
+          isBroadcast: false,
+          isSpawn: true,
+          count: 1,
+          lastSeq: 0,
         });
       }
     }
@@ -3081,6 +4083,77 @@
       }
     }
 
+    if (state.graphShowHelpers) {
+      const helperNodeIdByThread = new Map();
+      const registerHelperNode = (sub, isUnregistered) => {
+        const base = normalizeHandle(sub.agent_path || sub.agent_nickname || shortId(sub.thread_id) || 'helper');
+        let nodeId = base || shortId(sub.thread_id) || 'helper';
+        if (nodesMap.has(nodeId) && nodesMap.get(nodeId).codex_thread_id !== sub.thread_id) {
+          nodeId = `${nodeId}#${shortId(sub.thread_id || Math.random().toString(36).slice(2, 8))}`;
+        }
+        const node = ensureNode(nodeId, {
+          role: String(sub.agent_role || (isUnregistered ? 'investigator' : 'swarm_worker')).toLowerCase(),
+          status: String(sub.edge_status || sub.status || 'active').toLowerCase(),
+          isHelper: true,
+          isUnregistered,
+          helper: sub,
+          depth: Number(sub.depth || (isUnregistered ? 1 : 2)),
+          model: sub.model || null,
+          reasoning_effort: sub.reasoning_effort || null,
+          model_provider: sub.model_provider || null,
+          codex_thread_id: sub.thread_id || null,
+          model_source: sub.model_source || (sub.model ? 'live' : null),
+        });
+        if (node && sub.thread_id) {
+          helperNodeIdByThread.set(sub.thread_id, node.id);
+        }
+        return node;
+      };
+
+      const registeredHelperEntries = state.helperSubagents.map((sub) => ({
+        sub,
+        isUnregistered: false,
+        node: registerHelperNode(sub, false),
+      }));
+      const sessionHelperEntries = state.sessionSubagents.map((sub) => ({
+        sub,
+        isUnregistered: true,
+        node: registerHelperNode(sub, true),
+      }));
+
+      const ensureCoordinatorNode = () => ensureNode('coordinator', {
+        role: 'coordinator',
+        status: 'active',
+        model: coordModel,
+        reasoning_effort: coordEffort,
+        model_provider: coordProvider,
+        codex_thread_id: coordThreadId,
+        model_source: coordSource,
+      });
+
+      for (const { sub, isUnregistered, node } of [...registeredHelperEntries, ...sessionHelperEntries]) {
+        if (!node) continue;
+        let parentId = null;
+        if (sub.parent_thread_id && helperNodeIdByThread.has(sub.parent_thread_id)) {
+          parentId = helperNodeIdByThread.get(sub.parent_thread_id);
+        } else if (sub.parent_thread_id && workerNodeIdByThread.has(sub.parent_thread_id)) {
+          parentId = workerNodeIdByThread.get(sub.parent_thread_id);
+        } else {
+          const parentName = normalizeHandle(sub.parent_worker_name || '');
+          if (parentName && parentName !== 'coordinator' && nodesMap.has(parentName)) {
+            parentId = parentName;
+          } else if (parentName && parentName !== 'coordinator' && !isUnregistered) {
+            parentId = ensureNode(parentName)?.id || null;
+          } else {
+            parentId = ensureCoordinatorNode()?.id || null;
+          }
+        }
+        if (parentId) {
+          addSpawnEdge(parentId, node.id);
+        }
+      }
+    }
+
     let nodes = Array.from(nodesMap.values());
     let edges = Array.from(edgeMap.values());
 
@@ -3091,6 +4164,9 @@
         connectedIds.add(e.to);
       }
       nodes = nodes.filter((n) => {
+        if (n.isHelper) {
+          return n.status !== 'stopped' && n.status !== 'killed';
+        }
         if (n.role === 'coordinator' || n.role === 'human') {
           return connectedIds.has(n.id) || n.sentCount > 0 || n.recvCount > 0;
         }
@@ -3107,13 +4183,15 @@
   }
 
   function layoutGraphNodes(nodes) {
-    const width = 760;
     const topNodes = [];
     const midNodes = [];
+    const helperNodes = [];
     const bottomNodes = [];
 
     for (const n of nodes) {
-      if (n.role === 'coordinator' || n.role === 'human' || n.role === 'watchdog') {
+      if (n.isHelper) {
+        helperNodes.push(n);
+      } else if (n.role === 'coordinator' || n.role === 'human' || n.role === 'watchdog') {
         topNodes.push(n);
       } else if (n.role === 'verifier') {
         bottomNodes.push(n);
@@ -3123,12 +4201,14 @@
     }
 
     const pos = new Map();
-    const boxW = 148;
-    const boxH = 44;
+    const boxW = 156;
+    const boxH = 62;
+    const maxRowLen = Math.max(topNodes.length, Math.min(4, midNodes.length), Math.min(4, helperNodes.length), bottomNodes.length, 1);
+    const width = Math.max(760, maxRowLen * (boxW + 26) + 80);
 
     function placeRow(list, y) {
       if (list.length === 0) return;
-      const padX = 86;
+      const padX = 94;
       const span = width - padX * 2;
       if (list.length === 1) {
         pos.set(list[0].id, { x: width / 2, y, w: boxW, h: boxH });
@@ -3140,7 +4220,7 @@
       });
     }
 
-    const useCircularFallback = (topNodes.length === 0 && bottomNodes.length === 0) && nodes.length > 1;
+    const useCircularFallback = (topNodes.length === 0 && bottomNodes.length === 0 && helperNodes.length === 0) && nodes.length > 1;
     let totalHeight = 380;
 
     if (useCircularFallback) {
@@ -3158,22 +4238,40 @@
         });
       });
       totalHeight = 380;
-    } else {
-      placeRow(topNodes, 56);
+    } else if (helperNodes.length === 0) {
+      placeRow(topNodes, 58);
       if (midNodes.length <= 4) {
-        placeRow(midNodes, topNodes.length > 0 ? 190 : 80);
-        const bottomY = midNodes.length > 0 ? 324 : 210;
+        placeRow(midNodes, topNodes.length > 0 ? 188 : 80);
+        const bottomY = midNodes.length > 0 ? 318 : 210;
         placeRow(bottomNodes, bottomY);
         totalHeight = bottomNodes.length > 0 ? 390 : (midNodes.length > 0 ? 265 : 140);
       } else {
         const splitIdx = Math.ceil(midNodes.length / 2);
         const rowA = midNodes.slice(0, splitIdx);
         const rowB = midNodes.slice(splitIdx);
-        placeRow(rowA, 165);
-        placeRow(rowB, 265);
+        placeRow(rowA, 160);
+        placeRow(rowB, 260);
         placeRow(bottomNodes, 368);
         totalHeight = bottomNodes.length > 0 ? 430 : 340;
       }
+    } else {
+      const rows = [];
+      if (topNodes.length > 0) rows.push(topNodes);
+      for (let i = 0; i < midNodes.length; i += 4) {
+        rows.push(midNodes.slice(i, i + 4));
+      }
+      helperNodes.sort((a, b) => (a.depth || 2) - (b.depth || 2) || String(a.id).localeCompare(String(b.id)));
+      for (let i = 0; i < helperNodes.length; i += 4) {
+        rows.push(helperNodes.slice(i, i + 4));
+      }
+      if (bottomNodes.length > 0) rows.push(bottomNodes);
+      const rowStep = 104;
+      let y = 58;
+      for (const row of rows) {
+        placeRow(row, y);
+        y += rowStep;
+      }
+      totalHeight = Math.max(265, y - rowStep + 68);
     }
 
     return { pos, width, height: totalHeight };
@@ -3235,21 +4333,42 @@
     if (focusId) {
       const node = model.nodes.find((n) => n.id === focusId);
       if (node) {
-        const displayName = node.id === 'coordinator' ? '主协调者' : `@${node.id}`;
-        const statusStr = node.worker ? ` · ${labelWorkerStatus(node.status)}` : '';
+        const displayName = node.id === 'coordinator'
+          ? '主协调者'
+          : (node.isHelper ? subagentDisplayLabel(node.helper) : `@${node.id}`);
+        const statusStr = node.isHelper
+          ? (node.helper?.edge_status || node.status ? ` · ${node.helper?.edge_status || node.status}` : '')
+          : (node.worker ? ` · ${labelWorkerStatus(node.status)}` : '');
+        const roleLabel = node.isHelper
+          ? `L${node.depth || 2} 辅助 · ${labelSubagentRole(node.helper?.agent_role || node.role)}`
+          : labelRole(node.role);
         const broadcastStr = node.broadcastCount > 0 ? ` · @all 广播 ${node.broadcastCount} 次` : '';
+        const nodeModelBadge = renderModelBadge(node.model, node.reasoning_effort, {
+          source: node.model_source || (node.model ? 'live' : null),
+          provider: node.model_provider,
+          threadId: node.codex_thread_id,
+          compact: true,
+          showEmpty: true,
+        });
+        const metaParts = [
+          node.model_provider ? `Provider: ${node.model_provider}` : '',
+          node.codex_thread_id ? `线程: ${node.codex_thread_id}` : '',
+          node.helper?.agent_nickname ? `昵称: ${node.helper.agent_nickname}` : '',
+        ].filter(Boolean).join(' · ');
         el.graphDetailBar.classList.remove('hidden');
         el.graphDetailBar.innerHTML = `
           <div class="graph-detail-main">
             <span class="mono" style="font-weight:600;">${escapeHtml(displayName)}</span>
             ${isAppServerWorker(node.worker) ? renderAppServerBadge() : ''}
-            <span class="pill-badge tint-muted">${escapeHtml(labelRole(node.role))}${escapeHtml(statusStr)}</span>
-            <span class="muted-caption tabular">发出 ${node.sentCount} 条 · 被 @提及 ${node.recvCount} 次${escapeHtml(broadcastStr)}</span>
+            <span class="pill-badge tint-muted">${escapeHtml(roleLabel)}${escapeHtml(statusStr)}</span>
+            ${nodeModelBadge}
+            ${metaParts ? `<span class="muted-caption mono">${escapeHtml(metaParts)}</span>` : ''}
+            ${node.isHelper ? '' : `<span class="muted-caption tabular">发出 ${node.sentCount} 条 · 被 @提及 ${node.recvCount} 次${escapeHtml(broadcastStr)}</span>`}
           </div>
           <div class="graph-detail-actions">
-            <button type="button" class="btn btn-xs" data-graph-action="filter-board" data-node-id="${escapeHtml(node.id)}">在消息板筛选</button>
+            ${node.isHelper ? '' : `<button type="button" class="btn btn-xs" data-graph-action="filter-board" data-node-id="${escapeHtml(node.id)}">在消息板筛选</button>`}
             ${
-              node.worker
+              node.worker && !node.isHelper
                 ? `<button type="button" class="btn btn-xs btn-accent" data-graph-action="inspect-worker" data-worker-id="${escapeHtml(node.worker.id)}">打开工作区检查器</button>`
                 : ''
             }
@@ -3332,17 +4451,19 @@
         const isLatest = edge.lastSeq === latestSeq && state.graphPlaying;
         const dimmed = activeFocus && !isConnectedToFocus;
 
-        const strokeColor = isLatest || isConnectedToFocus ? 'var(--primary)' : 'var(--text-muted)';
+        const strokeColor = isLatest || isConnectedToFocus ? 'var(--primary)' : (edge.isSpawn ? 'var(--cyan)' : 'var(--text-muted)');
         const markerId = isLatest || isConnectedToFocus ? 'url(#graphArrowActive)' : 'url(#graphArrow)';
         const strokeWidth = (1.5 + Math.min(2.8, (edge.count - 1) * 0.55)).toFixed(2);
-        const opacity = dimmed ? '0.16' : (isConnectedToFocus || isLatest ? '0.95' : (edge.isBroadcast ? '0.48' : '0.68'));
-        const dash = edge.isBroadcast ? 'stroke-dasharray="5 4"' : '';
+        const opacity = dimmed ? '0.16' : (isConnectedToFocus || isLatest ? '0.95' : (edge.isBroadcast ? '0.48' : (edge.isSpawn ? '0.75' : '0.68')));
+        const dash = edge.isSpawn ? 'stroke-dasharray="4 3"' : (edge.isBroadcast ? 'stroke-dasharray="5 4"' : '');
+        const edgeLabel = edge.isSpawn ? '派生' : String(edge.count);
+        const labelW = edge.isSpawn ? 32 : Math.max(20, edgeLabel.length * 7 + 10);
 
         return `
-          <g class="graph-edge" data-from="${escapeHtml(edge.from)}" data-to="${escapeHtml(edge.to)}" data-broadcast="${edge.isBroadcast ? '1' : '0'}" data-latest="${isLatest ? '1' : '0'}">
+          <g class="graph-edge" data-from="${escapeHtml(edge.from)}" data-to="${escapeHtml(edge.to)}" data-broadcast="${edge.isBroadcast ? '1' : '0'}" data-spawn="${edge.isSpawn ? '1' : '0'}" data-latest="${isLatest ? '1' : '0'}">
             <path d="${geom.d}" stroke="${strokeColor}" stroke-width="${strokeWidth}" ${dash} fill="none" marker-end="${markerId}" style="opacity:${opacity}"></path>
-            <rect class="graph-edge-label-bg" x="${Number(geom.lx) - Math.max(10, (String(edge.count).length * 7 + 10) / 2)}" y="${Number(geom.ly) - 9}" width="${Math.max(20, String(edge.count).length * 7 + 10)}" height="17" rx="8"></rect>
-            <text x="${geom.lx}" y="${Number(geom.ly) + 3.5}" text-anchor="middle" font-size="10.5" font-weight="600" class="mono" fill="${isConnectedToFocus ? 'var(--link)' : 'var(--text-secondary)'}">${edge.count}</text>
+            <rect class="graph-edge-label-bg" x="${Number(geom.lx) - labelW / 2}" y="${Number(geom.ly) - 9}" width="${labelW}" height="17" rx="8"></rect>
+            <text x="${geom.lx}" y="${Number(geom.ly) + 3.5}" text-anchor="middle" font-size="10.5" font-weight="600" class="mono" fill="${isConnectedToFocus ? 'var(--link)' : 'var(--text-secondary)'}">${edgeLabel}</text>
           </g>
         `;
       })
@@ -3363,15 +4484,30 @@
         if (!box) return '';
         const x = (box.x - box.w / 2).toFixed(1);
         const y = (box.y - box.h / 2).toFixed(1);
-        const strokeColor = getGraphNodeStrokeColor(node);
+        const strokeColor = node.isHelper && !node.stalled ? 'var(--cyan)' : getGraphNodeStrokeColor(node);
         const isSelected = activeFocus === node.id;
         const dimmed = activeFocus && !connectedToFocus.has(node.id);
-        const displayTitle = `@${node.id}`;
-        const truncatedTitle = displayTitle.length > 15 ? `${displayTitle.slice(0, 14)}…` : displayTitle;
-        const subText = node.worker ? `${labelRole(node.role)} · ${labelWorkerStatus(node.status)}` : labelRole(node.role);
+        const displayTitle = node.isHelper ? subagentDisplayLabel(node.helper) : `@${node.id}`;
+        const truncatedTitle = displayTitle.length > 18
+          ? (displayTitle.startsWith('/') ? `…${displayTitle.slice(-17)}` : `${displayTitle.slice(0, 17)}…`)
+          : displayTitle;
+        const subText = node.isHelper
+          ? `L${node.depth || 2} 辅助 · ${labelSubagentRole(node.helper?.agent_role || node.role)}`
+          : (node.worker ? `${labelRole(node.role)} · ${labelWorkerStatus(node.status)}` : labelRole(node.role));
+        const modelLine = formatModelText(node.model, node.reasoning_effort);
+        const truncModel = modelLine.length > 21 ? `${modelLine.slice(0, 20)}…` : modelLine;
+        const ariaLabel = modelLine ? `${displayTitle} ${subText} ${modelLine}` : `${displayTitle} ${subText}`;
+        const titleTip = [
+          displayTitle,
+          subText,
+          modelLine ? `模型：${modelLine}` : '模型未观测',
+          node.model_provider ? `Provider：${node.model_provider}` : '',
+          node.codex_thread_id ? `线程：${node.codex_thread_id}` : '',
+        ].filter(Boolean).join(' | ');
 
         return `
-          <g class="graph-node" data-node-id="${escapeHtml(node.id)}" data-default-stroke="${escapeHtml(strokeColor)}" tabindex="0" role="button" aria-label="${escapeHtml(`${displayTitle} ${subText}`)}" aria-pressed="${state.graphSelectedNode === node.id ? 'true' : 'false'}">
+          <g class="graph-node" data-node-id="${escapeHtml(node.id)}" data-default-stroke="${escapeHtml(strokeColor)}" tabindex="0" role="button" aria-label="${escapeHtml(ariaLabel)}" aria-pressed="${state.graphSelectedNode === node.id ? 'true' : 'false'}">
+            <title>${escapeHtml(titleTip)}</title>
             <rect
               style="opacity:${dimmed ? '0.28' : '1'}"
               x="${x}"
@@ -3383,8 +4519,9 @@
               stroke="${isSelected ? 'var(--primary)' : strokeColor}"
               stroke-width="${isSelected ? '2.2' : '1.5'}"
             ></rect>
-            <text x="${box.x.toFixed(1)}" y="${(box.y - 3).toFixed(1)}" text-anchor="middle" font-size="12" font-weight="600" fill="var(--text-primary)" class="${node.id === 'coordinator' ? '' : 'mono'}">${escapeHtml(truncatedTitle)}</text>
-            <text x="${box.x.toFixed(1)}" y="${(box.y + 13).toFixed(1)}" text-anchor="middle" font-size="10.5" fill="var(--text-muted)">${escapeHtml(subText)}</text>
+            <text x="${box.x.toFixed(1)}" y="${(box.y - 11).toFixed(1)}" text-anchor="middle" font-size="11.5" font-weight="600" fill="var(--text-primary)" class="${node.id === 'coordinator' ? '' : 'mono'}">${escapeHtml(truncatedTitle)}</text>
+            <text x="${box.x.toFixed(1)}" y="${(box.y + 5).toFixed(1)}" text-anchor="middle" font-size="10" fill="var(--text-muted)">${escapeHtml(subText)}</text>
+            <text x="${box.x.toFixed(1)}" y="${(box.y + 20).toFixed(1)}" text-anchor="middle" font-size="9.5" fill="${modelLine ? 'var(--link)' : 'var(--text-muted)'}" class="mono">${escapeHtml(truncModel || '模型未观测')}</text>
           </g>
         `;
       })
@@ -3436,6 +4573,7 @@
       const from = edgeEl.getAttribute('data-from');
       const to = edgeEl.getAttribute('data-to');
       const isBroadcast = edgeEl.getAttribute('data-broadcast') === '1';
+      const isSpawn = edgeEl.getAttribute('data-spawn') === '1';
       const isLatest = edgeEl.getAttribute('data-latest') === '1';
       const isConnected = Boolean(activeFocus && (from === activeFocus || to === activeFocus));
       const dimmed = Boolean(activeFocus && !isConnected);
@@ -3443,9 +4581,9 @@
       const pathEl = edgeEl.querySelector('path');
       const textEl = edgeEl.querySelector('text');
       if (pathEl) {
-        pathEl.style.opacity = dimmed ? '0.16' : (isConnected || isLatest ? '0.95' : (isBroadcast ? '0.48' : '0.68'));
+        pathEl.style.opacity = dimmed ? '0.16' : (isConnected || isLatest ? '0.95' : (isBroadcast ? '0.48' : (isSpawn ? '0.75' : '0.68')));
         const active = isConnected || isLatest;
-        pathEl.setAttribute('stroke', active ? 'var(--primary)' : 'var(--text-muted)');
+        pathEl.setAttribute('stroke', active ? 'var(--primary)' : (isSpawn ? 'var(--cyan)' : 'var(--text-muted)'));
         pathEl.setAttribute('marker-end', active ? 'url(#graphArrowActive)' : 'url(#graphArrow)');
       }
       if (textEl) {
@@ -3620,6 +4758,43 @@
     else el.inspectorTitle.focus();
   }
 
+  function renderInspectorModelRows(worker) {
+    const modelSource = worker.model_source || (worker.model ? 'snapshot' : null);
+    const modelBadge = renderModelBadge(worker.model, worker.reasoning_effort, {
+      source: modelSource,
+      provider: worker.model_provider,
+      threadId: worker.codex_thread_id,
+      showEmpty: true,
+    });
+    const sourceCaption = worker.model
+      ? `<span class="muted-caption">${escapeHtml(modelSourceLabel(modelSource))}</span>`
+      : '';
+    const threadParts = [
+      worker.codex_thread_id ? worker.codex_thread_id : '',
+      worker.agent_nickname ? `昵称 ${worker.agent_nickname}` : '',
+      worker.model_provider ? `Provider ${worker.model_provider}` : '',
+    ].filter(Boolean);
+    return `
+      <div class="kv-key">使用模型</div>
+      <div class="kv-val">${modelBadge}${sourceCaption}</div>
+      <div class="kv-key">Codex 线程</div>
+      <div class="kv-val mono">${threadParts.length ? escapeHtml(threadParts.join(' · ')) : '—'}</div>
+    `;
+  }
+
+  function renderInspectorSubagentsSection(worker) {
+    if (!Array.isArray(worker?.subagents) || worker.subagents.length === 0) return '';
+    return `
+      <div class="inspector-section">
+        <div class="inspector-section-head">
+          <span class="inspector-section-title">下属辅助子代理（L2+）</span>
+          <span class="pill-badge tint-cyan tabular">${worker.subagents.length} 个</span>
+        </div>
+        ${renderSubagentTree(worker.subagents, false)}
+      </div>
+    `;
+  }
+
   function renderInspector() {
     const focused = el.inspectorDrawer.contains(document.activeElement) ? document.activeElement : null;
     const focusedId = focused?.getAttribute('id');
@@ -3659,8 +4834,10 @@
             <div class="kv-val">${escapeHtml(roleLabel)}</div>
             <div class="kv-key">当前任务</div>
             <div class="kv-val">${escapeHtml(worker.current_task || '—')}</div>
+            ${renderInspectorModelRows(worker)}
           </div>
         </div>
+        ${renderInspectorSubagentsSection(worker)}
         <div class="inspector-section">
           <div class="inspector-section-head">
             <span class="inspector-section-title">安全状态控制（保文件）</span>
@@ -3707,6 +4884,7 @@
             ${isAppServerWorker(worker) ? renderAppServerBadge() : ''}
             <span class="pill-badge ${getWorkerStatusTone(workerStatus, isWorkerStalled(worker))}">${escapeHtml(labelWorkerStatus(workerStatus))}</span>
           </div>
+          ${renderInspectorModelRows(worker)}
           <div class="kv-key">工作区</div>
           <div class="kv-val">
             <span class="pill-badge tint-primary">${escapeHtml(labelWsMode(wsMode))}</span>
@@ -3725,6 +4903,7 @@
           <div class="kv-val mono">${escapeHtml(ws.base_commit ? shortId(ws.base_commit) : '—')}</div>
         </div>
       </div>
+      ${renderInspectorSubagentsSection(worker)}
 
       <!-- 仅保留 4 类安全操作 -->
       <div class="inspector-section">
@@ -4158,6 +5337,7 @@
     });
 
     el.projectSelect.addEventListener('change', async () => {
+      state.selectedSessionId = null;
       await loadRuns(el.projectSelect.value || null);
     });
 
@@ -4196,6 +5376,7 @@
       if (!item) return;
       const projectId = item.getAttribute('data-select-project');
       setProjectPopoverOpen(false);
+      state.selectedSessionId = null;
       await loadRuns(projectId || null);
     });
 
@@ -4224,8 +5405,19 @@
     }
 
     el.runSidebarList.addEventListener('click', async (evt) => {
+      const codexGroup = evt.target.closest('summary')?.closest('[data-codex-project]');
+      if (codexGroup) state.codexProjectOpenOverrides.set(codexGroup.dataset.codexProject, !codexGroup.open);
       const group = evt.target.closest('summary')?.closest('[data-session-group]');
       if (group) state.sessionOpenOverrides.set(group.dataset.sessionGroup, !group.open);
+      const threadBtn = evt.target.closest('[data-select-thread]');
+      if (threadBtn) {
+        if (window.innerWidth <= 1080) setSidebarOpen(false);
+        await selectCodexThread(
+          threadBtn.getAttribute('data-thread-project'),
+          threadBtn.getAttribute('data-select-thread')
+        );
+        return;
+      }
       const item = evt.target.closest('[data-select-run]');
       if (!item) return;
       const nextRunId = item.getAttribute('data-select-run');
@@ -4302,6 +5494,12 @@
 
     el.exportMdBtn.addEventListener('click', () => handleExport('md'));
     el.exportJsonBtn.addEventListener('click', () => handleExport('json'));
+
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && state.codexCatalogAvailable) {
+        void refreshGlobalSessions();
+      }
+    });
 
     document.addEventListener('click', (evt) => {
       if (!el.exportDropdown.contains(evt.target)) {
@@ -4454,6 +5652,11 @@
 
     el.graphExpandAllToggle.addEventListener('change', () => {
       state.graphExpandAll = el.graphExpandAllToggle.checked;
+      renderGraph();
+    });
+
+    el.graphShowHelpersToggle?.addEventListener('change', () => {
+      state.graphShowHelpers = Boolean(el.graphShowHelpersToggle.checked);
       renderGraph();
     });
 

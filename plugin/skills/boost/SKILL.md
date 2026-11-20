@@ -5,9 +5,9 @@ metadata:
   short-description: "Adaptive Solo/Delegation execution with forced verification"
 ---
 
-## M6/M7/M8 workflow5 primary path (software 0.6.1/schema9 default)
+## M6/M7/M8 workflow5 primary path (software 0.6.2/schema10 default)
 
-New runs default to `workflow5` (`0.6.1/schema9`); stored runs follow `board_status.workflow.workflow_version` without fabricated historical evidence:
+New runs default to `workflow5` (`0.6.2/schema10`); stored runs follow `board_status.workflow.workflow_version` without fabricated historical evidence:
 
 - **Coordinator 2-step Macro Dispatch & 1-turn Direct Spawn**: Bind the root session on `run_create`; reuse that `session_id` if also passing it to `workflow_prepare_dispatch` (`run_create` and `board_status(compact=True)` also expose `cli_executables` for `tri-orchestrator-verify` and `tri-orchestrator-challenge`). For delegated authors, call `workflow_prepare_dispatch` with deterministic `task_name` (`^[a-z0-9_-]{1,48}$`, pre-freezing `/root/<task_name>`, optional `create_workspace=True`) -> issue 1-turn direct `spawn_agent(task_name="<task_name>", message="<full contract + workspace + step_id + message_id>")` with zero waiting-only bootstrap empty turns -> call `native_action_record_call(run_id=..., action_id=..., claim_token=..., expected_revision=..., outcome="confirmed"|"failed", raw_response=...)` (server writes receipt JSON, computes 64-hex SHA-256 `evidence_digest`, and atomically binds `agent_id` + `original_bindings`).
 - **`spawn_agent` Reconciliation Fence**: If `begin(action_type="spawn_agent")` times out, disconnects, or restarts into `needs_reconciliation`, NEVER blindly re-call `spawn_agent`; first call `list_agents(path_prefix="/root/<task_name>")` and pass observed state to `native_action_update(action="reconcile", ...)` (`outcome="confirmed"` if present; `outcome="not_called"|"rejected", cancel=True` ONLY if proven `not_found` or explicitly rejected).

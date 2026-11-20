@@ -78,7 +78,7 @@ def test_new_runs_use_workflow4_schema7_and_rpc_cannot_choose_version(tmp_path):
     settings = Settings(data_dir=tmp_path / 'data')
     db = Database(settings=settings)
     try:
-        assert SCHEMA_VERSION == db.migrate() == 9
+        assert SCHEMA_VERSION == db.migrate() == 10
         assert db.create_run(mode='boost', title='new', project_root=tmp_path)['workflow_version'] == 5
         dispatcher = RpcDispatcher(db, BoardService(db), WorkspaceManager(db, settings))
         with pytest.raises(ValueError, match='Unknown'):
@@ -112,7 +112,7 @@ def test_schema4_upgrade_keeps_existing_run_contracts_and_adds_nullable_context(
         columns = {r['name']: r for r in db.connect().execute('PRAGMA table_info(inbox_messages)')}
         for column in ('step_packet_version', 'step_attempt', 'step_contract_revision'):
             assert column in columns and columns[column]['notnull'] == 0
-        assert db.migrate() == 9
+        assert db.migrate() == 10
     finally:
         db.close()
     before = path.read_bytes()

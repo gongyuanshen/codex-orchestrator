@@ -77,7 +77,7 @@ def finish(s, step):
 
 def test_new_contract(flow):
     db, s, run, *_ = flow
-    assert SCHEMA_VERSION == 9
+    assert SCHEMA_VERSION == 10
     assert run['workflow_version'] == 5
 
 
