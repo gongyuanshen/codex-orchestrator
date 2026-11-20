@@ -46,6 +46,7 @@ codex plugin add tri-orchestrator@tri-orchestrator
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 # 如需在 CLI 中直接写入钩子信任哈希，可附加 -TrustPluginHooks
+# 默认保留永久基线 tri-orchestrator-baseline + 最近 3 个配置备份，可通过 -KeepBackups N 调整
 ```
 
 **macOS / Linux（Bash）：**
@@ -53,6 +54,7 @@ powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 ```bash
 bash scripts/install.sh
 # 如需在 CLI 中直接写入钩子信任哈希，可附加 --trust-plugin-hooks
+# 默认保留永久基线 tri-orchestrator-baseline + 最近 3 个配置备份，可通过 --keep-backups N 调整
 ```
 
 ### 旧版本运行库升级
@@ -62,7 +64,9 @@ bash scripts/install.sh
 ```bash
 python scripts/upgrade.py prepare --source-plugin ./plugin --target-plugin <old-plugin-dir> --data-dir <data-dir> --backup-dir <backup-dir>
 python scripts/upgrade.py apply --backup-dir <backup-dir>
-python scripts/upgrade.py verify --backup-dir <backup-dir>
+python scripts/upgrade.py verify --backup-dir <backup-dir> --keep-backups 3
+# 如需单独轮转清理旧版升级备份或残留的 plugin-backup-* staging 目录：
+python scripts/upgrade.py prune --backup-root <backups-dir> --plugin-cache-dir ~/.codex/plugins/cache/tri-orchestrator --keep-backups 3
 ```
 
 > 守护进程冷启动不会自动迁移旧版 Schema，也不要直接覆盖旧版托管缓存目录；升级遇到新数据写入后拒绝用旧备份回滚，保留数据进行前向修复。
@@ -209,6 +213,44 @@ flowchart LR
 
 ---
 
+## 磁盘占用、缓存位置与清理机制
+
+### 1. 非 Git 目录 `snapshot` 隔离、体积上限与 `.triignore` 过滤
+
+- 当目标目录不是 Git 仓库时，`WorkspaceManager` 会回退至 `mode="snapshot"`，将受纳文件复制一份到 `<project_root>/.swarm-workspaces/<run>-<worker>` 作为三方比较基线。
+- **体积阈值保护（`TRI_ORCH_MAX_SNAPSHOT_MB`）**：在执行快照拷贝前会先估算源目录的文件数与总字节数；默认上限为 **`500` MB**（设为 `0` 表示不限制）。一旦超限将直接拒绝创建并给出明确错误提示，严禁静默硬拷贝数 GB 构建目录；可通过改用 Git 仓库、缩小 `execution_root`、配置 `.triignore` 或调整环境变量解决。
+- **内置排除与 `.triignore`**：快照与状态比对会自动跳过内置 `SNAPSHOT_EXCLUDE_DIRS`（含 `.swarm-workspaces`、`.git`、`node_modules`、`.venv`、`__pycache__`、`.pytest_cache`、`.ruff_cache`、`.mypy_cache` 以及常见构建/缓存目录 `bin`、`obj`、`dist`、`build`、`out`、`target` 等），并支持在项目根目录放置可选 **`.triignore`** 文件（按行配置目录名或 glob 模式进行过滤）。
+
+### 2. 数据目录、隔离工作区与备份位置及生命周期
+
+| 存储路径 | 内容组成 | 生命周期与清理边界 |
+| :--- | :--- | :--- |
+| **`%LOCALAPPDATA%\tri-orchestrator`**（Windows）<br>`~/.local/share/tri-orchestrator`（POSIX）<br>（`TRI_ORCH_DATA_DIR`） | - `state.db`：SQLite WAL 状态机库<br>- `daemon.log` / `shim.log`：运行日志（`RotatingFileHandler` 自动轮转）<br>- `results/`：超大 MCP 返回体缓存 JSON<br>- `receipts/`：派发与验收 SHA-256 回执 | `state.db` 与 `receipts/` 长期留存以保留审计轨迹；`results/` 下缓存文件超过 `TRI_ORCH_RESULT_TTL_SEC`（默认 `86400` 秒）或超出最近 `TRI_ORCH_RESULT_MAX_FILES`（默认 `50` 份）时自动清理。 |
+| **`<project_root>/.swarm-workspaces/`** | 每个隔离写入子代理一个子目录（`git_clone` 或 `snapshot` 复制目录） | 任务结束调用 `workflow_closeout_run` / `workspace_cleanup` 时自动回收；已合入且无未提交改动的过期工作区超过 `TRI_ORCH_WORKSPACE_RETENTION_SEC`（默认 `86400` 秒）由 GC 安全删除。**凡存在未合入新增/修改文件的工作区绝不自动删除**，需人工核查合入或手动处置。 |
+| **`~/.codex/backups/`** 与<br>`~/.codex/plugins/cache/tri-orchestrator/` | - `tri-orchestrator-baseline`：首次安装前配置基线<br>- `tri-orchestrator-2*`：历次安装配置与角色备份<br>- `plugin-backup-*`：插件重装/升级残留 staging 目录 | 安装脚本仅备份 `config.toml` 与必要角色 TOML（绝不拷贝 `.venv`），永久保留唯一 `tri-orchestrator-baseline` 与最近 `N=3` 个时间戳备份（`-KeepBackups` / `--keep-backups` 可覆盖）；`scripts/upgrade.py verify` / `prune` 轮转清理已验证完成的旧升级备份与过期 `plugin-backup-*` staging 目录。 |
+
+### 3. 三种存储清理与 GC 触发方式
+
+1. **后台定时自动 GC**：守护进程内嵌周期 GC 任务（默认每隔 `TRI_ORCH_GC_INTERVAL_SEC=3600` 秒执行一次），仅清理过期 `results/` 缓存以及所属轮次已完成/归档、状态为 `merged` 且静态无未合入变更、超过保留期的隔离工作区。
+2. **Web 控制台「存储与清理」面板**：打开 `http://127.0.0.1:18790` 点击顶栏「**存储与清理**」按钮，可实时查看运行时目录各子项占用、逐条区分 `.swarm-workspaces` 状态（「可安全清理」、「含未合入变更待核查」、「进行中」），并一键执行安全清理。
+3. **离线 / 手动运行 CLI**：无需打开浏览器或启动 Web 服务，可在终端直接执行垃圾回收（支持在线或离线 SQLite WAL）：
+
+```bash
+# 常规安全清理（清理过期 results/ 与达到保留期限的已合入无脏改动工作区）
+tri-orchestrator-daemon --gc
+
+# 仅预演估算可释放空间，不实际删除任何文件
+tri-orchestrator-daemon --gc --gc-dry-run
+
+# 立即清理所有已完成/已归档轮次的已合入且无未合入改动的工作区（跳过等待保留期）
+tri-orchestrator-daemon --gc --gc-all-completed
+
+# 也可直接通过独立 GC 模块运行
+python -m orchestrator.gc --dry-run
+```
+
+---
+
 ## 架构与目录结构
 
 ```text
@@ -287,6 +329,11 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
 | `TRI_ORCH_STALL_SEC` | `300` | 成员心跳停滞告警阈值（秒）。 |
 | `TRI_ORCH_WATCHDOG_INTERVAL_SEC` | `15` | 看门狗巡检间隔（秒）。 |
 | `TRI_ORCH_PORT_RANGE` | `18800..18999` | 隔离工作区测试端口池范围。 |
+| `TRI_ORCH_MAX_SNAPSHOT_MB` | `500` | 非 Git 目录 `snapshot` 模式允许复制的最大估算体积（MB），`0` 表示不限制。 |
+| `TRI_ORCH_GC_INTERVAL_SEC` | `3600.0` | 守护进程后台定时 GC 轮询间隔（秒）。 |
+| `TRI_ORCH_RESULT_TTL_SEC` | `86400` | `results/` 下 MCP 大结果缓存文件的保留时长（秒）。 |
+| `TRI_ORCH_RESULT_MAX_FILES` | `50` | `results/` 目录下最多保留的近期缓存文件数量。 |
+| `TRI_ORCH_WORKSPACE_RETENTION_SEC` | `86400` | 已完结轮次中已合入且无脏改动的 `.swarm-workspaces` 工作区保留时长（秒）。 |
 | `TRI_ORCH_HOOK_TIMEOUT_SEC` | `1.2` | `tri-orchestrator-hook` 本地 RPC 默认超时（秒，硬上限 `1.5`）。 |
 | `TRI_ORCH_BASE_URL` | 空（按 `HOST`/`PORT` 拼装） | 可选显式覆盖 `tri-orchestrator-hook` 请求的守护进程基础 URL。 |
 | `CODEX_HOME` | `~/.codex` | Codex 本地目录路径；只读目录/模型桥接及安装卸载脚本据此定位状态库与 `agents/`。 |

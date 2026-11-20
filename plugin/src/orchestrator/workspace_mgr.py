@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import difflib
+import fnmatch
 import hashlib
+import logging
 import os
 import re
 import shutil
@@ -13,11 +15,15 @@ import sys
 import threading
 import time
 import uuid
-from pathlib import Path
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from orchestrator.config import Settings, get_settings
 from orchestrator.db import Database, NotFoundError, resolve_execution_root
+
+logger = logging.getLogger(__name__)
 
 try:
     import _winapi
@@ -29,6 +35,7 @@ VALID_MERGE_STRATEGIES = frozenset({"merge", "cherry-pick"})
 
 WORKSPACES_DIRNAME = ".swarm-workspaces"
 EXCLUDE_ENTRY = ".swarm-workspaces/"
+TRIIGNORE_FILENAME = ".triignore"
 SNAPSHOT_EXCLUDE_DIRS = frozenset(
     {
         WORKSPACES_DIRNAME,
@@ -39,6 +46,21 @@ SNAPSHOT_EXCLUDE_DIRS = frozenset(
         ".pytest_cache",
         ".ruff_cache",
         ".mypy_cache",
+        "bin",
+        "obj",
+        "dist",
+        "build",
+        "out",
+        "target",
+        ".tox",
+        ".nox",
+        ".coverage",
+        "htmlcov",
+        ".gradle",
+        ".next",
+        ".nuxt",
+        ".turbo",
+        ".parcel-cache",
     }
 )
 ENV_FILENAMES = (".env", ".env.local")
@@ -289,39 +311,268 @@ def _is_reparse_or_symlink(path: Path) -> bool:
     if path.is_symlink():
         return True
     try:
-        return hasattr(path, "is_junction") and path.is_junction()
+        if hasattr(path, "is_junction") and path.is_junction():
+            return True
+        reparse_attr = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        if reparse_attr:
+            st = path.lstat()
+            if getattr(st, "st_file_attributes", 0) & reparse_attr:
+                return True
     except OSError:
         return False
+    return False
+
+
+def _seg_glob_to_regex(segment: str) -> str:
+    """Convert a single path-segment glob pattern into a regex fragment."""
+    out: list[str] = []
+    i = 0
+    n = len(segment)
+    while i < n:
+        ch = segment[i]
+        if ch == "*":
+            out.append("[^/]*")
+            i += 1
+        elif ch == "?":
+            out.append("[^/]")
+            i += 1
+        elif ch == "[":
+            j = i + 1
+            if j < n and segment[j] in ("!", "^"):
+                j += 1
+            if j < n and segment[j] == "]":
+                j += 1
+            while j < n and segment[j] != "]":
+                j += 1
+            if j >= n:
+                out.append(re.escape(ch))
+                i += 1
+            else:
+                inner = segment[i + 1 : j]
+                if inner.startswith("!"):
+                    inner = "^" + inner[1:]
+                out.append(f"[{inner}]")
+                i = j + 1
+        else:
+            out.append(re.escape(ch))
+            i += 1
+    return "".join(out)
+
+
+def _compile_path_glob(pattern: str) -> re.Pattern[str]:
+    raw_segments = [s for s in pattern.split("/") if s]
+    segments: list[str] = []
+    for seg in raw_segments:
+        if seg == "**" and segments and segments[-1] == "**":
+            continue
+        segments.append(seg)
+
+    parts_re: list[str] = ["^"]
+    n = len(segments)
+    for idx, seg in enumerate(segments):
+        if seg == "**":
+            if n == 1:
+                parts_re.append(".+")
+            elif idx == 0:
+                parts_re.append("(?:.+/)?")
+            elif idx == n - 1:
+                parts_re.append("/.+")
+            else:
+                parts_re.append("/(?:.+/)?")
+        else:
+            if idx > 0 and segments[idx - 1] != "**":
+                parts_re.append("/")
+            parts_re.append(_seg_glob_to_regex(seg))
+    parts_re.append("$")
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    return re.compile("".join(parts_re), flags)
+
+
+@dataclass(frozen=True, slots=True)
+class _TriIgnoreRule:
+    pattern: str
+    dir_only: bool
+    anchored: bool
+    has_slash: bool
+    regex: re.Pattern[str] | None = None
+
+    def matches(self, rel_posix: str, name: str, *, is_dir: bool) -> bool:
+        if self.dir_only and not is_dir:
+            return False
+        if not self.has_slash and not self.anchored:
+            return fnmatch.fnmatch(name, self.pattern)
+        if self.anchored and not self.has_slash:
+            return "/" not in rel_posix and fnmatch.fnmatch(name, self.pattern)
+        return self.regex is not None and bool(self.regex.match(rel_posix))
+
+
+@dataclass(frozen=True, slots=True)
+class _TriIgnoreMatcher:
+    rules: tuple[_TriIgnoreRule, ...] = ()
+
+    def matches(self, rel_posix: str, *, is_dir: bool) -> bool:
+        if not self.rules:
+            return False
+        name = rel_posix.rsplit("/", 1)[-1]
+        return any(rule.matches(rel_posix, name, is_dir=is_dir) for rule in self.rules)
+
+    def is_rel_path_excluded(self, rel_posix: str) -> bool:
+        parts = PurePosixPath(rel_posix).parts
+        if any(part in SNAPSHOT_EXCLUDE_DIRS for part in parts[:-1]):
+            return True
+        if not self.rules:
+            return False
+        for idx in range(1, len(parts)):
+            anc = "/".join(parts[:idx])
+            if self.matches(anc, is_dir=True):
+                return True
+        return self.matches(rel_posix, is_dir=False)
+
+
+def _load_triignore(project_root: Path) -> _TriIgnoreMatcher:
+    """Load optional .triignore patterns from project_root."""
+    ignore_path = project_root / TRIIGNORE_FILENAME
+    if not ignore_path.is_file() or _is_reparse_or_symlink(ignore_path):
+        return _TriIgnoreMatcher()
+    rules: list[_TriIgnoreRule] = []
+    text = ignore_path.read_text(encoding="utf-8-sig", errors="replace")
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        pat = line.replace("\\", "/")
+        dir_only = pat.endswith("/")
+        pat = pat.rstrip("/")
+        anchored = pat.startswith("/")
+        pat = pat.lstrip("/")
+        if not pat:
+            continue
+        has_slash = "/" in pat
+        regex = _compile_path_glob(pat) if has_slash else None
+        rules.append(
+            _TriIgnoreRule(
+                pattern=pat,
+                dir_only=dir_only,
+                anchored=anchored,
+                has_slash=has_slash,
+                regex=regex,
+            )
+        )
+    return _TriIgnoreMatcher(tuple(rules))
+
+
+def _filter_snapshot_baseline(
+    baseline: dict[str, str],
+    *,
+    triignore: _TriIgnoreMatcher,
+) -> dict[str, str]:
+    """Drop historical baseline entries that now fall under snapshot exclusion rules."""
+    if not baseline:
+        return {}
+    return {
+        rel_path: file_hash
+        for rel_path, file_hash in baseline.items()
+        if not triignore.is_rel_path_excluded(rel_path)
+    }
 
 
 def _scan_snapshot_files(
     root: Path,
     *,
-    exclude_root_files: frozenset[str] = frozenset(),
+    exclude_root_files: Iterable[str] = frozenset(),
+    triignore: _TriIgnoreMatcher | None = None,
 ) -> dict[str, str]:
     """Walk root and return {posix_rel_path: sha256_hex} excluding ignored directories/files."""
     manifest: dict[str, str] = {}
     if not root.exists():
         return manifest
+    excluded_root = frozenset(exclude_root_files)
+    matcher = triignore if triignore is not None else _load_triignore(root)
 
     for dirpath, dirnames, filenames in os.walk(root):
         parent = Path(dirpath)
-        dirnames[:] = sorted(
-            d
-            for d in dirnames
-            if d not in SNAPSHOT_EXCLUDE_DIRS and not _is_reparse_or_symlink(parent / d)
-        )
         rel_dir = parent.relative_to(root)
         is_root = rel_dir == Path(".")
+        kept_dirs: list[str] = []
+        for d in sorted(dirnames):
+            if d in SNAPSHOT_EXCLUDE_DIRS or _is_reparse_or_symlink(parent / d):
+                continue
+            rel_d = d if is_root else f"{rel_dir.as_posix()}/{d}"
+            if matcher.matches(rel_d, is_dir=True):
+                continue
+            kept_dirs.append(d)
+        dirnames[:] = kept_dirs
+
         for fname in sorted(filenames):
-            if is_root and fname in exclude_root_files:
+            if is_root and fname in excluded_root:
                 continue
             full_path = parent / fname
-            if full_path.is_symlink():
+            if _is_reparse_or_symlink(full_path):
                 continue
-            rel_path = (rel_dir / fname).as_posix()
-            manifest[rel_path] = _sha256_file(full_path)
+            rel_posix = fname if is_root else f"{rel_dir.as_posix()}/{fname}"
+            if matcher.matches(rel_posix, is_dir=False):
+                continue
+            manifest[rel_posix] = _sha256_file(full_path)
     return manifest
+
+
+def _estimate_snapshot_size(
+    resolved_root: Path,
+    *,
+    execution_root: Path | None,
+    copy_env: bool,
+    triignore: _TriIgnoreMatcher,
+) -> tuple[int, int]:
+    """Estimate total bytes and file count that snapshot mode would copy from resolved_root."""
+    total_bytes = 0
+    file_count = 0
+    copied_root_env: set[str] = set()
+
+    for dirpath, dirnames, filenames in os.walk(resolved_root):
+        parent = Path(dirpath)
+        rel_dir = parent.relative_to(resolved_root)
+        is_root = rel_dir == Path(".")
+        kept_dirs: list[str] = []
+        for d in sorted(dirnames):
+            if d in SNAPSHOT_EXCLUDE_DIRS or _is_reparse_or_symlink(parent / d):
+                continue
+            rel_d = d if is_root else f"{rel_dir.as_posix()}/{d}"
+            if triignore.matches(rel_d, is_dir=True):
+                continue
+            kept_dirs.append(d)
+        dirnames[:] = kept_dirs
+
+        for fname in sorted(filenames):
+            if not copy_env and fname in ENV_FILENAMES and (
+                is_root or parent == execution_root
+            ):
+                continue
+            src_file = parent / fname
+            if _is_reparse_or_symlink(src_file):
+                continue
+            rel_posix = fname if is_root else f"{rel_dir.as_posix()}/{fname}"
+            if triignore.matches(rel_posix, is_dir=False):
+                continue
+            try:
+                total_bytes += src_file.lstat().st_size
+                file_count += 1
+                if is_root and fname in ENV_FILENAMES:
+                    copied_root_env.add(fname)
+            except OSError:
+                continue
+
+    if copy_env and execution_root is not None and execution_root != resolved_root:
+        for fname in ENV_FILENAMES:
+            if fname in copied_root_env:
+                continue
+            candidate = execution_root / fname
+            if candidate.is_file() and not _is_reparse_or_symlink(candidate):
+                try:
+                    total_bytes += candidate.lstat().st_size
+                    file_count += 1
+                except OSError:
+                    continue
+    return total_bytes, file_count
 
 
 class WorkspaceManager:
@@ -611,6 +862,28 @@ class WorkspaceManager:
 
             use_git_clone = is_git_worktree and has_head
             base_root = repo_root if use_git_clone else resolved_root
+            triignore = _load_triignore(resolved_root) if not use_git_clone else _TriIgnoreMatcher()
+
+            if not use_git_clone:
+                estimated_bytes, estimated_files = _estimate_snapshot_size(
+                    resolved_root,
+                    execution_root=execution_root,
+                    copy_env=copy_env,
+                    triignore=triignore,
+                )
+                max_snapshot_mb = int(self.settings.max_snapshot_mb)
+                if max_snapshot_mb > 0:
+                    limit_bytes = max_snapshot_mb * 1024 * 1024
+                    if estimated_bytes > limit_bytes:
+                        estimated_mb = estimated_bytes / (1024 * 1024)
+                        raise WorkspaceError(
+                            f"Snapshot workspace size {estimated_mb:.2f} MB ({estimated_files} files) "
+                            f"exceeds max_snapshot_mb={max_snapshot_mb} MB ({limit_bytes} bytes) "
+                            f"for {resolved_root}. Suggestions: initialize a Git repository (git init), "
+                            "narrow execution_root, configure .triignore exclusions, or adjust "
+                            "TRI_ORCH_MAX_SNAPSHOT_MB (0 = unlimited)."
+                        )
+
             # Placement follows the Run; source and merge paths still use project coordinates.
             ws_dir, branch_name = self._allocate_workspace_dir_and_branch(
                 execution_root or base_root, run_id, worker_name
@@ -644,16 +917,23 @@ class WorkspaceManager:
                 else:
                     ws_dir.mkdir(parents=True, exist_ok=True)
                     baseline_files: dict[str, str] = {}
+                    copied_bytes = 0
+                    file_count = 0
+                    copied_file_sizes: dict[str, int] = {}
 
                     for dirpath, dirnames, filenames in os.walk(resolved_root):
                         parent = Path(dirpath)
-                        dirnames[:] = sorted(
-                            d
-                            for d in dirnames
-                            if d not in SNAPSHOT_EXCLUDE_DIRS and not _is_reparse_or_symlink(parent / d)
-                        )
                         rel_dir = parent.relative_to(resolved_root)
                         is_root = rel_dir == Path(".")
+                        kept_dirs: list[str] = []
+                        for d in sorted(dirnames):
+                            if d in SNAPSHOT_EXCLUDE_DIRS or _is_reparse_or_symlink(parent / d):
+                                continue
+                            rel_d = d if is_root else f"{rel_dir.as_posix()}/{d}"
+                            if triignore.matches(rel_d, is_dir=True):
+                                continue
+                            kept_dirs.append(d)
+                        dirnames[:] = kept_dirs
                         (ws_dir / rel_dir).mkdir(parents=True, exist_ok=True)
                         for fname in sorted(filenames):
                             if not copy_env and fname in ENV_FILENAMES and (
@@ -661,22 +941,40 @@ class WorkspaceManager:
                             ):
                                 continue
                             src_file = parent / fname
-                            if src_file.is_symlink():
+                            if _is_reparse_or_symlink(src_file):
+                                continue
+                            rel_posix = fname if is_root else f"{rel_dir.as_posix()}/{fname}"
+                            if triignore.matches(rel_posix, is_dir=False):
                                 continue
                             dst_file = ws_dir / rel_dir / fname
+                            src_size = src_file.lstat().st_size
                             shutil.copy2(src_file, dst_file)
+                            copied_bytes += src_size
+                            file_count += 1
+                            copied_file_sizes[rel_posix] = src_size
                             if not (is_root and fname in ENV_FILENAMES):
-                                rel_posix = (rel_dir / fname).as_posix()
                                 baseline_files[rel_posix] = _sha256_file(src_file)
 
                     if copy_env and execution_root is not None and execution_root != resolved_root:
-                        self._copy_env_files(source_roots, ws_dir, is_git=False)
+                        copied_env = self._copy_env_files(source_roots, ws_dir, is_git=False)
+                        for env_name in copied_env:
+                            env_dst = ws_dir / env_name
+                            if env_dst.is_file():
+                                new_size = env_dst.lstat().st_size
+                                if env_name in copied_file_sizes:
+                                    copied_bytes += new_size - copied_file_sizes[env_name]
+                                else:
+                                    copied_bytes += new_size
+                                    file_count += 1
+                                copied_file_sizes[env_name] = new_size
                     self._apply_dep_mode(execution_root or resolved_root, ws_dir, dep_mode, is_git=False)
 
                     manifest = {
                         "project_root": str(resolved_root),
                         "copy_env": bool(copy_env),
                         "files": baseline_files,
+                        "copied_bytes": copied_bytes,
+                        "file_count": file_count,
                     }
                     ws_record = self.db.create_workspace(
                         run_id,
@@ -688,6 +986,8 @@ class WorkspaceManager:
                         auto_allocate_port=True,
                         snapshot_manifest=manifest,
                     )
+                    ws_record["copied_bytes"] = copied_bytes
+                    ws_record["file_count"] = file_count
             except BaseException:
                 _rmtree_safe(ws_dir)
                 raise
@@ -778,11 +1078,15 @@ class WorkspaceManager:
 
         # Snapshot mode
         manifest = ws.get("snapshot_manifest") or {}
-        baseline: dict[str, str] = dict(manifest.get("files") or {})
         project_root = self._get_workspace_project_root(ws)
+        triignore = _load_triignore(project_root)
+        baseline: dict[str, str] = _filter_snapshot_baseline(
+            dict(manifest.get("files") or {}),
+            triignore=triignore,
+        )
         exclude_env = frozenset(ENV_FILENAMES)
-        ws_files = _scan_snapshot_files(ws_path, exclude_root_files=exclude_env)
-        root_files = _scan_snapshot_files(project_root, exclude_root_files=exclude_env)
+        ws_files = _scan_snapshot_files(ws_path, exclude_root_files=exclude_env, triignore=triignore)
+        root_files = _scan_snapshot_files(project_root, exclude_root_files=exclude_env, triignore=triignore)
 
         added = sorted(p for p in ws_files if p not in baseline)
         deleted = sorted(p for p in baseline if p not in ws_files)
@@ -893,11 +1197,15 @@ class WorkspaceManager:
 
         # Snapshot mode diff
         manifest = ws.get("snapshot_manifest") or {}
-        baseline: dict[str, str] = dict(manifest.get("files") or {})
         project_root = self._get_workspace_project_root(ws)
+        triignore = _load_triignore(project_root)
+        baseline: dict[str, str] = _filter_snapshot_baseline(
+            dict(manifest.get("files") or {}),
+            triignore=triignore,
+        )
         exclude_env = frozenset(ENV_FILENAMES)
-        ws_files = _scan_snapshot_files(ws_path, exclude_root_files=exclude_env)
-        root_files = _scan_snapshot_files(project_root, exclude_root_files=exclude_env)
+        ws_files = _scan_snapshot_files(ws_path, exclude_root_files=exclude_env, triignore=triignore)
+        root_files = _scan_snapshot_files(project_root, exclude_root_files=exclude_env, triignore=triignore)
 
         all_paths = sorted(set(baseline) | set(ws_files))
         files = []
@@ -1096,11 +1404,15 @@ class WorkspaceManager:
 
         # Snapshot mode 3-way preview
         manifest = ws.get("snapshot_manifest") or {}
-        baseline: dict[str, str] = dict(manifest.get("files") or {})
         project_root = self._get_workspace_project_root(ws)
+        triignore = _load_triignore(project_root)
+        baseline: dict[str, str] = _filter_snapshot_baseline(
+            dict(manifest.get("files") or {}),
+            triignore=triignore,
+        )
         exclude_env = frozenset(ENV_FILENAMES)
-        ws_files = _scan_snapshot_files(ws_path, exclude_root_files=exclude_env)
-        root_files = _scan_snapshot_files(project_root, exclude_root_files=exclude_env)
+        ws_files = _scan_snapshot_files(ws_path, exclude_root_files=exclude_env, triignore=triignore)
+        root_files = _scan_snapshot_files(project_root, exclude_root_files=exclude_env, triignore=triignore)
 
         all_paths = sorted(set(baseline) | set(ws_files) | set(root_files))
         files_changed: list[str] = []
@@ -1204,10 +1516,12 @@ class WorkspaceManager:
     def _merge_snapshot_gated(self, service: Any, ws: dict[str, Any], root: Path,
                               strategy: str) -> dict[str, Any]:
         source = Path(ws["path"])
-        baseline = ws["snapshot_manifest"]["files"]
+        manifest = ws.get("snapshot_manifest") or {}
+        triignore = _load_triignore(root)
+        baseline = _filter_snapshot_baseline(dict(manifest.get("files") or {}), triignore=triignore)
         excluded = frozenset(ENV_FILENAMES)
-        approved = _scan_snapshot_files(source, exclude_root_files=excluded)
-        before = _scan_snapshot_files(root, exclude_root_files=excluded)
+        approved = _scan_snapshot_files(source, exclude_root_files=excluded, triignore=triignore)
+        before = _scan_snapshot_files(root, exclude_root_files=excluded, triignore=triignore)
         step = service.require_candidate(ws["id"], manifest=approved)
         changes = sorted(p for p in set(baseline) | set(approved)
                          if baseline.get(p) != approved.get(p))
@@ -1260,7 +1574,7 @@ class WorkspaceManager:
                     self._replace_merge_file(staged, target)
                 elif target.exists():
                     target.unlink()
-            if _scan_snapshot_files(root, exclude_root_files=excluded) != desired:
+            if _scan_snapshot_files(root, exclude_root_files=excluded, triignore=triignore) != desired:
                 raise WorkspaceConflictError("Snapshot target differs from approved merge result")
             proof = {"merge_id": merge_id, "mode": "snapshot", "project_root": str(root),
                      "source_manifest": approved, "target_manifest": desired}
@@ -1615,11 +1929,15 @@ class WorkspaceManager:
         # Snapshot mode 3-way merge
         with self._lock:
             manifest = ws.get("snapshot_manifest") or {}
-            baseline: dict[str, str] = dict(manifest.get("files") or {})
             project_root = self._get_workspace_project_root(ws)
+            triignore = _load_triignore(project_root)
+            baseline: dict[str, str] = _filter_snapshot_baseline(
+                dict(manifest.get("files") or {}),
+                triignore=triignore,
+            )
             exclude_env = frozenset(ENV_FILENAMES)
-            ws_files = _scan_snapshot_files(ws_path, exclude_root_files=exclude_env)
-            root_files = _scan_snapshot_files(project_root, exclude_root_files=exclude_env)
+            ws_files = _scan_snapshot_files(ws_path, exclude_root_files=exclude_env, triignore=triignore)
+            root_files = _scan_snapshot_files(project_root, exclude_root_files=exclude_env, triignore=triignore)
 
             all_paths = sorted(set(baseline) | set(ws_files) | set(root_files))
             files_changed: list[str] = []
@@ -1666,6 +1984,7 @@ class WorkspaceManager:
                     shutil.copy2(ws_path / rel_path, target_file)
 
             new_manifest = {
+                **manifest,
                 "project_root": str(project_root),
                 "copy_env": bool(manifest.get("copy_env", True)),
                 "files": ws_files,
@@ -1785,3 +2104,371 @@ class WorkspaceManager:
                 "status": "cleaned",
                 "path": ws["path"],
             }
+
+    def workspace_gc_safety(self, workspace_id: str) -> dict[str, Any]:
+        """Statically inspect whether a non-active workspace is safe for GC reclamation.
+
+        Enforces the same static safety guards as ``workspace_cleanup`` (merged status,
+        +A:0 / ~M:0 / -D:0, and Git merged-commit proof + branch/HEAD invariants)
+        without bypassing ``WorkspaceCleanupGuardError`` boundaries.
+        """
+        ws = self._require_workspace(workspace_id)
+        ws_path = Path(ws["path"])
+        is_reparse = _is_reparse_or_symlink(ws_path)
+        exists = ws_path.exists() or is_reparse
+
+        if ws["status"] == "cleaned":
+            if not exists:
+                return {
+                    "workspace_id": workspace_id,
+                    "mode": ws["mode"],
+                    "status": ws["status"],
+                    "exists": False,
+                    "safe_to_clean": True,
+                    "reason": "Already cleaned",
+                    "added_count": 0,
+                    "modified_count": 0,
+                    "deleted_count": 0,
+                    "added_files": [],
+                    "modified_files": [],
+                    "deleted_files": [],
+                }
+            return {
+                "workspace_id": workspace_id,
+                "mode": ws["mode"],
+                "status": ws["status"],
+                "exists": True,
+                "safe_to_clean": False,
+                "reason": "Workspace status is 'cleaned' in DB, but directory still exists on disk",
+                "added_count": 0,
+                "modified_count": 0,
+                "deleted_count": 0,
+                "added_files": [],
+                "modified_files": [],
+                "deleted_files": [],
+            }
+
+        if is_reparse:
+            return {
+                "workspace_id": workspace_id,
+                "mode": ws["mode"],
+                "status": ws["status"],
+                "exists": True,
+                "safe_to_clean": False,
+                "reason": "Workspace path is a symlink or junction; refusing automatic cleanup",
+                "added_count": 0,
+                "modified_count": 0,
+                "deleted_count": 0,
+                "added_files": [],
+                "modified_files": [],
+                "deleted_files": [],
+            }
+
+        if not exists:
+            if ws["status"] != "merged":
+                return {
+                    "workspace_id": workspace_id,
+                    "mode": ws["mode"],
+                    "status": ws["status"],
+                    "exists": False,
+                    "safe_to_clean": False,
+                    "reason": f"Workspace directory missing on disk and status is {ws['status']!r}, not 'merged'",
+                    "added_count": 0,
+                    "modified_count": 0,
+                    "deleted_count": 0,
+                    "added_files": [],
+                    "modified_files": [],
+                    "deleted_files": [],
+                }
+            if ws["mode"] == "git_clone" and (not ws["merged_commit"] or not ws["merged_target_commit"]):
+                return {
+                    "workspace_id": workspace_id,
+                    "mode": ws["mode"],
+                    "status": ws["status"],
+                    "exists": False,
+                    "safe_to_clean": False,
+                    "reason": "Missing merged commit proof; merge again",
+                    "added_count": 0,
+                    "modified_count": 0,
+                    "deleted_count": 0,
+                    "added_files": [],
+                    "modified_files": [],
+                    "deleted_files": [],
+                }
+            return {
+                "workspace_id": workspace_id,
+                "mode": ws["mode"],
+                "status": ws["status"],
+                "exists": False,
+                "safe_to_clean": True,
+                "reason": "Merged workspace directory already absent on disk",
+                "added_count": 0,
+                "modified_count": 0,
+                "deleted_count": 0,
+                "added_files": [],
+                "modified_files": [],
+                "deleted_files": [],
+            }
+
+        if ws["mode"] == "snapshot":
+            try:
+                status_info = self.workspace_status(workspace_id)
+            except (WorkspaceError, OSError, NotFoundError) as exc:
+                logger.warning("Snapshot GC inspection failed for %s: %s", workspace_id, exc)
+                return {
+                    "workspace_id": workspace_id,
+                    "mode": ws["mode"],
+                    "status": ws["status"],
+                    "exists": True,
+                    "safe_to_clean": False,
+                    "reason": f"Snapshot inspection error: {exc}",
+                    "added_count": 0,
+                    "modified_count": 0,
+                    "deleted_count": 0,
+                    "added_files": [],
+                    "modified_files": [],
+                    "deleted_files": [],
+                }
+            added_files = list(status_info.get("added_files") or [])
+            modified_files = list(status_info.get("modified_files") or [])
+            deleted_files = list(status_info.get("deleted_files") or [])
+            if ws["status"] != "merged":
+                safe = False
+                reason = (
+                    f"Workspace status is {ws['status']!r}, not 'merged' "
+                    f"(+A:{len(added_files)}, ~M:{len(modified_files)})"
+                )
+            elif added_files or modified_files or deleted_files or status_info.get("dirty"):
+                safe = False
+                reason = (
+                    f"Unmerged snapshot changes (+A:{len(added_files)}, "
+                    f"~M:{len(modified_files)}, -D:{len(deleted_files)})"
+                )
+            else:
+                safe = True
+                reason = "Merged snapshot workspace is clean (+A:0, ~M:0)"
+            return {
+                "workspace_id": workspace_id,
+                "mode": ws["mode"],
+                "status": ws["status"],
+                "exists": True,
+                "safe_to_clean": safe,
+                "reason": reason,
+                "added_count": len(added_files),
+                "modified_count": len(modified_files),
+                "deleted_count": len(deleted_files),
+                "added_files": added_files,
+                "modified_files": modified_files,
+                "deleted_files": deleted_files,
+            }
+
+        # git_clone mode
+        is_empty_git_shell = (
+            ws_path.is_dir()
+            and not (ws_path / ".git").exists()
+            and not any(ws_path.iterdir())
+        )
+        if is_empty_git_shell:
+            if ws["status"] != "merged":
+                safe = False
+                reason = f"Workspace status is {ws['status']!r}, not 'merged'"
+            elif not ws["merged_commit"] or not ws["merged_target_commit"]:
+                safe = False
+                reason = "Missing merged commit proof; merge again"
+            else:
+                safe = True
+                reason = "Merged empty git_clone shell is clean (+A:0, ~M:0)"
+            return {
+                "workspace_id": workspace_id,
+                "mode": ws["mode"],
+                "status": ws["status"],
+                "exists": True,
+                "safe_to_clean": safe,
+                "reason": reason,
+                "added_count": 0,
+                "modified_count": 0,
+                "deleted_count": 0,
+                "added_files": [],
+                "modified_files": [],
+                "deleted_files": [],
+            }
+
+        if not (ws_path / ".git").exists():
+            return {
+                "workspace_id": workspace_id,
+                "mode": ws["mode"],
+                "status": ws["status"],
+                "exists": True,
+                "safe_to_clean": False,
+                "reason": "Missing .git metadata in non-empty directory",
+                "added_count": 0,
+                "modified_count": 0,
+                "deleted_count": 0,
+                "added_files": [],
+                "modified_files": [],
+                "deleted_files": [],
+            }
+
+        try:
+            status_info = self.workspace_status(workspace_id)
+            added_set: set[str] = set()
+            modified_set: set[str] = set()
+            deleted_set: set[str] = set()
+
+            for line in status_info.get("porcelain_lines") or []:
+                code = line[:2]
+                entry = line[3:] if len(line) > 3 else line.strip()
+                if " -> " in entry:
+                    entry = entry.split(" -> ", 1)[1]
+                if code == "??" or ("A" in code and "D" not in code):
+                    added_set.add(entry)
+                elif "D" in code:
+                    deleted_set.add(entry)
+                else:
+                    modified_set.add(entry)
+
+            actual_branch = self._current_branch_or_head(ws_path)
+            current_head = _run_git(ws_path, "rev-parse", "HEAD", check=True).stdout.strip()
+            ref_commit = ws["merged_commit"] or ws["base_commit"]
+            if ref_commit and current_head != ref_commit:
+                diff_ns = _run_git(
+                    ws_path,
+                    "-c",
+                    "core.quotepath=false",
+                    "diff",
+                    "--name-status",
+                    f"{ref_commit}..HEAD",
+                )
+                if diff_ns.returncode == 0:
+                    for ln in diff_ns.stdout.splitlines():
+                        if not ln.strip():
+                            continue
+                        parts = ln.split("\t")
+                        st_code = parts[0].strip()
+                        fpath = parts[-1].strip()
+                        if st_code.startswith("A"):
+                            added_set.add(fpath)
+                        elif st_code.startswith("D"):
+                            deleted_set.add(fpath)
+                        else:
+                            modified_set.add(fpath)
+
+            added_files = sorted(added_set)
+            modified_files = sorted(modified_set)
+            deleted_files = sorted(deleted_set)
+
+            if ws["status"] != "merged":
+                safe = False
+                reason = (
+                    f"Workspace status is {ws['status']!r}, not 'merged' "
+                    f"(+A:{len(added_files)}, ~M:{len(modified_files)})"
+                )
+            elif not ws["merged_commit"] or not ws["merged_target_commit"]:
+                safe = False
+                reason = "Missing merged commit proof; merge again"
+            elif actual_branch != ws["branch_name"]:
+                safe = False
+                reason = f"Workspace is on {actual_branch!r}, expected branch {ws['branch_name']!r}"
+            elif current_head != ws["merged_commit"]:
+                safe = False
+                reason = (
+                    f"HEAD {current_head} differs from merged commit {ws['merged_commit']}; "
+                    "merge again"
+                )
+            elif (
+                status_info.get("dirty")
+                or status_info.get("has_uncommitted_changes")
+                or added_files
+                or modified_files
+                or deleted_files
+            ):
+                safe = False
+                reason = (
+                    f"Workspace has unmerged/uncommitted changes (+A:{len(added_files)}, "
+                    f"~M:{len(modified_files)}, -D:{len(deleted_files)})"
+                )
+            else:
+                safe = True
+                reason = "Merged git_clone workspace is clean (+A:0, ~M:0)"
+
+            return {
+                "workspace_id": workspace_id,
+                "mode": ws["mode"],
+                "status": ws["status"],
+                "exists": True,
+                "safe_to_clean": safe,
+                "reason": reason,
+                "added_count": len(added_files),
+                "modified_count": len(modified_files),
+                "deleted_count": len(deleted_files),
+                "added_files": added_files,
+                "modified_files": modified_files,
+                "deleted_files": deleted_files,
+            }
+        except (WorkspaceError, OSError) as exc:
+            logger.warning("Git GC inspection failed for %s: %s", workspace_id, exc)
+            return {
+                "workspace_id": workspace_id,
+                "mode": ws["mode"],
+                "status": ws["status"],
+                "exists": True,
+                "safe_to_clean": False,
+                "reason": f"Git inspection error: {exc}",
+                "added_count": 0,
+                "modified_count": 0,
+                "deleted_count": 0,
+                "added_files": [],
+                "modified_files": [],
+                "deleted_files": [],
+            }
+
+    def workspace_gc_cleanup(self, workspace_id: str) -> dict[str, Any]:
+        """Reclaim a non-active merged workspace after verifying all static cleanup guards."""
+        ws = self._require_workspace(workspace_id)
+        key = os.path.normcase(str(self._get_workspace_project_root(ws).resolve()))
+        with self._project_locks_guard:
+            lock = self._project_locks.setdefault(key, threading.RLock())
+        with lock:
+            with self._lock:
+                ws = self._require_workspace(workspace_id)
+                ws_path = Path(ws["path"])
+                if ws["status"] == "cleaned" and not ws_path.exists() and not _is_reparse_or_symlink(ws_path):
+                    return {
+                        "workspace_id": workspace_id,
+                        "cleaned": True,
+                        "already_cleaned": True,
+                        "status": "cleaned",
+                        "path": ws["path"],
+                    }
+
+                run = self.db.get_run(ws["run_id"])
+                if run is None:
+                    raise NotFoundError(f"Run not found: {ws['run_id']}")
+                if run["status"] not in {"completed", "archived"}:
+                    raise WorkspaceCleanupGuardError(
+                        f"Refusing GC cleanup for workspace {workspace_id}: run status is {run['status']!r}"
+                    )
+
+                safety = self.workspace_gc_safety(workspace_id)
+                if not safety["safe_to_clean"]:
+                    raise WorkspaceCleanupGuardError(
+                        f"Refusing GC cleanup for workspace {workspace_id}: {safety['reason']}"
+                    )
+
+                if ws_path.exists() or _is_reparse_or_symlink(ws_path):
+                    parent = ws_path.parent
+                    _rmtree_safe(ws_path)
+                    if parent.name == WORKSPACES_DIRNAME and parent.exists():
+                        try:
+                            parent.rmdir()
+                        except OSError:
+                            pass
+
+                self.db.update_workspace(workspace_id, status="cleaned")
+                return {
+                    "workspace_id": workspace_id,
+                    "cleaned": True,
+                    "already_cleaned": False,
+                    "status": "cleaned",
+                    "path": ws["path"],
+                }

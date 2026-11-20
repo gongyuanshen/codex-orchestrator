@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
+import math
 import os
 import shutil
 import socket
@@ -26,7 +28,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from orchestrator.board import BoardService
-from orchestrator import __version__, codex_bridge
+from orchestrator import __version__, codex_bridge, gc
 from orchestrator.config import Settings, get_settings
 from orchestrator.db import Database, NotFoundError, SCHEMA_VERSION, VALID_RUN_MODES, require_runtime_schema
 from orchestrator.inbox import InboxConflictError, request_wait
@@ -761,6 +763,42 @@ def _enrich_snapshot_agents(
     return enriched_workers, helper_subagents, session_subagents, model_summary
 
 
+def _publish_gc_events(
+    database: Database, event_bus: EventBus, result: dict[str, Any]
+) -> None:
+    """Broadcast workspace_updated and storage_updated SSE events after actual GC cleanup."""
+    if result.get("dry_run"):
+        return
+    cleaned_workspaces = list(result.get("cleaned_workspaces") or [])
+    cleaned_results = list(result.get("cleaned_results") or [])
+    freed_bytes = int(result.get("freed_bytes") or 0)
+    if not cleaned_workspaces and not cleaned_results and freed_bytes <= 0:
+        return
+    for ws_id in cleaned_workspaces:
+        ws = database.get_workspace(ws_id)
+        if ws is not None:
+            stripped_ws = {
+                k: v
+                for k, v in ws.items()
+                if k not in {"snapshot_manifest", "snapshot_manifest_json"}
+            }
+            event_bus.publish(
+                "workspace_updated",
+                {"run_id": ws["run_id"], "workspace": stripped_ws},
+                run_id=ws["run_id"],
+            )
+    event_bus.publish(
+        "storage_updated",
+        {
+            "freed_bytes": freed_bytes,
+            "cleaned_results": cleaned_results,
+            "cleaned_workspaces": cleaned_workspaces,
+            "report": result.get("report_after"),
+        },
+        run_id=None,
+    )
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -769,6 +807,8 @@ def create_app(
     keepalive_sec: float = 15.0,
     manage_pid_file: bool = False,
     codex_watch_interval_sec: float | None = None,
+    start_gc: bool = True,
+    gc_interval_sec: float | None = None,
 ) -> Starlette:
     """Build the Starlette HTTP/SSE application for tri-orchestrator."""
     cfg = settings or get_settings()
@@ -778,6 +818,11 @@ def create_app(
         if codex_watch_interval_sec is None
         else float(codex_watch_interval_sec)
     )
+    effective_gc_interval = float(
+        cfg.gc_interval_sec if gc_interval_sec is None else gc_interval_sec
+    )
+    if start_gc and (not math.isfinite(effective_gc_interval) or effective_gc_interval <= 0):
+        raise ValueError(f"gc_interval_sec must be > 0, got {effective_gc_interval}")
 
     @asynccontextmanager
     async def lifespan(app: Starlette) -> AsyncIterator[None]:
@@ -842,6 +887,46 @@ def create_app(
         if watch_interval > 0:
             codex_watch_task = asyncio.create_task(_watch_codex_catalog())
 
+        async def _run_gc_loop() -> None:
+            while not shutdown_event.is_set():
+                gc_future = asyncio.ensure_future(
+                    asyncio.to_thread(
+                        gc.run_gc,
+                        database,
+                        workspace_mgr,
+                        cfg,
+                        include_all_completed=False,
+                    )
+                )
+                try:
+                    gc_result = await asyncio.shield(gc_future)
+                except asyncio.CancelledError:
+                    try:
+                        await gc_future
+                    except Exception:
+                        logger.exception("Background GC pass failed during shutdown")
+                    raise
+                except Exception:
+                    logger.exception("Background GC pass failed")
+                else:
+                    try:
+                        _publish_gc_events(database, event_bus, gc_result)
+                    except Exception:
+                        logger.exception("Failed to publish background GC events")
+
+                try:
+                    await asyncio.wait_for(
+                        shutdown_event.wait(), timeout=effective_gc_interval
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    continue
+
+        gc_task: asyncio.Task[None] | None = None
+        if start_gc:
+            gc_task = asyncio.create_task(_run_gc_loop())
+        app.state.gc_task = gc_task
+
         try:
             yield
         finally:
@@ -852,7 +937,7 @@ def create_app(
             # A cancelled short DB read must finish before its connection is closed.
             await asyncio.gather(*waiting, return_exceptions=True)
             watchdog.stop()
-            for bg_task in (watchdog_task, codex_watch_task):
+            for bg_task in (watchdog_task, codex_watch_task, gc_task):
                 if bg_task is not None:
                     bg_task.cancel()
                     try:
@@ -1710,6 +1795,69 @@ def create_app(
             return _map_exception_to_response(exc)
 
     # ------------------------------------------------------------------
+    # Storage Inspection & Safe GC
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_bool_flag(body: dict[str, Any], key: str, default: bool) -> bool:
+        if key not in body or body[key] is None:
+            return default
+        value = body[key]
+        if type(value) is not bool:
+            raise ValueError(f"'{key}' must be a boolean")
+        return value
+
+    async def api_storage(request: Request) -> JSONResponse:
+        state = request.app.state
+        try:
+            report = await asyncio.to_thread(
+                gc.collect_storage_report, state.db, state.settings
+            )
+            return JSONResponse(report)
+        except Exception as exc:
+            return _map_exception_to_response(exc)
+
+    def _run_storage_gc_sync(
+        state: Any,
+        *,
+        clean_results: bool,
+        clean_workspaces: bool,
+        include_all_completed: bool,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        result = gc.run_gc(
+            state.db,
+            state.workspace_mgr,
+            state.settings,
+            clean_results=clean_results,
+            clean_workspaces=clean_workspaces,
+            include_all_completed=include_all_completed,
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            _publish_gc_events(state.db, state.event_bus, result)
+        return result
+
+    async def api_storage_gc(request: Request) -> JSONResponse:
+        try:
+            body = await _parse_json_body(request, allow_empty=True)
+            clean_results = _parse_bool_flag(body, "clean_results", True)
+            clean_workspaces = _parse_bool_flag(body, "clean_workspaces", True)
+            include_all_completed = _parse_bool_flag(body, "include_all_completed", True)
+            dry_run = _parse_bool_flag(body, "dry_run", False)
+            result = await asyncio.to_thread(
+                _run_storage_gc_sync,
+                request.app.state,
+                clean_results=clean_results,
+                clean_workspaces=clean_workspaces,
+                include_all_completed=include_all_completed,
+                dry_run=dry_run,
+            )
+            return JSONResponse(result)
+        except Exception as exc:
+            return _map_exception_to_response(exc)
+
+    # ------------------------------------------------------------------
     # Explicit Forbidden Dangerous Endpoints Guard
     # ------------------------------------------------------------------
 
@@ -1730,6 +1878,8 @@ def create_app(
         Route("/api/health", api_health, methods=["GET"]),
         Route("/api/tools", api_tools, methods=["GET"]),
         Route("/api/rpc", api_rpc, methods=["POST"]),
+        Route("/api/storage", api_storage, methods=["GET"]),
+        Route("/api/storage/gc", api_storage_gc, methods=["POST"]),
         Route("/api/projects", api_projects, methods=["GET"]),
         Route("/api/codex/catalog", api_codex_catalog, methods=["GET"]),
         Route("/api/sessions", api_sessions, methods=["GET"]),
@@ -1754,6 +1904,35 @@ def create_app(
     ]
 
     return Starlette(debug=False, routes=routes, lifespan=lifespan)
+
+
+def _run_gc_cli(
+    cfg: Settings,
+    *,
+    dry_run: bool,
+    include_all_completed: bool,
+) -> dict[str, Any]:
+    """Execute one-shot safe garbage collection on cfg.data_dir (offline or online WAL)."""
+    if dry_run and not cfg.db_path.exists():
+        return gc._empty_dry_run_without_db(cfg)
+    require_runtime_schema(cfg.db_path)
+    has_existing_schema = False
+    if cfg.db_path.exists():
+        with codex_bridge.readonly_snapshot(cfg.db_path) as conn:
+            has_existing_schema = bool(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+                ).fetchone()
+            )
+    with Database(cfg.db_path, settings=cfg, init_schema=not has_existing_schema) as db:
+        ws_mgr = WorkspaceManager(db, cfg)
+        return gc.run_gc(
+            db,
+            ws_mgr,
+            cfg,
+            include_all_completed=include_all_completed,
+            dry_run=dry_run,
+        )
 
 
 def run_daemon(settings: Settings | None = None) -> None:
@@ -1787,18 +1966,40 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default=None, help="Bind host (default TRI_ORCH_HOST or 127.0.0.1)")
     parser.add_argument("--port", type=int, default=None, help="Bind port (default TRI_ORCH_PORT or 18790)")
     parser.add_argument("--data-dir", default=None, help="Runtime data directory override")
+    parser.add_argument(
+        "--gc",
+        action="store_true",
+        help="Run safe garbage collection once against cfg.data_dir, print JSON report, and exit",
+    )
+    parser.add_argument(
+        "--gc-dry-run",
+        action="store_true",
+        help="Preview GC deletions without deleting files or updating state.db (requires --gc)",
+    )
+    parser.add_argument(
+        "--gc-all-completed",
+        action="store_true",
+        help="Include clean merged workspaces from completed/archived runs regardless of retention age (requires --gc)",
+    )
     args = parser.parse_args(argv)
+    if not args.gc and (args.gc_dry_run or args.gc_all_completed):
+        parser.error("--gc-dry-run and --gc-all-completed require --gc")
 
     cfg = get_settings(data_dir=args.data_dir)
     if args.host is not None or args.port is not None:
-        cfg = Settings(
+        cfg = dataclasses.replace(
+            cfg,
             host=args.host if args.host is not None else cfg.host,
             port=args.port if args.port is not None else cfg.port,
-            data_dir=cfg.data_dir,
-            stall_sec=cfg.stall_sec,
-            watchdog_interval_sec=cfg.watchdog_interval_sec,
-            port_range=cfg.port_range,
         )
+    if args.gc:
+        report = _run_gc_cli(
+            cfg,
+            dry_run=bool(args.gc_dry_run),
+            include_all_completed=bool(args.gc_all_completed),
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return 0
     run_daemon(cfg)
     return 0
 

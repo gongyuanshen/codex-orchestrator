@@ -644,7 +644,7 @@ def _deliver_tool_result(
 
     text_pretty = json.dumps(payload, ensure_ascii=False, indent=2)
     encoded = text_pretty.encode("utf-8")
-    directory = (settings.data_dir / "results").resolve()
+    directory = settings.results_dir.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{uuid.uuid4().hex}.json"
     temporary = path.with_suffix(".json.tmp")
@@ -653,13 +653,29 @@ def _deliver_tool_result(
         output.flush()
         os.fsync(output.fileno())
     os.replace(temporary, path)
-    # Prune stale overflow files older than 24h, keeping latest 50.
+    # Prune stale overflow files beyond result_ttl_sec or keeping latest result_max_files.
     try:
-        result_files = sorted(directory.glob("*.json"), key=lambda p: p.stat().st_mtime)
-        cutoff = time.time() - 86400
+        entries: list[tuple[Path, float, bool]] = []
+        with os.scandir(directory) as it:
+            for entry in it:
+                if entry.name.endswith(".json") and entry.is_file(follow_symlinks=False):
+                    try:
+                        st = entry.stat(follow_symlinks=False)
+                        candidate = Path(entry.path)
+                        entries.append((candidate, float(st.st_mtime), candidate.name == path.name))
+                    except OSError:
+                        continue
+        entries.sort(key=lambda item: (item[1], item[2], item[0].name))
+        now = time.time()
+        ttl_sec = int(settings.result_ttl_sec)
+        max_files = int(settings.result_max_files)
         kept = 0
-        for rf in reversed(result_files):
-            if kept >= 50 or rf.stat().st_mtime < cutoff:
+        for rf, rf_mtime, is_current in reversed(entries):
+            if is_current:
+                # Never prune the just-written result file before returning its path.
+                kept += 1
+                continue
+            if kept >= max_files or (now - rf_mtime) >= ttl_sec:
                 try:
                     rf.unlink(missing_ok=True)
                 except OSError:

@@ -175,6 +175,17 @@
     graphShowHelpers: true,
     graphSelectedNode: null,
     graphHoverNode: null,
+
+    storageModalOpen: false,
+    storageReport: null,
+    storageLoading: false,
+    storageLoadError: '',
+    storageRequestVersion: 0,
+    storageRefreshQueued: false,
+    storageGcBusy: false,
+    storageGcResult: null,
+    storageGcError: '',
+    storageReturnFocus: null,
   };
 
   const el = {
@@ -283,6 +294,17 @@
     refreshDiffBtn: document.getElementById('refreshDiffBtn'),
     closeDrawerBtn: document.getElementById('closeDrawerBtn'),
     inspectorBody: document.getElementById('inspectorBody'),
+
+    storageManageBtn: document.getElementById('storageManageBtn'),
+    storageManageBadge: document.getElementById('storageManageBadge'),
+    storageModalBackdrop: document.getElementById('storageModalBackdrop'),
+    storageModalDialog: document.getElementById('storageModalDialog'),
+    storageModalTitle: document.getElementById('storageModalTitle'),
+    storageTotalPill: document.getElementById('storageTotalPill'),
+    storageRefreshBtn: document.getElementById('storageRefreshBtn'),
+    storageCloseBtn: document.getElementById('storageCloseBtn'),
+    storageModalBody: document.getElementById('storageModalBody'),
+    storageGcBtn: document.getElementById('storageGcBtn'),
 
     toastContainer: document.getElementById('toastContainer'),
   };
@@ -519,6 +541,38 @@
     if (!id) return '';
     const s = String(id);
     return s.length > 12 ? s.slice(0, 8) : s;
+  }
+
+  const STORAGE_CATEGORY_META = {
+    cleanable: { label: '可安全清理', tone: 'tint-success', order: 1 },
+    dirty_review: { label: '含未合入变更待核查', tone: 'tint-warning', order: 0 },
+    active: { label: '进行中', tone: 'tint-primary', order: 2 },
+  };
+
+  function formatBytes(rawBytes) {
+    const num = Number(rawBytes);
+    if (!Number.isFinite(num) || num < 0) return '—';
+    if (num < 1024) return `${Math.round(num)} B`;
+    if (num < 1024 * 1024) return `${(num / 1024).toFixed(1)} KB`;
+    if (num < 1024 * 1024 * 1024) return `${(num / (1024 * 1024)).toFixed(2)} MB`;
+    return `${(num / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  }
+
+  function formatBytesDetailed(rawBytes) {
+    const num = Number(rawBytes);
+    if (!Number.isFinite(num) || num < 0) return '—';
+    const human = formatBytes(num);
+    if (num < 1024) return human;
+    return `${human}（${Math.round(num).toLocaleString('zh-CN')} B）`;
+  }
+
+  function getStorageCategoryMeta(category) {
+    const key = String(category || '').toLowerCase();
+    return STORAGE_CATEGORY_META[key] || {
+      label: category ? String(category) : '未知状态',
+      tone: 'tint-muted',
+      order: 3,
+    };
   }
 
   function normalizeChannel(ch) {
@@ -1824,6 +1878,24 @@
       if (refreshCatalog && ['run_updated', 'session_updated', 'workspace_updated', 'codex_catalog_updated'].includes(eventType)) {
         void refreshCatalog();
       }
+      if (eventType === 'storage_updated') {
+        const parsedStorage = safeJsonParse(rawData, null);
+        const storageData = parsedStorage && typeof parsedStorage === 'object'
+          ? (parsedStorage.data && typeof parsedStorage.data === 'object' ? parsedStorage.data : parsedStorage)
+          : null;
+        if (storageData?.report && typeof storageData.report === 'object') {
+          state.storageReport = storageData.report;
+          state.storageLoadError = '';
+          renderStorageBadge();
+          if (state.storageModalOpen) renderStorageModal();
+        } else {
+          void loadStorageReport({ silent: true });
+        }
+        return;
+      }
+      if (eventType === 'workspace_updated' && state.storageModalOpen) {
+        void loadStorageReport({ silent: true });
+      }
       const runId = currentRunId();
       if (!runId) return;
       const payload = safeJsonParse(rawData, null);
@@ -1873,6 +1945,7 @@
       'worker_updated',
       'worker_control_updated',
       'workspace_updated',
+      'storage_updated',
       'run_updated',
       'session_updated',
       'codex_catalog_updated',
@@ -5285,6 +5358,349 @@
     }
   }
 
+  // ---------- 存储与清理管理面板 ----------
+
+  function renderStorageBadge() {
+    if (!el.storageManageBtn || !el.storageManageBadge) return;
+    const report = state.storageReport;
+    if (!report || typeof report !== 'object') {
+      el.storageManageBadge.textContent = '';
+      el.storageManageBadge.classList.add('hidden');
+      el.storageManageBtn.classList.remove('has-cleanable', 'has-dirty', 'is-highlighted');
+      el.storageManageBtn.title = '查看运行时存储占用并清理安全缓存与已合入工作区';
+      return;
+    }
+
+    const totalBytes = Number(report.total_bytes ?? 0);
+    const ws = report.workspaces || {};
+    const cleanableBytes = Number(ws.cleanable_bytes ?? 0);
+    const cleanableCount = Number(ws.cleanable_count ?? 0);
+    const dirtyCount = Number(ws.dirty_review_count ?? 0);
+    const hasCleanable = cleanableBytes > 0 || cleanableCount > 0;
+    const hasDirty = dirtyCount > 0;
+    const highlighted = hasCleanable || hasDirty;
+
+    el.storageManageBtn.classList.toggle('has-cleanable', hasCleanable && !hasDirty);
+    el.storageManageBtn.classList.toggle('has-dirty', hasDirty);
+    el.storageManageBtn.classList.toggle('is-highlighted', highlighted);
+
+    let badgeText = formatBytes(totalBytes);
+    if (hasDirty && hasCleanable) {
+      badgeText = `${formatBytes(cleanableBytes)} · ${dirtyCount} 待核查`;
+    } else if (hasDirty) {
+      badgeText = `${formatBytes(totalBytes)} · ${dirtyCount} 待核查`;
+    } else if (hasCleanable) {
+      badgeText = `可清 ${formatBytes(cleanableBytes)}`;
+    }
+
+    el.storageManageBadge.textContent = badgeText;
+    el.storageManageBadge.className = `storage-btn-badge tabular${hasDirty ? ' is-dirty' : hasCleanable ? ' is-cleanable' : ''}`;
+    el.storageManageBadge.classList.remove('hidden');
+
+    const titleParts = [
+      `总占用 ${formatBytes(totalBytes)}`,
+      hasCleanable ? `可安全清理 ${formatBytes(cleanableBytes)}（${cleanableCount} 个工作区）` : '暂无可清理工作区',
+      hasDirty ? `含未合入变更待核查 ${dirtyCount} 个` : '',
+    ].filter(Boolean);
+    el.storageManageBtn.title = titleParts.join(' · ');
+  }
+
+  function renderStorageModal() {
+    renderStorageBadge();
+    if (!el.storageModalBody) return;
+
+    const report = state.storageReport;
+    if (el.storageTotalPill) {
+      if (report && typeof report === 'object') {
+        el.storageTotalPill.textContent = `总占用 ${formatBytes(report.total_bytes ?? 0)}`;
+        el.storageTotalPill.classList.remove('hidden');
+      } else {
+        el.storageTotalPill.textContent = '';
+        el.storageTotalPill.classList.add('hidden');
+      }
+    }
+
+    if (el.storageRefreshBtn) {
+      el.storageRefreshBtn.disabled = state.storageLoading || state.storageGcBusy;
+      el.storageRefreshBtn.textContent = state.storageLoading ? '刷新中...' : '刷新';
+    }
+
+    if (el.storageGcBtn) {
+      el.storageGcBtn.disabled = state.storageLoading || state.storageGcBusy || !report;
+      el.storageGcBtn.textContent = state.storageGcBusy ? '清理中...' : '立即清理安全缓存与已合入工作区';
+    }
+
+    if (state.storageLoading && !report) {
+      el.storageModalBody.innerHTML = '<div class="empty-state">正在扫描运行时数据目录与隔离工作区占用…</div>';
+      return;
+    }
+
+    const banners = [];
+    if (state.storageLoadError) {
+      banners.push(`
+        <div class="banner banner-danger" role="alert">
+          <div class="banner-header"><span>获取存储占用失败</span></div>
+          <div>${escapeHtml(state.storageLoadError)}</div>
+        </div>
+      `);
+    }
+    if (state.storageGcError) {
+      banners.push(`
+        <div class="banner banner-danger" role="alert">
+          <div class="banner-header"><span>执行安全清理失败</span></div>
+          <div>${escapeHtml(state.storageGcError)}</div>
+        </div>
+      `);
+    }
+    if (state.storageGcResult) {
+      const res = state.storageGcResult;
+      const freed = Number(res.freed_bytes ?? 0);
+      const cleanedResults = Array.isArray(res.cleaned_results) ? res.cleaned_results.length : 0;
+      const cleanedWs = Array.isArray(res.cleaned_workspaces) ? res.cleaned_workspaces.length : 0;
+      const skippedDirty = Array.isArray(res.skipped_dirty_workspaces) ? res.skipped_dirty_workspaces : [];
+      const variant = skippedDirty.length > 0 ? 'warning' : 'success';
+      const summaryParts = [
+        `已清理结果缓存 ${cleanedResults} 项`,
+        `已清理安全工作区 ${cleanedWs} 个`,
+        skippedDirty.length > 0 ? `已跳过含未合入变更工作区 ${skippedDirty.length} 个（保留磁盘文件待核查）` : '',
+      ].filter(Boolean);
+      banners.push(`
+        <div class="banner banner-${variant}" role="status">
+          <div class="banner-header">
+            <span>本次清理已释放 ${escapeHtml(formatBytesDetailed(freed))}</span>
+            <button type="button" class="btn btn-ghost btn-xs" data-storage-action="dismiss-gc-banner">关闭</button>
+          </div>
+          <div>${escapeHtml(summaryParts.join(' · '))}</div>
+        </div>
+      `);
+    }
+
+    if (!report || typeof report !== 'object') {
+      el.storageModalBody.innerHTML = banners.join('') || '<div class="empty-state">暂未获取到存储占用报告，请点击“刷新”重试。</div>';
+      return;
+    }
+
+    const runtime = report.runtime || {};
+    const wsSummary = report.workspaces || {};
+    const rawItems = Array.isArray(wsSummary.items) ? wsSummary.items : [];
+    const items = [...rawItems].sort((a, b) => {
+      const oa = getStorageCategoryMeta(a.category).order;
+      const ob = getStorageCategoryMeta(b.category).order;
+      if (oa !== ob) return oa - ob;
+      return Number(b.bytes ?? 0) - Number(a.bytes ?? 0);
+    });
+
+    const dataDir = report.data_dir || '';
+    const runtimeHtml = `
+      <section class="storage-section" aria-label="运行时数据目录占用">
+        <div class="storage-section-head">
+          <div class="storage-section-title-group">
+            <h3 class="storage-section-title">运行时数据目录（data_dir）</h3>
+            ${dataDir ? `<code class="storage-path-inline mono" title="${escapeHtml(dataDir)}">${escapeHtml(dataDir)}</code>` : ''}
+            ${dataDir ? `<button type="button" class="btn btn-ghost btn-xs" data-storage-action="copy-path" data-path="${escapeHtml(dataDir)}">复制</button>` : ''}
+          </div>
+          <span class="pill-badge tint-muted tabular">总计 ${escapeHtml(formatBytes(runtime.total_bytes ?? 0))}</span>
+        </div>
+        <div class="storage-metrics-grid">
+          <div class="storage-metric-card">
+            <div class="storage-metric-label">SQLite 状态库（state.db）</div>
+            <div class="storage-metric-value mono tabular">${escapeHtml(formatBytes(runtime.state_db_bytes ?? 0))}</div>
+            <div class="storage-metric-sub">任务、成员与消息板元数据</div>
+          </div>
+          <div class="storage-metric-card">
+            <div class="storage-metric-label">大结果缓存（results/）</div>
+            <div class="storage-metric-value mono tabular">${escapeHtml(formatBytes(runtime.results_bytes ?? 0))}</div>
+            <div class="storage-metric-sub tabular">${escapeHtml(String(runtime.results_count ?? 0))} 个缓存文件</div>
+          </div>
+          <div class="storage-metric-card">
+            <div class="storage-metric-label">运行日志（logs/）</div>
+            <div class="storage-metric-value mono tabular">${escapeHtml(formatBytes(runtime.logs_bytes ?? 0))}</div>
+            <div class="storage-metric-sub">守护进程与子任务日志</div>
+          </div>
+          <div class="storage-metric-card">
+            <div class="storage-metric-label">验收回执（receipts/）</div>
+            <div class="storage-metric-value mono tabular">${escapeHtml(formatBytes(runtime.receipts_bytes ?? 0))}</div>
+            <div class="storage-metric-sub">工作流验收与归档记录</div>
+          </div>
+        </div>
+      </section>
+    `;
+
+    const wsItemsHtml = items.length === 0
+      ? '<div class="empty-state">当前无磁盘残留的隔离工作区目录。</div>'
+      : `<div class="storage-ws-list" role="list">
+          ${items.map((item) => {
+            const cat = String(item.category || '').toLowerCase();
+            const catMeta = getStorageCategoryMeta(cat);
+            const added = Number(item.added_count ?? 0);
+            const modified = Number(item.modified_count ?? 0);
+            const exists = item.exists !== false;
+            const workerLabel = item.worker_name ? `@${normalizeHandle(item.worker_name)}` : '未命名成员';
+            const modeLabel = labelWsMode(item.mode);
+            const wsStatusLabel = labelWsStatus(item.status);
+            const runStatusLabel = labelRunStatus(item.run_status);
+            const isDirty = cat === 'dirty_review';
+            const changeBadges = (isDirty || added > 0 || modified > 0)
+              ? `<span class="chip-tag ${isDirty ? 'tint-warning' : 'tint-muted'} mono tabular">新增 ${escapeHtml(String(added))} · 修改 ${escapeHtml(String(modified))}</span>`
+              : '';
+
+            return `
+              <article class="storage-ws-item ${isDirty ? 'is-dirty-review' : ''}" role="listitem" data-workspace-id="${escapeHtml(item.workspace_id || '')}" data-category="${escapeHtml(cat)}">
+                <div class="storage-ws-row-top">
+                  <div class="storage-ws-badges">
+                    <span class="pill-badge ${catMeta.tone}">${escapeHtml(catMeta.label)}</span>
+                    <span class="storage-ws-worker mono">${escapeHtml(workerLabel)}</span>
+                    <span class="chip-tag tint-muted">${escapeHtml(modeLabel)}</span>
+                    <span class="chip-tag ${getWsStatusTone(item.status)}">${escapeHtml(wsStatusLabel)}</span>
+                    ${changeBadges}
+                    ${!exists ? '<span class="chip-tag tint-muted">目录已不存在</span>' : ''}
+                  </div>
+                  <div class="storage-ws-size mono tabular">${escapeHtml(formatBytes(item.bytes ?? 0))}</div>
+                </div>
+                <div class="storage-ws-path-row">
+                  <span class="storage-ws-path mono" title="${escapeHtml(item.path || '')}">${escapeHtml(item.path || '—')}</span>
+                  ${item.path ? `<button type="button" class="btn btn-ghost btn-xs" data-storage-action="copy-path" data-path="${escapeHtml(item.path)}">复制路径</button>` : ''}
+                </div>
+                <div class="storage-ws-meta">
+                  <span class="mono">run ${escapeHtml(shortId(item.run_id || ''))}（${escapeHtml(runStatusLabel)}）</span>
+                  ${item.reason ? `<span>${escapeHtml(item.reason)}</span>` : ''}
+                  ${isDirty ? '<span class="storage-dirty-note">含未合入改动，不自动删除，请先核查并合入或手工处理</span>' : ''}
+                </div>
+              </article>
+            `;
+          }).join('')}
+        </div>`;
+
+    const workspacesHtml = `
+      <section class="storage-section" aria-label="隔离工作区占用">
+        <div class="storage-section-head">
+          <div class="storage-section-title-group">
+            <h3 class="storage-section-title">隔离工作区（.swarm-workspaces）</h3>
+            <span class="pill-badge tint-success tabular">可安全清理 ${escapeHtml(String(wsSummary.cleanable_count ?? 0))}（${escapeHtml(formatBytes(wsSummary.cleanable_bytes ?? 0))}）</span>
+            <span class="pill-badge ${Number(wsSummary.dirty_review_count ?? 0) > 0 ? 'tint-warning' : 'tint-muted'} tabular">待核查 ${escapeHtml(String(wsSummary.dirty_review_count ?? 0))}</span>
+            <span class="pill-badge tint-primary tabular">进行中 ${escapeHtml(String(wsSummary.active_count ?? 0))}</span>
+          </div>
+          <span class="pill-badge tint-muted tabular">总计 ${escapeHtml(formatBytes(wsSummary.total_bytes ?? 0))}</span>
+        </div>
+        ${wsItemsHtml}
+      </section>
+    `;
+
+    el.storageModalBody.innerHTML = `${banners.join('')}${runtimeHtml}${workspacesHtml}`;
+  }
+
+  async function loadStorageReport(opts = {}) {
+    if (state.storageLoading) {
+      state.storageRefreshQueued = true;
+      return state.storageReport;
+    }
+    const reqVersion = ++state.storageRequestVersion;
+    state.storageLoading = true;
+    if (!opts.silent) {
+      state.storageLoadError = '';
+    }
+    if (state.storageModalOpen) {
+      renderStorageModal();
+    }
+    try {
+      const data = await apiRequest('/api/storage');
+      if (reqVersion !== state.storageRequestVersion) return null;
+      if (data && typeof data === 'object') {
+        state.storageReport = data;
+        state.storageLoadError = '';
+      }
+      return data;
+    } catch (err) {
+      if (reqVersion !== state.storageRequestVersion) return null;
+      if (!opts.silent || state.storageModalOpen) {
+        state.storageLoadError = err.message;
+      }
+      return null;
+    } finally {
+      state.storageLoading = false;
+      renderStorageBadge();
+      if (state.storageModalOpen) {
+        renderStorageModal();
+      }
+      if (state.storageRefreshQueued) {
+        state.storageRefreshQueued = false;
+        void loadStorageReport({ silent: true });
+      }
+    }
+  }
+
+  async function runStorageGc() {
+    if (state.storageGcBusy || state.storageLoading) return null;
+    state.storageGcBusy = true;
+    state.storageGcError = '';
+    if (state.storageModalOpen) {
+      renderStorageModal();
+    }
+    try {
+      const resp = await apiRequest('/api/storage/gc', {
+        method: 'POST',
+        body: JSON.stringify({
+          clean_results: true,
+          clean_workspaces: true,
+          include_all_completed: true,
+          dry_run: false,
+        }),
+      });
+      state.storageGcResult = resp;
+      if (resp && resp.report_after && typeof resp.report_after === 'object') {
+        state.storageReport = resp.report_after;
+        state.storageLoadError = '';
+      } else {
+        await loadStorageReport({ silent: false });
+      }
+      const freed = Number(resp?.freed_bytes ?? 0);
+      showToast('存储清理完成', `本次已释放 ${formatBytesDetailed(freed)}`, 'success', 4500);
+      return resp;
+    } catch (err) {
+      state.storageGcError = err.message;
+      showToast('存储清理失败', err.message, 'error', 6000);
+      return null;
+    } finally {
+      state.storageGcBusy = false;
+      renderStorageBadge();
+      if (state.storageModalOpen) {
+        renderStorageModal();
+      }
+    }
+  }
+
+  function openStorageModal() {
+    setProjectPopoverOpen(false);
+    closeExportMenu(false);
+    if (state.cmdPaletteOpen) closeCommandPalette(false);
+    if (!state.storageModalOpen) {
+      state.storageReturnFocus = document.activeElement;
+    }
+    state.storageModalOpen = true;
+    state.storageLoadError = '';
+    el.storageManageBtn?.setAttribute('aria-expanded', 'true');
+    el.storageManageBtn?.classList.add('active');
+    el.storageModalBackdrop?.setAttribute('aria-hidden', 'false');
+    el.storageModalBackdrop?.classList.remove('hidden');
+    renderStorageModal();
+    el.storageModalTitle?.focus();
+    void loadStorageReport();
+  }
+
+  function closeStorageModal(returnFocus = true) {
+    if (!state.storageModalOpen) return;
+    state.storageModalOpen = false;
+    el.storageManageBtn?.setAttribute('aria-expanded', 'false');
+    el.storageManageBtn?.classList.remove('active');
+    el.storageModalBackdrop?.setAttribute('aria-hidden', 'true');
+    el.storageModalBackdrop?.classList.add('hidden');
+    if (returnFocus) {
+      const target = state.storageReturnFocus?.isConnected ? state.storageReturnFocus : el.storageManageBtn;
+      target?.focus();
+    }
+    state.storageReturnFocus = null;
+  }
+
   // ---------- 事件绑定 ----------
 
   function bindEvents() {
@@ -5483,7 +5899,41 @@
 
     el.refreshSnapshotBtn.addEventListener('click', async () => {
       checkHealth();
+      void loadStorageReport({ silent: true });
       await loadProjects();
+    });
+
+    el.storageManageBtn?.addEventListener('click', () => {
+      if (state.storageModalOpen) closeStorageModal(true);
+      else openStorageModal();
+    });
+    el.storageCloseBtn?.addEventListener('click', () => closeStorageModal(true));
+    el.storageModalBackdrop?.addEventListener('click', (evt) => {
+      if (evt.target === el.storageModalBackdrop) closeStorageModal(true);
+    });
+    el.storageRefreshBtn?.addEventListener('click', async () => {
+      await loadStorageReport();
+    });
+    el.storageGcBtn?.addEventListener('click', async () => {
+      await runStorageGc();
+    });
+    el.storageModalBody?.addEventListener('click', async (evt) => {
+      const btn = evt.target.closest('[data-storage-action]');
+      if (!btn) return;
+      const action = btn.getAttribute('data-storage-action');
+      if (action === 'copy-path') {
+        const p = btn.getAttribute('data-path') || '';
+        try {
+          await navigator.clipboard.writeText(p);
+          showToast('路径已复制', p, 'success', 2000);
+        } catch {
+          showToast('复制失败', p, 'warning', 3000);
+        }
+      } else if (action === 'dismiss-gc-banner') {
+        state.storageGcResult = null;
+        state.storageGcError = '';
+        renderStorageModal();
+      }
     });
 
     el.exportMenuBtn.addEventListener('click', (evt) => {
@@ -5538,6 +5988,9 @@
         if (state.cmdPaletteOpen) {
           evt.preventDefault();
           closeCommandPalette(true);
+        } else if (state.storageModalOpen) {
+          evt.preventDefault();
+          closeStorageModal(true);
         } else if (state.projectPopoverOpen) {
           evt.preventDefault();
           setProjectPopoverOpen(false);
@@ -5548,6 +6001,14 @@
         } else if (state.inspectorOpen) {
           evt.preventDefault();
           setInspectorOpen(false);
+        }
+      } else if (evt.key === 'Tab' && state.storageModalOpen && el.storageModalDialog) {
+        const items = Array.from(el.storageModalDialog.querySelectorAll('button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'))
+          .filter((item) => !item.closest('.hidden') && item.getClientRects().length > 0);
+        if (items.length > 0) {
+          const index = items.indexOf(document.activeElement);
+          evt.preventDefault();
+          items[index < 0 ? (evt.shiftKey ? items.length - 1 : 0) : (index + (evt.shiftKey ? -1 : 1) + items.length) % items.length].focus();
         }
       } else if (evt.key === 'Tab' && state.inspectorOpen && window.innerWidth <= 1080) {
         const items = Array.from(el.inspectorDrawer.querySelectorAll('button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'))
@@ -5778,6 +6239,7 @@
       showToast('加载项目列表失败', err.message, 'error');
     }
     connectGlobalEvents();
+    void loadStorageReport({ silent: true });
 
     setInterval(checkHealth, HEALTH_POLL_MS);
     setInterval(tickHeartbeats, HEARTBEAT_TICK_MS);

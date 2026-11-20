@@ -95,3 +95,8 @@ Investigate only substantive unknowns, post `route_decision` (`msg_type="info"`)
 - **Boost**: execute -> capture candidate -> independent challenge -> candidate verify -> original-author repair on FAIL -> same-verifier re-verify -> separate integrated gate.
 - **Teamwork & Handoff**: each milestone step requires predecessor integrated PASS and confirmed handoff (`action="handoff"`, `recipient_agent_id=next_coordinator_agent_id` -> `action="ack_handoff"` with `handoff_digest`) before dependent admission; root retains child lifecycle ownership.
 - **Swarm**: `inbox_send` kinds `task/rework/review/result` bind `step_id` and recipient; at most one `inbox_wait` (`20000ms..25000ms`) per worker turn, and verify real native state before waking idle children.
+
+## Storage transparency & closeout reporting
+
+- **Snapshot size & `.triignore`**: When provisioning `create_workspace=True` on non-Git roots (`mode="snapshot"`), watch `TRI_ORCH_MAX_SNAPSHOT_MB` (default `500` MB) and exclude large/generated trees via `.triignore` alongside built-in exclusions.
+- **Mandatory closeout & user disclosure**: On completion, execute `workflow_closeout_run` / `workspace_cleanup` on merged workspaces, and explicitly report in the final user response whether isolated workspaces were cleaned and whether any unmerged/dirty leftovers remain.
