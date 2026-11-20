@@ -10,7 +10,9 @@ param(
     [string]$CodexHome = "",
     [switch]$SkipUvSync,
     [switch]$SkipPluginInstall,
-    [switch]$TrustPluginHooks
+    [switch]$TrustPluginHooks,
+    [ValidateRange(0, 10000)]
+    [int]$KeepBackups = 3
 )
 
 Set-StrictMode -Version Latest
@@ -536,16 +538,22 @@ try {
     Remove-Item -Path $stageDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Ensure CodexHome & backup directories exist
+# Ensure CodexHome & backup directories exist (back up only config.toml + role TOMLs; never copy .venv into backups)
 New-Item -ItemType Directory -Path $CodexHome -Force | Out-Null
 $agentsDstDir = Join-Path $CodexHome "agents"
 New-Item -ItemType Directory -Path $agentsDstDir -Force | Out-Null
 
+$backupsRoot = Join-Path $CodexHome "backups"
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$backupDir = Join-Path $CodexHome "backups\tri-orchestrator-$timestamp"
+$backupDir = Join-Path $backupsRoot "tri-orchestrator-$timestamp"
+$suffixIdx = 1
+while (Test-Path $backupDir) {
+    $backupDir = Join-Path $backupsRoot ("tri-orchestrator-{0}-{1:D2}" -f $timestamp, $suffixIdx)
+    $suffixIdx++
+}
 New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 
-$baselineDir = Join-Path $CodexHome "backups\tri-orchestrator-baseline"
+$baselineDir = Join-Path $backupsRoot "tri-orchestrator-baseline"
 $baselineExists = Test-Path $baselineDir
 if (-not $baselineExists) {
     New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null
@@ -606,6 +614,86 @@ $manifestObj = [ordered]@{
     agents_meta      = $updated.Meta
 }
 Write-Utf8NoBom -Path (Join-Path $backupDir "manifest.json") -Content (($manifestObj | ConvertTo-Json -Depth 6) + "`n")
+
+$pruneBackupsPy = @'
+import os, pathlib, stat, sys
+
+backups_root = pathlib.Path(sys.argv[1])
+keep_count = max(0, int(sys.argv[2]))
+
+def is_reparse_or_symlink(p: pathlib.Path) -> bool:
+    try:
+        if p.is_symlink():
+            return True
+        if hasattr(p, "is_junction") and p.is_junction():
+            return True
+        st = os.lstat(p)
+        attrs = getattr(st, "st_file_attributes", 0)
+        return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    except OSError:
+        return False
+
+def rmtree_safe(root: pathlib.Path) -> None:
+    if is_reparse_or_symlink(root):
+        try:
+            os.rmdir(root)
+        except OSError:
+            root.unlink(missing_ok=True)
+        return
+    with os.scandir(root) as it:
+        for entry in it:
+            ep = pathlib.Path(entry.path)
+            if is_reparse_or_symlink(ep):
+                try:
+                    os.rmdir(ep)
+                except OSError:
+                    ep.unlink(missing_ok=True)
+            elif entry.is_dir(follow_symlinks=False):
+                rmtree_safe(ep)
+            else:
+                try:
+                    ep.unlink()
+                except PermissionError:
+                    os.chmod(ep, stat.S_IWRITE | stat.S_IREAD)
+                    ep.unlink()
+    try:
+        os.rmdir(root)
+    except PermissionError:
+        os.chmod(root, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        os.rmdir(root)
+
+if not backups_root.is_dir():
+    sys.exit(0)
+
+candidates = []
+for entry in backups_root.iterdir():
+    name = entry.name
+    if name == "tri-orchestrator-baseline":
+        continue
+    if not name.startswith("tri-orchestrator-2"):
+        continue
+    if is_reparse_or_symlink(entry):
+        continue
+    if entry.is_dir():
+        candidates.append(entry)
+
+candidates.sort(key=lambda p: p.name, reverse=True)
+pruned = []
+for old_dir in candidates[keep_count:]:
+    rmtree_safe(old_dir)
+    pruned.append(old_dir.name)
+
+if pruned:
+    print(f"[install] Pruned {len(pruned)} old backup(s) under {backups_root} (kept baseline + latest {keep_count}): {', '.join(pruned)}")
+'@
+
+$pruneRes = Invoke-PythonInline -PyRunner $pyRunner -Code $pruneBackupsPy -ScriptArgs @($backupsRoot, [string]$KeepBackups)
+if ($pruneRes.ExitCode -ne 0) {
+    throw "Failed to prune old config backups under ${backupsRoot}: $($pruneRes.StdErr) $($pruneRes.StdOut)"
+}
+if (-not [string]::IsNullOrWhiteSpace($pruneRes.StdOut)) {
+    Write-Host ($pruneRes.StdOut.TrimEnd())
+}
 
 $cachedPluginDir = ""
 

@@ -16,6 +16,7 @@ import re
 import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import time
@@ -35,6 +36,134 @@ def write_json(path: Path, value: dict) -> None:
         json.dump(value, output, ensure_ascii=False, indent=2)
         output.flush()
         os.fsync(output.fileno())
+
+
+def _write_json_replace(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".upgrade-" + uuid.uuid4().hex + ".tmp")
+    try:
+        with temp.open("x", encoding="utf-8") as output:
+            json.dump(value, output, ensure_ascii=False, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _is_reparse_or_symlink(path: Path) -> bool:
+    try:
+        if path.is_symlink():
+            return True
+        if hasattr(path, "is_junction") and path.is_junction():
+            return True
+        st = os.lstat(path)
+        attrs = getattr(st, "st_file_attributes", 0)
+        return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    except OSError:
+        return False
+
+
+def _dir_bytes(root: Path) -> int:
+    if _is_reparse_or_symlink(root):
+        return 0
+    if not root.is_dir():
+        try:
+            return root.lstat().st_size
+        except OSError:
+            return 0
+    total = 0
+    with os.scandir(root) as it:
+        for entry in it:
+            ep = Path(entry.path)
+            if _is_reparse_or_symlink(ep):
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                total += _dir_bytes(ep)
+            else:
+                try:
+                    total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+    return total
+
+
+def _rmtree_safe(root: Path) -> int:
+    """Recursively remove a directory tree without following symlinks or Windows junctions."""
+    if _is_reparse_or_symlink(root):
+        try:
+            os.rmdir(root)
+        except OSError:
+            root.unlink(missing_ok=True)
+        return 0
+    if not root.exists():
+        return 0
+    if not root.is_dir():
+        size = 0
+        try:
+            size = root.lstat().st_size
+        except OSError:
+            pass
+        try:
+            root.unlink()
+        except PermissionError:
+            os.chmod(root, stat.S_IWRITE | stat.S_IREAD)
+            root.unlink()
+        return size
+
+    freed = 0
+    with os.scandir(root) as it:
+        for entry in it:
+            ep = Path(entry.path)
+            if _is_reparse_or_symlink(ep):
+                try:
+                    os.rmdir(ep)
+                except OSError:
+                    ep.unlink(missing_ok=True)
+            elif entry.is_dir(follow_symlinks=False):
+                freed += _rmtree_safe(ep)
+            else:
+                try:
+                    freed += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+                try:
+                    ep.unlink()
+                except PermissionError:
+                    os.chmod(ep, stat.S_IWRITE | stat.S_IREAD)
+                    ep.unlink()
+    try:
+        os.rmdir(root)
+    except PermissionError:
+        os.chmod(root, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        os.rmdir(root)
+    return freed
+
+
+def _is_valid_plugin_dir(path: Path) -> bool:
+    if _is_reparse_or_symlink(path) or not path.is_dir():
+        return False
+    if (path / ".codex-plugin" / "plugin.json").is_file():
+        return True
+    try:
+        for child in path.iterdir():
+            if not _is_reparse_or_symlink(child) and child.is_dir():
+                if (child / ".codex-plugin" / "plugin.json").is_file():
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _infer_plugin_cache_dir(target_plugin: Path) -> tuple[Path | None, Path | None]:
+    resolved = target_plugin.resolve()
+    parent = resolved.parent
+    grandparent = parent.parent
+    if parent.name == "tri-orchestrator" and grandparent.name == "tri-orchestrator" and grandparent.parent.name == "cache":
+        return grandparent, parent
+    if parent.name == "tri-orchestrator" and grandparent.name == "cache":
+        return parent, resolved
+    return None, resolved
 
 
 def digest(data: bytes) -> str:
@@ -183,13 +312,15 @@ def offline(data: Path, port: int):
             yield
 
 
-def prepare(source_plugin: Path, target_plugin: Path, data_dir: Path, backup_dir: Path, *, port: int = 18790) -> dict:
+def prepare(source_plugin: Path, target_plugin: Path, data_dir: Path, backup_dir: Path, *, port: int = 18790, keep_backups: int | None = None) -> dict:
     source, target, data, backup = (Path(p).resolve() for p in (source_plugin, target_plugin, data_dir, backup_dir))
     paths = [source, target, data, backup]
     if any(a == b or a.is_relative_to(b) or b.is_relative_to(a) for i, a in enumerate(paths) for b in paths[i + 1:]):
         raise UpgradeError("Source, target, runtime data and backup directories must not overlap")
     if type(port) is not int or not 1 <= port <= 65535:
         raise UpgradeError("Invalid loopback port")
+    if keep_backups is not None and (type(keep_backups) is not int or keep_backups < 0):
+        raise UpgradeError("keep_backups must be a non-negative integer")
     source_id, target_id = package_identity(source), package_identity(target)
     snapshot = database_snapshot(data / "state.db")
     no_active(snapshot)
@@ -214,6 +345,15 @@ def prepare(source_plugin: Path, target_plugin: Path, data_dir: Path, backup_dir
                 "source_files": source_files, "target_files": target_files, "database_before": snapshot,
                 "activation": "Package operation only; Codex owns registry activation and manual MCP reload"}
     write_json(backup / "prepared.json", manifest)
+    if keep_backups is not None:
+        prune_report = prune(
+            backup_root=backup.parent,
+            keep_backups=keep_backups,
+            active_plugin_dir=target,
+            current_backup_dir=backup,
+            protect_current=True,
+        )
+        return {**manifest, "pruned": prune_report}
     return manifest
 
 
@@ -289,7 +429,15 @@ def rollback(backup_dir: Path) -> dict:
         return report
 
 
-def verify(backup_dir: Path) -> dict:
+def verify(
+    backup_dir: Path,
+    *,
+    keep_backups: int = 3,
+    prune_backups: bool = True,
+    plugin_cache_dir: Path | None = None,
+) -> dict:
+    if type(keep_backups) is not int or keep_backups < 0:
+        raise UpgradeError("keep_backups must be a non-negative integer")
     backup = Path(backup_dir).resolve()
     manifest = load_prepared(backup)
     data = Path(manifest["data_dir"])
@@ -316,8 +464,198 @@ def verify(backup_dir: Path) -> dict:
             or health.get("port") != manifest["port"]
             or not required.issubset(health.get("capabilities", []))):
         raise UpgradeError(f"Host activation health mismatch: {health}")
-    return {"status": "backend_verified", "health": health,
-            "remaining": "Fresh native MCP catalog/tool invocation and three entry acceptance are separate host checks"}
+    _write_json_replace(
+        backup / "verified.json",
+        {
+            "status": "backend_verified",
+            "verified_at": time.time(),
+            "software_version": health.get("software_version"),
+            "schema_version": health.get("schema_version"),
+        },
+    )
+    report = {
+        "status": "backend_verified",
+        "health": health,
+        "remaining": "Fresh native MCP catalog/tool invocation and three entry acceptance are separate host checks",
+    }
+    if prune_backups:
+        target_raw = manifest.get("target_plugin")
+        target_plugin = Path(target_raw) if target_raw else None
+        if plugin_cache_dir is None and target_plugin is not None:
+            inferred_cache, inferred_active = _infer_plugin_cache_dir(target_plugin)
+        else:
+            inferred_cache = plugin_cache_dir
+            inferred_active = target_plugin
+        report["pruned"] = prune(
+            backup_root=backup.parent,
+            plugin_cache_dir=inferred_cache,
+            keep_backups=keep_backups,
+            active_plugin_dir=inferred_active,
+            current_backup_dir=backup,
+            protect_current=(keep_backups > 0),
+        )
+    return report
+
+
+def prune(
+    backup_root: Path | None = None,
+    *,
+    plugin_cache_dir: Path | None = None,
+    keep_backups: int = 3,
+    keep_plugin_backups: int = 0,
+    active_plugin_dir: Path | None = None,
+    current_backup_dir: Path | None = None,
+    protect_current: bool = True,
+    verified_only: bool = False,
+    dry_run: bool = False,
+) -> dict:
+    """Rotate old completed upgrade backups and prune stale plugin-backup-* staging dirs."""
+    if type(keep_backups) is not int or keep_backups < 0:
+        raise UpgradeError("keep_backups must be a non-negative integer")
+    if type(keep_plugin_backups) is not int or keep_plugin_backups < 0:
+        raise UpgradeError("keep_plugin_backups must be a non-negative integer")
+
+    active_resolved = active_plugin_dir.resolve() if active_plugin_dir is not None else None
+    current_resolved = current_backup_dir.resolve() if current_backup_dir is not None else None
+
+    pruned_backups: list[str] = []
+    kept_backups: list[str] = []
+    skipped_backups: list[dict[str, str]] = []
+    pruned_plugin_backups: list[str] = []
+    kept_plugin_backups: list[str] = []
+    skipped_plugin_backups: list[dict[str, str]] = []
+    freed_bytes = 0
+
+    def _overlaps_active(candidate: Path) -> bool:
+        if active_resolved is None:
+            return False
+        cand_res = candidate.resolve()
+        return (
+            cand_res == active_resolved
+            or active_resolved.is_relative_to(cand_res)
+            or cand_res.is_relative_to(active_resolved)
+        )
+
+    if backup_root is not None:
+        root_path = Path(backup_root).resolve()
+        if root_path.is_dir():
+            eligible: list[tuple[tuple[float, float, str], Path]] = []
+            for entry in sorted(root_path.iterdir(), key=lambda p: p.name):
+                if _is_reparse_or_symlink(entry):
+                    if (entry / "prepared.json").is_file() or (entry / "upgrade-bundle" / "prepared.json").is_file():
+                        skipped_backups.append({"path": str(entry), "reason": "symlink_or_junction"})
+                    continue
+                if not entry.is_dir():
+                    continue
+                if (entry / "prepared.json").is_file():
+                    bundle_dir = entry
+                elif (entry / "upgrade-bundle" / "prepared.json").is_file():
+                    bundle_dir = entry / "upgrade-bundle"
+                else:
+                    continue
+
+                if _overlaps_active(entry):
+                    skipped_backups.append({"path": str(entry), "reason": "active_plugin_overlap"})
+                    continue
+
+                is_verified = (bundle_dir / "verified.json").is_file()
+                is_applied = (bundle_dir / "applied.json").is_file()
+                is_failed = (bundle_dir / "apply-failed.json").is_file()
+                is_started = (bundle_dir / "apply-started.json").is_file()
+                is_rolled_back = (bundle_dir / "rolled-back.json").is_file()
+
+                if is_failed and not is_verified:
+                    skipped_backups.append({"path": str(entry), "reason": "apply_failed"})
+                    continue
+                if is_started and not is_applied and not is_rolled_back and not is_verified:
+                    skipped_backups.append({"path": str(entry), "reason": "apply_in_progress"})
+                    continue
+                if verified_only and not is_verified:
+                    skipped_backups.append({"path": str(entry), "reason": "not_verified"})
+                    continue
+
+                try:
+                    prepared_data = json.loads((bundle_dir / "prepared.json").read_text(encoding="utf-8"))
+                    created_at = float(prepared_data.get("created_at") or 0.0)
+                except Exception:
+                    created_at = 0.0
+                try:
+                    mtime = float(entry.lstat().st_mtime)
+                except OSError:
+                    mtime = 0.0
+                eligible.append(((created_at, mtime, entry.name), entry))
+
+            eligible.sort(key=lambda item: item[0], reverse=True)
+            retained: list[Path] = []
+            for _, cand in eligible:
+                if protect_current and current_resolved is not None and cand.resolve() == current_resolved:
+                    retained.append(cand)
+            for _, cand in eligible:
+                if cand in retained:
+                    continue
+                if len(retained) < keep_backups:
+                    retained.append(cand)
+
+            retained_set = {p.resolve() for p in retained}
+            for _, cand in eligible:
+                if cand.resolve() in retained_set:
+                    kept_backups.append(str(cand))
+                else:
+                    freed_bytes += _dir_bytes(cand) if dry_run else _rmtree_safe(cand)
+                    pruned_backups.append(str(cand))
+
+    if plugin_cache_dir is not None:
+        cache_path = Path(plugin_cache_dir).resolve()
+        if cache_path.is_dir():
+            has_active_plugin = bool(active_resolved is not None and active_resolved.exists())
+            if not has_active_plugin:
+                for child in cache_path.iterdir():
+                    if not child.name.startswith("plugin-backup-") and _is_valid_plugin_dir(child):
+                        has_active_plugin = True
+                        break
+
+            staging_candidates: list[tuple[tuple[float, str], Path]] = []
+            for entry in sorted(cache_path.iterdir(), key=lambda p: p.name):
+                if not entry.name.startswith("plugin-backup-"):
+                    continue
+                if _is_reparse_or_symlink(entry):
+                    skipped_plugin_backups.append({"path": str(entry), "reason": "symlink_or_junction"})
+                    continue
+                if not entry.is_dir():
+                    continue
+                if _overlaps_active(entry):
+                    skipped_plugin_backups.append({"path": str(entry), "reason": "active_plugin_overlap"})
+                    continue
+                if not has_active_plugin:
+                    skipped_plugin_backups.append({"path": str(entry), "reason": "no_active_plugin_detected"})
+                    continue
+                try:
+                    mtime = float(entry.lstat().st_mtime)
+                except OSError:
+                    mtime = 0.0
+                staging_candidates.append(((mtime, entry.name), entry))
+
+            staging_candidates.sort(key=lambda item: item[0], reverse=True)
+            for idx, (_, cand) in enumerate(staging_candidates):
+                if idx < keep_plugin_backups:
+                    kept_plugin_backups.append(str(cand))
+                else:
+                    freed_bytes += _dir_bytes(cand) if dry_run else _rmtree_safe(cand)
+                    pruned_plugin_backups.append(str(cand))
+
+    return {
+        "status": "dry_run" if dry_run else "pruned",
+        "dry_run": dry_run,
+        "keep_backups": keep_backups,
+        "keep_plugin_backups": keep_plugin_backups,
+        "freed_bytes": freed_bytes,
+        "pruned_backups": pruned_backups,
+        "kept_backups": kept_backups,
+        "skipped_backups": skipped_backups,
+        "pruned_plugin_backups": pruned_plugin_backups,
+        "kept_plugin_backups": kept_plugin_backups,
+        "skipped_plugin_backups": skipped_plugin_backups,
+    }
 
 
 def main() -> int:
@@ -329,9 +667,23 @@ def main() -> int:
     prep.add_argument("--data-dir", type=Path, required=True)
     prep.add_argument("--backup-dir", type=Path, required=True)
     prep.add_argument("--port", type=int, default=18790)
-    for action in ("apply", "rollback", "verify"):
+    prep.add_argument("--keep-backups", type=int, default=None)
+    for action in ("apply", "rollback"):
         command = sub.add_parser(action)
         command.add_argument("--backup-dir", type=Path, required=True)
+    ver = sub.add_parser("verify", help="Verify running upgraded daemon and prune rotated backups")
+    ver.add_argument("--backup-dir", type=Path, required=True)
+    ver.add_argument("--keep-backups", type=int, default=3)
+    ver.add_argument("--no-prune", action="store_false", dest="prune_backups")
+    ver.add_argument("--plugin-cache-dir", type=Path, default=None)
+    prn = sub.add_parser("prune", help="Rotate old upgrade backups and expired plugin-backup-* staging dirs")
+    prn.add_argument("--backup-root", type=Path, default=None)
+    prn.add_argument("--plugin-cache-dir", type=Path, default=None)
+    prn.add_argument("--active-plugin-dir", type=Path, default=None)
+    prn.add_argument("--keep-backups", type=int, default=3)
+    prn.add_argument("--keep-plugin-backups", type=int, default=0)
+    prn.add_argument("--verified-only", action="store_true")
+    prn.add_argument("--dry-run", action="store_true")
     args = vars(parser.parse_args())
     action = args.pop("action")
     print(json.dumps(globals()[action](**args), ensure_ascii=False, indent=2))

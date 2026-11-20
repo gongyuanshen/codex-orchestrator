@@ -31,12 +31,14 @@ from orchestrator.db import (
     Database,
     NotFoundError,
 )
+from orchestrator.gc import _dir_size_bytes
 from orchestrator.workspace_mgr import (
     VALID_DEP_MODES,
     VALID_MERGE_STRATEGIES,
     WORKSPACES_DIRNAME,
     WorkspaceCleanupGuardError,
     WorkspaceManager,
+    _is_reparse_or_symlink,
     _rmtree_safe,
 )
 
@@ -61,6 +63,36 @@ def _clean_opt_str(value: Any) -> str | None:
         return None
     cleaned = value.strip()
     return cleaned or None
+
+
+def _extract_workspace_copy_stats(ws: dict[str, Any]) -> dict[str, Any]:
+    """Extract copied_bytes / file_count metadata from workspace record or snapshot_manifest."""
+    stats: dict[str, Any] = {}
+    manifest = ws.get("snapshot_manifest") if isinstance(ws.get("snapshot_manifest"), dict) else {}
+    for key in ("copied_bytes", "file_count"):
+        if key in ws and ws[key] is not None:
+            stats[key] = ws[key]
+        elif key in manifest and manifest[key] is not None:
+            stats[key] = manifest[key]
+    return stats
+
+
+def _compact_workspace_payload(
+    ws: dict[str, Any], *, extra_stats: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Strip large snapshot manifests from workspace payload while preserving copy stats."""
+    compact = {
+        k: v
+        for k, v in ws.items()
+        if k not in {"snapshot_manifest", "snapshot_manifest_json"}
+    }
+    merged_stats = _extract_workspace_copy_stats(ws)
+    if extra_stats:
+        for key in ("copied_bytes", "file_count"):
+            if key in extra_stats and extra_stats[key] is not None:
+                merged_stats[key] = extra_stats[key]
+    compact.update(merged_stats)
+    return compact
 
 
 def _resolve_live_model_and_effort(
@@ -1537,9 +1569,12 @@ class RpcDispatcher:
             copy_env=bool(args.get("copy_env", True)),
             dep_mode=str(args.get("dep_mode") or "none"),
         )
+        copy_stats = _extract_workspace_copy_stats(ws)
+        if copy_stats:
+            ws = {**ws, **copy_stats}
         self._emit(
             "workspace_updated",
-            {"run_id": ws["run_id"], "workspace": ws},
+            {"run_id": ws["run_id"], "workspace": _compact_workspace_payload(ws)},
             run_id=ws["run_id"],
         )
         worker = self.db.get_worker_by_name(run_id, worker_name)
@@ -1699,6 +1734,7 @@ class RpcDispatcher:
 
                 # 1) Optional workspace creation
                 ws: dict[str, Any] | None = None
+                created_ws_stats: dict[str, Any] = {}
                 requested_ws_id = args.get("workspace_id").strip() if isinstance(args.get("workspace_id"), str) and args.get("workspace_id").strip() else None
                 if create_ws:
                     base_mode = str(args.get("workspace_base_mode") or "auto").strip()
@@ -1710,6 +1746,7 @@ class RpcDispatcher:
                         copy_env=bool(args.get("copy_env", True)),
                         dep_mode=str(args.get("dep_mode") or "none"),
                     )
+                    created_ws_stats = _extract_workspace_copy_stats(ws)
                     created_ws_dir = Path(ws["path"])
                     if base_mode != "auto" and ws["mode"] != base_mode:
                         raise ValueError(
@@ -2062,7 +2099,7 @@ class RpcDispatcher:
 
         compact_step = _strip_step_manifests(step)
         compact_ws = (
-            {k: v for k, v in ws.items() if k not in {"snapshot_manifest", "snapshot_manifest_json"}}
+            _compact_workspace_payload(ws, extra_stats=created_ws_stats)
             if ws is not None else None
         )
         refreshed = self._sync_run_agent_models(run_id)
@@ -2708,16 +2745,35 @@ class RpcDispatcher:
                 self._emit("workflow_updated", {"run_id": run_id, "step": _strip_step_manifests(step)}, run_id=run_id)
 
         cleaned_workspaces: list[str] = []
+        freed_bytes = 0
         for ws in merged_ws:
-            self.workspace_mgr.workspace_cleanup(ws["id"], force=False)
+            ws_path = Path(ws["path"])
+            ws_bytes = (
+                _dir_size_bytes(ws_path)
+                if ws_path.exists() and not _is_reparse_or_symlink(ws_path)
+                else 0
+            )
+            cleanup_res = self.workspace_mgr.workspace_cleanup(ws["id"], force=False)
+            if not cleanup_res.get("already_cleaned"):
+                freed_bytes += ws_bytes
             cleaned_workspaces.append(ws["id"])
             updated_ws = self.db.get_workspace(ws["id"])
             if updated_ws is not None:
                 self._emit(
                     "workspace_updated",
-                    {"run_id": run_id, "workspace": {k: v for k, v in updated_ws.items() if k not in {"snapshot_manifest", "snapshot_manifest_json"}}},
+                    {"run_id": run_id, "workspace": _compact_workspace_payload(updated_ws)},
                     run_id=run_id,
                 )
+        if cleaned_workspaces or freed_bytes > 0:
+            self._emit(
+                "storage_updated",
+                {
+                    "run_id": run_id,
+                    "freed_bytes": int(freed_bytes),
+                    "cleaned_workspaces": cleaned_workspaces,
+                },
+                run_id=run_id,
+            )
 
         stopped_workers: list[str] = []
         stopped_entries: list[tuple[str, dict[str, Any]]] = []
@@ -2758,6 +2814,7 @@ class RpcDispatcher:
             "run": completed_run,
             "advanced_steps": advanced,
             "cleaned_workspaces": cleaned_workspaces,
+            "freed_bytes": int(freed_bytes),
             "stopped_workers": stopped_workers,
             "board_pointer": board_pointer,
             "summary": str(raw_summary or "Run closeout complete").strip(),

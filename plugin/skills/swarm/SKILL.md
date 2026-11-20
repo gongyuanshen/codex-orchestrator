@@ -86,6 +86,7 @@ Include the matching contract verbatim in the child prompt whenever omitting `ag
 - For `mode="git_clone"` only: commit owned changes on the assigned branch, report actual commit SHA, and require a clean Git worktree before verification and merge.
 - For `mode="snapshot"`: `branch_name=None` is normal and `dirty=true` before merge is expected. Do not require a Git commit or a clean Git worktree; verify `workspace_diff`, ownership, and post-edit tests (`workspace_merge_preview` / `workspace_merge(workspace_id, strategy="merge")` run a three-way snapshot comparison/apply).
 - Use `dep_mode="none"`, `dep_mode="copy"`, or `dep_mode="fresh_venv_uv"` when dependency writes need isolation; `dep_mode="link_ro_cache"` provides shared writable dependencies and is not read-only or write-isolated.
+- **Storage Transparency & Closeout Disclosure**: On non-Git `snapshot` roots, watch snapshot size (`TRI_ORCH_MAX_SNAPSHOT_MB` / `.triignore` exclusions) before dispatching isolated workspaces; at completion, execute `workflow_closeout_run` / `workspace_cleanup` and state in the final user report whether isolated workspaces were cleaned and whether any uncleaned/dirty leftovers remain.
 
 ## Workflow
 

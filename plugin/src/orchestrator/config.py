@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -12,6 +13,11 @@ DEFAULT_PORT = 18790
 DEFAULT_STALL_SEC = 300
 DEFAULT_WATCHDOG_INTERVAL_SEC = 15
 DEFAULT_PORT_RANGE = (18800, 18999)
+DEFAULT_MAX_SNAPSHOT_MB = 500
+DEFAULT_GC_INTERVAL_SEC = 3600.0
+DEFAULT_RESULT_TTL_SEC = 86400
+DEFAULT_RESULT_MAX_FILES = 50
+DEFAULT_WORKSPACE_RETENTION_SEC = 86400
 
 _PORT_RANGE_RE = re.compile(r"^\s*(\d+)\s*(?:\.\.|-|:|,)\s*(\d+)\s*$")
 
@@ -51,8 +57,19 @@ def _parse_positive_number(raw: str, env_name: str) -> int | float:
         value: int | float = float(text) if ("." in text or "e" in text.lower()) else int(text)
     except ValueError as exc:
         raise ValueError(f"Invalid numeric value for {env_name}: {raw!r}") from exc
-    if value <= 0:
+    if not math.isfinite(float(value)) or value <= 0:
         raise ValueError(f"{env_name} must be > 0, got {value}")
+    return value
+
+
+def _parse_non_negative_int(raw: str, env_name: str) -> int:
+    text = raw.strip()
+    try:
+        value = int(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid integer value for {env_name}: {raw!r}") from exc
+    if value < 0:
+        raise ValueError(f"{env_name} must be >= 0, got {value}")
     return value
 
 
@@ -71,6 +88,11 @@ class Settings:
     stall_sec: int | float = DEFAULT_STALL_SEC
     watchdog_interval_sec: int | float = DEFAULT_WATCHDOG_INTERVAL_SEC
     port_range: tuple[int, int] = DEFAULT_PORT_RANGE
+    max_snapshot_mb: int = DEFAULT_MAX_SNAPSHOT_MB
+    gc_interval_sec: float = DEFAULT_GC_INTERVAL_SEC
+    result_ttl_sec: int = DEFAULT_RESULT_TTL_SEC
+    result_max_files: int = DEFAULT_RESULT_MAX_FILES
+    workspace_retention_sec: int = DEFAULT_WORKSPACE_RETENTION_SEC
 
     def __post_init__(self) -> None:
         self.host = str(self.host).strip() or DEFAULT_HOST
@@ -85,10 +107,31 @@ class Settings:
                 f"watchdog_interval_sec must be > 0, got {self.watchdog_interval_sec}"
             )
         self.port_range = parse_port_range(self.port_range)
+        self.max_snapshot_mb = int(self.max_snapshot_mb)
+        if self.max_snapshot_mb < 0:
+            raise ValueError(f"max_snapshot_mb must be >= 0, got {self.max_snapshot_mb}")
+        self.gc_interval_sec = float(self.gc_interval_sec)
+        if not math.isfinite(self.gc_interval_sec) or self.gc_interval_sec <= 0:
+            raise ValueError(f"gc_interval_sec must be > 0, got {self.gc_interval_sec}")
+        self.result_ttl_sec = int(self.result_ttl_sec)
+        if self.result_ttl_sec < 0:
+            raise ValueError(f"result_ttl_sec must be >= 0, got {self.result_ttl_sec}")
+        self.result_max_files = int(self.result_max_files)
+        if self.result_max_files < 0:
+            raise ValueError(f"result_max_files must be >= 0, got {self.result_max_files}")
+        self.workspace_retention_sec = int(self.workspace_retention_sec)
+        if self.workspace_retention_sec < 0:
+            raise ValueError(
+                f"workspace_retention_sec must be >= 0, got {self.workspace_retention_sec}"
+            )
 
     @property
     def db_path(self) -> Path:
         return self.data_dir / "state.db"
+
+    @property
+    def results_dir(self) -> Path:
+        return self.data_dir / "results"
 
     @property
     def lock_path(self) -> Path:
@@ -158,6 +201,41 @@ class Settings:
             parse_port_range(raw_port_range) if raw_port_range else DEFAULT_PORT_RANGE
         )
 
+        raw_max_snapshot = os.environ.get("TRI_ORCH_MAX_SNAPSHOT_MB", "").strip()
+        max_snapshot_mb = (
+            _parse_non_negative_int(raw_max_snapshot, "TRI_ORCH_MAX_SNAPSHOT_MB")
+            if raw_max_snapshot
+            else DEFAULT_MAX_SNAPSHOT_MB
+        )
+
+        raw_gc_interval = os.environ.get("TRI_ORCH_GC_INTERVAL_SEC", "").strip()
+        gc_interval_sec = (
+            float(_parse_positive_number(raw_gc_interval, "TRI_ORCH_GC_INTERVAL_SEC"))
+            if raw_gc_interval
+            else DEFAULT_GC_INTERVAL_SEC
+        )
+
+        raw_result_ttl = os.environ.get("TRI_ORCH_RESULT_TTL_SEC", "").strip()
+        result_ttl_sec = (
+            _parse_non_negative_int(raw_result_ttl, "TRI_ORCH_RESULT_TTL_SEC")
+            if raw_result_ttl
+            else DEFAULT_RESULT_TTL_SEC
+        )
+
+        raw_result_max = os.environ.get("TRI_ORCH_RESULT_MAX_FILES", "").strip()
+        result_max_files = (
+            _parse_non_negative_int(raw_result_max, "TRI_ORCH_RESULT_MAX_FILES")
+            if raw_result_max
+            else DEFAULT_RESULT_MAX_FILES
+        )
+
+        raw_ws_retention = os.environ.get("TRI_ORCH_WORKSPACE_RETENTION_SEC", "").strip()
+        workspace_retention_sec = (
+            _parse_non_negative_int(raw_ws_retention, "TRI_ORCH_WORKSPACE_RETENTION_SEC")
+            if raw_ws_retention
+            else DEFAULT_WORKSPACE_RETENTION_SEC
+        )
+
         return cls(
             host=host,
             port=port,
@@ -165,6 +243,11 @@ class Settings:
             stall_sec=stall_sec,
             watchdog_interval_sec=watchdog_interval_sec,
             port_range=port_range,
+            max_snapshot_mb=max_snapshot_mb,
+            gc_interval_sec=gc_interval_sec,
+            result_ttl_sec=result_ttl_sec,
+            result_max_files=result_max_files,
+            workspace_retention_sec=workspace_retention_sec,
         )
 
 

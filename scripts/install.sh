@@ -15,6 +15,7 @@ Options:
   --skip-uv-sync            Skip pre-warming uv sync on the cached plugin runtime
   --skip-plugin-install     Skip codex plugin marketplace/plugin registration
   --trust-plugin-hooks      Trust all 4 plugin hooks in [hooks.state] config.toml
+  --keep-backups N          Retain latest N timestamped backups (default: 3; baseline always kept)
   -h, --help                Show this help message
 EOF
 }
@@ -25,6 +26,7 @@ CODEX_HOME_ARG=""
 SKIP_UV_SYNC=0
 SKIP_PLUGIN_INSTALL=0
 TRUST_PLUGIN_HOOKS=0
+KEEP_BACKUPS=3
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -54,6 +56,17 @@ while [ "$#" -gt 0 ]; do
     --trust-plugin-hooks)
       TRUST_PLUGIN_HOOKS=1
       shift
+      ;;
+    --keep-backups)
+      [ "$#" -ge 2 ] || { echo "Missing value for --keep-backups" >&2; exit 2; }
+      case "$2" in
+        ''|*[!0-9]*)
+          echo "Invalid --keep-backups value (expected non-negative integer): $2" >&2
+          exit 2
+          ;;
+      esac
+      KEEP_BACKUPS="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -362,11 +375,17 @@ if printf '%s' "$strict_err" | grep -q "Error loading config\.toml"; then
   exit 1
 fi
 
-# Create CODEX_HOME, agents/, and backup directories
+# Create CODEX_HOME, agents/, and backup directories (back up only config.toml + role TOMLs; never copy .venv into backups)
 mkdir -p "$CODEX_HOME_DIR" "$CODEX_HOME_DIR/agents"
+BACKUPS_ROOT="$CODEX_HOME_DIR/backups"
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
-BACKUP_DIR="$CODEX_HOME_DIR/backups/tri-orchestrator-$TIMESTAMP"
-BASELINE_DIR="$CODEX_HOME_DIR/backups/tri-orchestrator-baseline"
+BACKUP_DIR="$BACKUPS_ROOT/tri-orchestrator-$TIMESTAMP"
+suffix_idx=1
+while [ -e "$BACKUP_DIR" ]; do
+  BACKUP_DIR="$(printf '%s/tri-orchestrator-%s-%02d' "$BACKUPS_ROOT" "$TIMESTAMP" "$suffix_idx")"
+  suffix_idx=$((suffix_idx + 1))
+done
+BASELINE_DIR="$BACKUPS_ROOT/tri-orchestrator-baseline"
 BASELINE_EXISTS=0
 if [ -d "$BASELINE_DIR" ]; then
   BASELINE_EXISTS=1
@@ -435,6 +454,78 @@ obj = {
     "agents_meta": json.loads(pathlib.Path(sys.argv[9]).read_text(encoding="utf-8")),
 }
 pathlib.Path(sys.argv[1]).write_text(json.dumps(obj, indent=2) + "\n", encoding="utf-8")
+PY
+
+run_py - "$BACKUPS_ROOT" "$KEEP_BACKUPS" <<'PY'
+import os, pathlib, stat, sys
+
+backups_root = pathlib.Path(sys.argv[1])
+keep_count = max(0, int(sys.argv[2]))
+
+def is_reparse_or_symlink(p: pathlib.Path) -> bool:
+    try:
+        if p.is_symlink():
+            return True
+        if hasattr(p, "is_junction") and p.is_junction():
+            return True
+        st = os.lstat(p)
+        attrs = getattr(st, "st_file_attributes", 0)
+        return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
+    except OSError:
+        return False
+
+def rmtree_safe(root: pathlib.Path) -> None:
+    if is_reparse_or_symlink(root):
+        try:
+            os.rmdir(root)
+        except OSError:
+            root.unlink(missing_ok=True)
+        return
+    with os.scandir(root) as it:
+        for entry in it:
+            ep = pathlib.Path(entry.path)
+            if is_reparse_or_symlink(ep):
+                try:
+                    os.rmdir(ep)
+                except OSError:
+                    ep.unlink(missing_ok=True)
+            elif entry.is_dir(follow_symlinks=False):
+                rmtree_safe(ep)
+            else:
+                try:
+                    ep.unlink()
+                except PermissionError:
+                    os.chmod(ep, stat.S_IWRITE | stat.S_IREAD)
+                    ep.unlink()
+    try:
+        os.rmdir(root)
+    except PermissionError:
+        os.chmod(root, stat.S_IWRITE | stat.S_IREAD | stat.S_IEXEC)
+        os.rmdir(root)
+
+if not backups_root.is_dir():
+    sys.exit(0)
+
+candidates = []
+for entry in backups_root.iterdir():
+    name = entry.name
+    if name == "tri-orchestrator-baseline":
+        continue
+    if not name.startswith("tri-orchestrator-2"):
+        continue
+    if is_reparse_or_symlink(entry):
+        continue
+    if entry.is_dir():
+        candidates.append(entry)
+
+candidates.sort(key=lambda p: p.name, reverse=True)
+pruned = []
+for old_dir in candidates[keep_count:]:
+    rmtree_safe(old_dir)
+    pruned.append(old_dir.name)
+
+if pruned:
+    print(f"[install] Pruned {len(pruned)} old backup(s) under {backups_root} (kept baseline + latest {keep_count}): {', '.join(pruned)}")
 PY
 
 CACHED_PLUGIN_DIR=""
