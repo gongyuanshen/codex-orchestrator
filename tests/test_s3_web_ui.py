@@ -160,9 +160,12 @@ def test_t6_all_projects_and_all_modes_accept_merged_cross_mode_snapshots():
       const cross={id:'r',project_id:'child',canonical_project_id:'parent',mode:'boost',status:'active',
         session_id:'s',session_seq:3,codex_thread_name:'Codex thread',title:'Source title'};
       bindEvents();
-      assert.equal(el.runModeToggle.textContent,'仅看本模式');
-      assert.equal(el.runModeToggle.getAttribute('aria-pressed'),'false');
-      el.runModeToggle.dispatchEvent({type:'click'});
+      assert.equal(el.runModeCurrentBtn.textContent,'仅 Swarm');
+      assert.equal(el.runModeCurrentBtn.getAttribute('aria-pressed'),'true');
+      assert.equal(el.runModeCurrentBtn.classList.contains('active'),true);
+      assert.equal(el.runModeAllBtn.getAttribute('aria-pressed'),'false');
+      assert.equal(el.runModeAllBtn.classList.contains('active'),false);
+      el.runModeAllBtn.dispatchEvent({type:'click'});
       assert.equal(requests[0].url,'/api/runs?project_id=parent&mode=all');
       requests[0].resolve({runs:[cross]});
       await new Promise(resolve=>setImmediate(resolve));
@@ -174,14 +177,23 @@ def test_t6_all_projects_and_all_modes_accept_merged_cross_mode_snapshots():
       assert.equal(el.topbarContextProject.textContent,'Parent repo');
       assert.equal(el.topbarContextRun.textContent,'Codex thread · #3');
       assert.equal(el.runTitleHeading.textContent,'Source title');
-      assert.equal(el.runModeToggle.textContent,'全部模式');
-      assert.equal(el.runModeToggle.getAttribute('aria-pressed'),'true');
+      assert.equal(el.runModeCurrentBtn.getAttribute('aria-pressed'),'false');
+      assert.equal(el.runModeCurrentBtn.classList.contains('active'),false);
+      assert.equal(el.runModeAllBtn.getAttribute('aria-pressed'),'true');
+      assert.equal(el.runModeAllBtn.classList.contains('active'),true);
       const load=loadRuns('__all__');
       assert.equal(requests[2].url,'/api/runs?mode=all');
       requests[2].resolve({runs:[]});await load;
       assert.equal(state.selectedProjectId,'__all__');
       assert.equal(el.projectSwitcherName.textContent,'全部项目（跨项目并发）');
     })()''')
+    from pathlib import Path
+    css = (Path(__file__).resolve().parents[1] / "plugin/src/orchestrator/web/styles.css").read_text(encoding="utf-8")
+    base_idx = css.index(".run-filter-pills {")
+    mode_idx = css.index(".run-filter-pills.run-mode-pills {")
+    assert mode_idx > base_idx
+    assert "repeat(2, minmax(0, 1fr))" in css[mode_idx : mode_idx + 120]
+    assert "white-space: nowrap;" in css
 
 
 def test_t6_global_palette_badge_searches_all_three_sections_and_navigates():

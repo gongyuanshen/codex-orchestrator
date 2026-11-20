@@ -200,6 +200,8 @@
     runFilterPills: Array.from(document.querySelectorAll('.run-filter-pill')),
     runSidebarList: document.getElementById('runSidebarList'),
     runModeToggle: document.getElementById('runModeToggle'),
+    runModeCurrentBtn: document.getElementById('runModeCurrentBtn'),
+    runModeAllBtn: document.getElementById('runModeAllBtn'),
     globalActiveBadge: document.getElementById('globalActiveBadge'),
     cmdPaletteTrigger: document.getElementById('cmdPaletteTrigger'),
     topbarContextProject: document.getElementById('topbarContextProject'),
@@ -2185,8 +2187,19 @@
   }
 
   function renderRunModeToggle() {
-    el.runModeToggle.textContent = state.allModes ? '全部模式' : '仅看本模式';
-    el.runModeToggle.setAttribute('aria-pressed', String(state.allModes));
+    const currentLabel = PAGE_MODE && MODE_BADGES[PAGE_MODE] ? `仅 ${MODE_BADGES[PAGE_MODE]}` : '仅本模式';
+    if (el.runModeCurrentBtn) {
+      el.runModeCurrentBtn.textContent = currentLabel;
+      el.runModeCurrentBtn.classList.toggle('active', !state.allModes);
+      el.runModeCurrentBtn.setAttribute('aria-pressed', String(!state.allModes));
+    }
+    if (el.runModeAllBtn) {
+      el.runModeAllBtn.classList.toggle('active', state.allModes);
+      el.runModeAllBtn.setAttribute('aria-pressed', String(state.allModes));
+    }
+    if (el.runModeToggle) {
+      el.runModeToggle.setAttribute('data-all-modes', String(state.allModes));
+    }
   }
 
   function renderRunSidebarCard(r, withSession = false) {
@@ -5385,12 +5398,16 @@
       renderRunSidebar();
     });
 
-    el.runModeToggle.addEventListener('click', async () => {
-      state.allModes = !state.allModes;
+    const applyRunModeFilter = async (nextAllModes) => {
+      const normalized = Boolean(nextAllModes);
+      if (normalized === state.allModes) return;
+      state.allModes = normalized;
       const selected = state.run || state.runs.find((r) => r.id === state.selectedRunId);
       const keepSelected = selected && (state.allModes || selected.mode === PAGE_MODE);
       await loadRuns(state.selectedProjectId, keepSelected ? selected.id : null, keepSelected ? selected : null);
-    });
+    };
+    el.runModeCurrentBtn?.addEventListener('click', () => applyRunModeFilter(false));
+    el.runModeAllBtn?.addEventListener('click', () => applyRunModeFilter(true));
 
     for (const pill of el.runFilterPills) {
       pill.addEventListener('click', () => {
