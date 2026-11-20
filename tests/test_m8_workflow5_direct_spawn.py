@@ -777,7 +777,7 @@ def test_schema7_to_schema9_migration_preserves_workflow0_to_4_semantics(tmp_pat
     settings = Settings(data_dir=tmp_path / "migrated_state")
     db = Database(db_file, settings=settings)
     try:
-        assert db.migrate() == SCHEMA_VERSION == 9
+        assert db.migrate() == SCHEMA_VERSION == 10
         for wf_v in range(5):
             r = db.get_run(f"run_wf{wf_v}")
             assert r["workflow_version"] == wf_v

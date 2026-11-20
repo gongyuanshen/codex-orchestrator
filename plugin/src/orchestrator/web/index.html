@@ -139,6 +139,7 @@
           <span class="run-pill-dot" aria-hidden="true">·</span>
           <span id="runStatusBadge" class="run-pill-status">—</span>
         </div>
+        <span id="runModelBadge" class="chip-tag model-badge hidden" title="当前任务使用的模型与推理强度"></span>
       </div>
 
       <div class="topbar-right">
@@ -408,6 +409,10 @@
               <label class="toggle-inline" title="展开 @all 广播消息到所有成员的虚线连线">
                 <input type="checkbox" id="graphExpandAllToggle" checked>
                 <span>展开 @all</span>
+              </label>
+              <label class="toggle-inline" title="在协作图中展示二层及以上辅助子代理节点与派生连线">
+                <input type="checkbox" id="graphShowHelpersToggle" checked>
+                <span>显示辅助子代理</span>
               </label>
               <div class="graph-legend" aria-hidden="true">
                 <span class="legend-item"><span class="legend-line legend-solid"></span>@提及数</span>

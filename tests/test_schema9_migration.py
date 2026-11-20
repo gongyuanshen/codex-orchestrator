@@ -92,8 +92,8 @@ def _assert_schema9(conn):
     ]
 
     turns = columns("session_turns")
-    assert set(turns) == {"session_id", "turn_id", "cwd", "prompt_preview",
-                          "active_run_id", "created_at", "updated_at"}
+    assert {"session_id", "turn_id", "cwd", "prompt_preview",
+            "active_run_id", "created_at", "updated_at"} <= set(turns)
     assert (turns["session_id"][-1], turns["turn_id"][-1]) == (1, 2)
     assert [(r["name"], r["desc"]) for r in conn.execute(
         "PRAGMA index_xinfo(idx_session_turns_session_updated)") if r["key"]] == [
@@ -110,7 +110,7 @@ def test_schema8_upgrade_keeps_old_column_hashes_and_order(tmp_path):
     assert before["schema_version"] == 8
 
     with db_module.Database(path, settings=Settings(data_dir=tmp_path)) as db:
-        assert db.migrate() == db_module.SCHEMA_VERSION == 9
+        assert db.migrate() == db_module.SCHEMA_VERSION == 10
         upgrade.require_old_rows(path, before)
         with db.read_connection() as conn:
             _assert_schema9(conn)
@@ -135,7 +135,7 @@ def test_schema8_upgrade_keeps_old_column_hashes_and_order(tmp_path):
         assert db.get_session_binding("z-session")["run_id"] == new["id"]
         assert db.get_session_binding("z-session", "old-run")["last_stop_blocked_key"] == "  blocked  "
         after = upgrade.database_snapshot(path)
-        assert db.migrate() == 9
+        assert db.migrate() == 10
         assert upgrade.database_snapshot(path) == after
         upgrade.require_old_rows(path, before)
 
@@ -233,11 +233,11 @@ def test_schema8_reader_rejects_schema9_without_changes(tmp_path, monkeypatch):
     path = tmp_path / "state.db"
     settings = Settings(data_dir=tmp_path)
     with db_module.Database(path, settings=settings) as db:
-        assert db.migrate() == 9
+        assert db.migrate() == 10
     upgrade = _upgrade_script()
     before = upgrade.database_snapshot(path)
     monkeypatch.setattr(db_module, "SCHEMA_VERSION", 8)
-    with pytest.raises(ValueError, match="Database schema 9 is newer than supported 8"):
+    with pytest.raises(ValueError, match="Database schema 10 is newer than supported 8"):
         db_module.Database(path, settings=settings)
     assert upgrade.database_snapshot(path) == before
 

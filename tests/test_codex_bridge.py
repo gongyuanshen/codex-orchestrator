@@ -117,6 +117,9 @@ def test_single_and_batch_title_priority_project_mapping_and_agent_exclusion(cod
         "cwd": r"g:\斗罗大陆神界传说\.swarm-workspaces\worker",
         "codex_project_id": "world", "codex_project_name": "斗罗大陆",
         "codex_project_root": r"G:\斗罗大陆神界传说",
+        "model": None,
+        "reasoning_effort": None,
+        "model_provider": None,
     }
     assert metas["assigned"]["codex_project_root"] == r"H:\World"
     assert metas["named"]["codex_project_id"] == "nested"
@@ -125,6 +128,9 @@ def test_single_and_batch_title_priority_project_mapping_and_agent_exclusion(cod
     for excluded in ("missing", "agent", "guardian", "agent-source"):
         assert bridge.get_thread_meta(excluded) is None
     assert bridge.get_threads_meta([]) == {}
+    assert bridge.get_session_subagents("renamed") == []
+    assert bridge.get_sessions_subagents(["renamed", "named"]) == {"renamed": [], "named": []}
+    assert bridge.get_sessions_subagents([]) == {}
 
 
 def test_readonly_uri_and_cache_tracks_each_mtime_and_ttl(codex_home, monkeypatch):
@@ -311,5 +317,226 @@ def test_unavailable_state_returns_only_empty_values_and_never_writes(codex_home
         assert bridge.resolve_codex_project_for_path("/foo") is None
         assert bridge.get_thread_meta("renamed") is None
         assert bridge.get_threads_meta(["renamed", "titled"]) == {}
+        assert bridge.get_session_subagents("renamed") == []
+        assert bridge.get_sessions_subagents(["renamed", "titled"]) == {}
         assert _snapshot(codex_home) == before
         assert not caplog.records
+
+
+def _create_full_codex_db(home: Path) -> Path:
+    db = home / "state_5.sqlite"
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.executescript("""
+            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE project_roots (
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                position INTEGER NOT NULL, path TEXT NOT NULL,
+                PRIMARY KEY (project_id, position)
+            );
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY, cwd TEXT, project_id TEXT, name TEXT,
+                title TEXT, first_user_message TEXT, thread_source TEXT, source TEXT,
+                model TEXT, reasoning_effort TEXT, model_provider TEXT,
+                agent_path TEXT, agent_role TEXT, agent_nickname TEXT,
+                created_at REAL, updated_at REAL
+            );
+            CREATE TABLE thread_spawn_edges (
+                parent_thread_id TEXT NOT NULL,
+                child_thread_id TEXT NOT NULL,
+                status TEXT
+            );
+        """)
+        conn.execute("INSERT INTO projects VALUES ('p1', 'Main')")
+        conn.execute("INSERT INTO project_roots VALUES ('p1', 0, '/repo')")
+    return db
+
+
+def test_thread_model_fields_and_subagent_tree_discovery(tmp_path, monkeypatch):
+    bridge = _bridge()
+    home = tmp_path / "full-codex"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    db = _create_full_codex_db(home)
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.executemany(
+            """INSERT INTO threads VALUES
+               (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                ("sess-1", "/repo", "p1", "Main Session", "Title", "First", "user", "cli",
+                 "  gpt-6.2-sol  ", "ultra", "openai", None, None, None, 100.0, 105.0),
+                ("sess-blank", "/repo", "p1", "Blank Model", "Title", "First", "user", "cli",
+                 "   ", "", None, None, None, None, 101.0, 101.0),
+                ("w1", "/repo", "p1", "Coder", None, None, "subagent", '{"subagent":{}}',
+                 "gpt-6.1-sol", "high", "openai", "/root/coder", "coder", "Kier", 110.0, 120.0),
+                ("exp1", "/repo", "p1", "Explorer", None, None, "subagent", '{"subagent":{}}',
+                 "gpt-6.2-mini", "low", "openai", "/root/explorer", "explorer", "Scout", 108.0, 112.0),
+                ("gr1", "/repo", "p1", "Guardian", None, None, "guardian_review", '{"subagent":{}}',
+                 "gpt-6.2-sol", "high", "openai", "/root/guardian", "guardian", "Guard", 109.0, 111.0),
+                ("h2a", "/repo", "p1", "Helper A", None, None, "subagent", '{"subagent":{}}',
+                 "gpt-6.2-mini", "medium", "openai", "/root/coder/sub-a", "explorer", "Lumen", 130.0, 135.0),
+                ("h2b", "/repo", "p1", "Helper B", None, None, "subagent", '{"subagent":{}}',
+                 "gpt-6.2-nano", None, "openai", "/root/coder/sub-b", "worker", "Spark", 125.0, 128.0),
+                ("h3", "/repo", "p1", "Deep Helper", None, None, "subagent", '{"subagent":{}}',
+                 "gpt-6.2-nano", "low", "anthropic", "/root/coder/sub-a/deep", "explorer", "Echo", 140.0, 145.0),
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO thread_spawn_edges VALUES (?, ?, ?)",
+            [
+                ("sess-1", "w1", "completed"),
+                ("sess-1", "exp1", "running"),
+                ("sess-1", "gr1", "completed"),
+                ("w1", "h2a", "completed"),
+                ("w1", "h2b", "running"),
+                ("h2a", "h3", "completed"),
+            ],
+        )
+
+    now = [200.0]
+    monkeypatch.setattr(bridge, "monotonic", lambda: now[0])
+
+    meta = bridge.get_thread_meta("sess-1")
+    assert meta == {
+        "session_id": "sess-1",
+        "title": "Main Session",
+        "cwd": "/repo",
+        "codex_project_id": "p1",
+        "codex_project_name": "Main",
+        "codex_project_root": "/repo",
+        "model": "gpt-6.2-sol",
+        "reasoning_effort": "ultra",
+        "model_provider": "openai",
+    }
+    blank_meta = bridge.get_thread_meta("sess-blank")
+    assert blank_meta["model"] is None
+    assert blank_meta["reasoning_effort"] is None
+    assert blank_meta["model_provider"] is None
+
+    tree = bridge.get_session_subagents("sess-1")
+    assert [(item["thread_id"], item["depth"], item["parent_thread_id"]) for item in tree] == [
+        ("exp1", 1, "sess-1"),
+        ("w1", 1, "sess-1"),
+        ("h2b", 2, "w1"),
+        ("h2a", 2, "w1"),
+        ("h3", 3, "h2a"),
+    ]
+    assert tree[1] == {
+        "thread_id": "w1",
+        "parent_thread_id": "sess-1",
+        "depth": 1,
+        "edge_status": "completed",
+        "agent_path": "/root/coder",
+        "agent_role": "coder",
+        "agent_nickname": "Kier",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "high",
+        "model_provider": "openai",
+        "created_at": 110.0,
+        "updated_at": 120.0,
+    }
+
+    batch = bridge.get_sessions_subagents(["sess-1", "sess-blank"])
+    assert [item["thread_id"] for item in batch["sess-1"]] == ["exp1", "w1", "h2b", "h2a", "h3"]
+    assert batch["sess-blank"] == []
+
+    # Caller mutation must not corrupt _cache.
+    tree[0]["model"] = "corrupted"
+    tree.clear()
+    fresh = bridge.get_session_subagents("sess-1")
+    assert len(fresh) == 5
+    assert fresh[0]["model"] == "gpt-6.2-mini"
+
+
+def test_subagent_tree_cycle_protection_depth_limit_and_optional_columns(tmp_path, monkeypatch):
+    bridge = _bridge()
+    home = tmp_path / "cyclic-codex"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    with closing(sqlite3.connect(home / "state_5.sqlite")) as conn, conn:
+        conn.executescript("""
+            CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE project_roots (
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                position INTEGER NOT NULL, path TEXT NOT NULL,
+                PRIMARY KEY (project_id, position)
+            );
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY, cwd TEXT, project_id TEXT, name TEXT,
+                title TEXT, first_user_message TEXT, thread_source TEXT, source TEXT
+            );
+            CREATE TABLE thread_spawn_edges (
+                parent_thread_id TEXT NOT NULL,
+                child_thread_id TEXT NOT NULL
+            );
+        """)
+        conn.execute("INSERT INTO projects VALUES ('p1', 'Main')")
+        conn.execute("INSERT INTO project_roots VALUES ('p1', 0, '/repo')")
+        nodes = [("root", "/repo", "p1", "Root", None, None, "user", "cli")]
+        for depth in range(1, 11):
+            nodes.append((f"d{depth}", "/repo", "p1", f"D{depth}", None, None, "subagent", "cli"))
+        conn.executemany("INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)", nodes)
+        edges = [
+            ("root", "root"),
+            ("root", "d1"),
+            ("d1", "root"),
+            ("d1", "d1"),
+            ("d2", "d1"),
+        ]
+        for depth in range(1, 10):
+            edges.append((f"d{depth}", f"d{depth + 1}"))
+        conn.executemany("INSERT INTO thread_spawn_edges VALUES (?, ?)", edges)
+
+    tree = bridge.get_session_subagents("root")
+    assert [(item["thread_id"], item["depth"]) for item in tree] == [
+        (f"d{depth}", depth) for depth in range(1, 9)
+    ]
+    assert tree[0] == {
+        "thread_id": "d1",
+        "parent_thread_id": "root",
+        "depth": 1,
+        "edge_status": None,
+        "agent_path": "",
+        "agent_role": None,
+        "agent_nickname": None,
+        "model": None,
+        "reasoning_effort": None,
+        "model_provider": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
+def test_subagents_preserve_wal_readonly_and_reflect_wal_updates(tmp_path, monkeypatch):
+    bridge = _bridge()
+    home = tmp_path / "wal-codex"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    db = _create_full_codex_db(home)
+    with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        conn.execute(
+            "INSERT INTO threads VALUES ('s1', '/repo', 'p1', 'S1', NULL, NULL, 'user', 'cli', 'gpt-6.2-sol', 'high', 'openai', NULL, NULL, NULL, 1.0, 1.0)"
+        )
+        conn.execute(
+            "INSERT INTO threads VALUES ('c1', '/repo', 'p1', 'C1', NULL, NULL, 'subagent', 'cli', 'gpt-6.2-mini', 'low', 'openai', '/root/c1', 'coder', 'A', 2.0, 2.0)"
+        )
+        conn.execute("INSERT INTO thread_spawn_edges VALUES ('s1', 'c1', 'running')")
+        conn.commit()
+
+        before = _snapshot(home)
+        assert [item["thread_id"] for item in bridge.get_session_subagents("s1")] == ["c1"]
+        assert _snapshot(home) == before
+
+        wal = home / "state_5.sqlite-wal"
+        wal_ns = wal.stat().st_mtime_ns + 1_000_000_000
+        conn.execute(
+            "INSERT INTO threads VALUES ('c2', '/repo', 'p1', 'C2', NULL, NULL, 'subagent', 'cli', 'gpt-6.2-nano', 'medium', 'openai', '/root/c1/c2', 'explorer', 'B', 3.0, 3.0)"
+        )
+        conn.execute("INSERT INTO thread_spawn_edges VALUES ('c1', 'c2', 'completed')")
+        conn.commit()
+        os.utime(wal, ns=(wal_ns, wal_ns))
+
+        before = _snapshot(home)
+        subagents = bridge.get_session_subagents("s1")
+        assert [(item["thread_id"], item["depth"]) for item in subagents] == [("c1", 1), ("c2", 2)]
+        assert _snapshot(home) == before

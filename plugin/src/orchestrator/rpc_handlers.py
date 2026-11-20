@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,30 @@ def _discover_cli_executables() -> dict[str, str | None]:
             found = shutil.which(name)
             result[name.replace("tri-orchestrator-", "")] = found
     return result
+
+
+def _clean_opt_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _resolve_live_model_and_effort(
+    session_id: str | None, preferred_model: str | None = None
+) -> tuple[str | None, str | None]:
+    """Resolve model and matching reasoning_effort without pairing mismatched live effort."""
+    preferred = _clean_opt_str(preferred_model)
+    live = codex_bridge.get_thread_meta(session_id) if session_id else None
+    live_model = _clean_opt_str(live.get("model")) if live else None
+    live_effort = _clean_opt_str(live.get("reasoning_effort")) if live else None
+    resolved_model = preferred or live_model
+    resolved_effort = (
+        live_effort
+        if (live and resolved_model and live_model == resolved_model)
+        else None
+    )
+    return resolved_model, resolved_effort
 
 
 class EventBus:
@@ -824,6 +849,7 @@ INTERNAL_RPC_DEFINITIONS: list[dict[str, Any]] = [
                 "event_name": {"type": "string"},
                 "cwd": {"type": "string"},
                 "turn_id": {"type": "string"},
+                "model": {"type": "string"},
                 "prompt_preview": {"type": "string"},
                 "has_mode_invocation": {"type": "boolean"},
                 "stop_hook_active": {"type": "boolean", "default": False},
@@ -955,6 +981,139 @@ class RpcDispatcher:
             raise ValueError(f"Missing or invalid required string argument {key!r}")
         return val
 
+    def _sync_run_agent_models(self, run_id: str) -> dict[str, dict[str, Any]]:
+        """Snapshot live Codex thread model metadata for run workers and their L2+ subagents."""
+        run = self.db.get_run(run_id)
+        if not run or not run.get("session_id"):
+            return {}
+
+        session_id = str(run["session_id"])
+        root_thread = codex_bridge.get_thread_meta(session_id)
+        subagents = codex_bridge.get_session_subagents(session_id)
+        workers = self.db.list_workers(run_id=run_id)
+        if not workers:
+            return {}
+
+        by_id: dict[str, dict[str, Any]] = {}
+        depth1_by_path: dict[str, list[dict[str, Any]]] = {}
+        children_by_parent: dict[str, list[dict[str, Any]]] = {}
+
+        for node in subagents:
+            tid = _clean_opt_str(node.get("thread_id"))
+            if not tid:
+                continue
+            by_id[tid] = node
+            node_path = _clean_opt_str(node.get("agent_path"))
+            if node.get("depth") == 1 and node_path:
+                depth1_by_path.setdefault(node_path, []).append(node)
+            parent_tid = _clean_opt_str(node.get("parent_thread_id"))
+            if parent_tid:
+                children_by_parent.setdefault(parent_tid, []).append(node)
+
+        refreshed: dict[str, dict[str, Any]] = {}
+        subagent_rows: list[dict[str, Any]] = []
+        seen_subagent_tids: set[str] = set()
+
+        for worker in workers:
+            agent_path = (
+                _clean_opt_str(worker.get("agent_id"))
+                or _clean_opt_str(worker.get("pending_agent_path"))
+                or ""
+            )
+            is_root_worker = agent_path == "/root"
+            existing_tid = _clean_opt_str(worker.get("codex_thread_id"))
+
+            matched: dict[str, Any] | None = None
+            matched_thread_id: str | None = None
+
+            if existing_tid and existing_tid in by_id:
+                matched = by_id[existing_tid]
+                matched_thread_id = existing_tid
+            elif is_root_worker:
+                if root_thread is not None:
+                    matched = root_thread
+                    matched_thread_id = session_id
+            elif agent_path and agent_path in depth1_by_path:
+                candidates = depth1_by_path[agent_path]
+                if len(candidates) == 1:
+                    matched = candidates[0]
+                else:
+                    worker_created = worker.get("created_at") or 0.0
+                    matched = min(
+                        candidates,
+                        key=lambda node: (
+                            abs(
+                                (
+                                    node.get("created_at")
+                                    if node.get("created_at") is not None
+                                    else worker_created
+                                )
+                                - worker_created
+                            ),
+                            str(node.get("thread_id") or ""),
+                        ),
+                    )
+                matched_thread_id = _clean_opt_str(matched.get("thread_id"))
+            else:
+                direct_agent_id = _clean_opt_str(worker.get("agent_id"))
+                if direct_agent_id and direct_agent_id in by_id:
+                    matched_thread_id = direct_agent_id
+                    matched = by_id[direct_agent_id]
+
+            if matched is None or not matched_thread_id:
+                refreshed[worker["name"]] = worker
+                continue
+
+            updated_worker = self.db.update_worker_model_meta(
+                worker["id"],
+                codex_thread_id=matched_thread_id,
+                model=_clean_opt_str(matched.get("model")),
+                reasoning_effort=_clean_opt_str(matched.get("reasoning_effort")),
+                model_provider=_clean_opt_str(matched.get("model_provider")),
+            )
+            refreshed[worker["name"]] = (
+                updated_worker if updated_worker is not None else worker
+            )
+
+            if not is_root_worker and matched_thread_id != session_id:
+                queue = deque(children_by_parent.get(matched_thread_id, ()))
+                visited = {matched_thread_id}
+                while queue:
+                    child = queue.popleft()
+                    child_tid = _clean_opt_str(child.get("thread_id"))
+                    if not child_tid or child_tid in visited:
+                        continue
+                    visited.add(child_tid)
+                    depth = int(child.get("depth") or 0)
+                    if depth >= 2 and child_tid not in seen_subagent_tids:
+                        seen_subagent_tids.add(child_tid)
+                        subagent_rows.append(
+                            {
+                                "thread_id": child_tid,
+                                "parent_worker_id": worker["id"],
+                                "parent_thread_id": (
+                                    _clean_opt_str(child.get("parent_thread_id"))
+                                    or matched_thread_id
+                                ),
+                                "depth": depth,
+                                "agent_path": child.get("agent_path") or "",
+                                "agent_role": child.get("agent_role"),
+                                "agent_nickname": child.get("agent_nickname"),
+                                "model": child.get("model"),
+                                "reasoning_effort": child.get("reasoning_effort"),
+                                "model_provider": child.get("model_provider"),
+                                "edge_status": child.get("edge_status"),
+                                "created_at": child.get("created_at"),
+                                "updated_at": child.get("updated_at"),
+                            }
+                        )
+                    queue.extend(children_by_parent.get(child_tid, ()))
+
+        if subagent_rows:
+            self.db.upsert_worker_subagents(run_id, subagent_rows)
+
+        return refreshed
+
     # ------------------------------------------------------------------
     # Run & Task Packet Handlers
     # ------------------------------------------------------------------
@@ -1026,6 +1185,7 @@ class RpcDispatcher:
                     root, name=name, is_git=is_git,
                     codex_project_id=codex_id, codex_project_name=codex_name,
                 )["id"]
+            turn = None
             if session_id:
                 turn = self.db.get_session_turn(session_id, turn_id) if turn_id else None
                 if turn_id is None:
@@ -1043,6 +1203,24 @@ class RpcDispatcher:
                     previous_run_id = turn["active_run_id"]
                     if trigger_prompt is None:
                         trigger_prompt = turn["prompt_preview"]
+            trigger_model = _clean_opt_str(turn.get("model")) if turn else None
+            trigger_reasoning_effort = _clean_opt_str(turn.get("reasoning_effort")) if turn else None
+            if session_id and (not trigger_model or not trigger_reasoning_effort):
+                live_model, live_effort = _resolve_live_model_and_effort(session_id, trigger_model)
+                if not trigger_model:
+                    trigger_model = live_model
+                if not trigger_reasoning_effort and trigger_model and live_model == trigger_model:
+                    trigger_reasoning_effort = live_effort
+                if turn and (
+                    (not _clean_opt_str(turn.get("model")) and trigger_model)
+                    or (not _clean_opt_str(turn.get("reasoning_effort")) and trigger_reasoning_effort)
+                ):
+                    self.db.update_session_turn_model(
+                        session_id,
+                        turn["turn_id"],
+                        model=trigger_model,
+                        reasoning_effort=trigger_reasoning_effort,
+                    )
             run = self.db.create_run(
                 mode=mode,
                 title=title,
@@ -1053,6 +1231,8 @@ class RpcDispatcher:
                 turn_id=turn_id,
                 trigger_prompt=trigger_prompt if trigger_prompt is not None else "",
                 execution_root=str(Path(execution_root).resolve(strict=False)) if execution_root else "",
+                trigger_model=trigger_model,
+                trigger_reasoning_effort=trigger_reasoning_effort,
             )
         self._emit("run_updated", {"run_id": run["id"], "run": run}, run_id=run["id"])
         if session_id:
@@ -1077,6 +1257,7 @@ class RpcDispatcher:
             title=args.get("title"),
             metadata=args.get("metadata"),
         )
+        self._sync_run_agent_models(run_id)
         self._emit("run_updated", {"run_id": run["id"], "run": run}, run_id=run["id"])
         return {**run, "cli_executables": _discover_cli_executables()}
 
@@ -1208,6 +1389,8 @@ class RpcDispatcher:
                 int(raw_threshold) if raw_threshold is not None else None
             ),
         )
+        refreshed = self._sync_run_agent_models(run_id)
+        worker = refreshed.get(worker["name"], worker)
         self._emit(
             "worker_updated",
             {"run_id": worker["run_id"], "worker": worker},
@@ -1223,6 +1406,8 @@ class RpcDispatcher:
             current_task=args.get("current_task"),
             status=args.get("status"),
         )
+        refreshed = self._sync_run_agent_models(worker["run_id"])
+        worker = refreshed.get(worker["name"], worker)
         self._emit(
             "worker_updated",
             {"run_id": worker["run_id"], "worker": worker},
@@ -1240,6 +1425,8 @@ class RpcDispatcher:
             current_task=args.get("current_task"),
             workspace_id=args.get("workspace_id"),
         )
+        refreshed = self._sync_run_agent_models(worker["run_id"])
+        worker = refreshed.get(worker["name"], worker)
         self._emit(
             "worker_updated",
             {"run_id": worker["run_id"], "worker": worker},
@@ -1262,7 +1449,8 @@ class RpcDispatcher:
             run_id = result['run_id']
             event = {'run_id': run_id, 'action_id': result['action_id'], 'status': result['status']}
             if result.get('action_type') == 'spawn_agent' and args.get('action') in {'record', 'reconcile'}:
-                worker = self.db.get_worker_by_name(run_id, result['recipient'])
+                refreshed = self._sync_run_agent_models(run_id)
+                worker = refreshed.get(result['recipient']) or self.db.get_worker_by_name(run_id, result['recipient'])
                 if worker is not None:
                     self._emit('worker_updated', {'run_id': run_id, 'worker': worker}, run_id=run_id)
                 self._emit('workflow_updated', {'run_id': run_id}, run_id=run_id)
@@ -1877,6 +2065,8 @@ class RpcDispatcher:
             {k: v for k, v in ws.items() if k not in {"snapshot_manifest", "snapshot_manifest_json"}}
             if ws is not None else None
         )
+        refreshed = self._sync_run_agent_models(run_id)
+        worker = refreshed.get(worker["name"], worker)
         if compact_ws is not None:
             self._emit("workspace_updated", {"run_id": run_id, "workspace": compact_ws}, run_id=run_id)
         self._emit("worker_updated", {"run_id": run_id, "worker": worker}, run_id=run_id)
@@ -2013,8 +2203,9 @@ class RpcDispatcher:
                 agent_id=args.get("agent_id"),
                 cancel=cancel,
             )
+            refreshed = self._sync_run_agent_models(run_id)
             if updated.get("action_type") == "spawn_agent":
-                w = self.db.get_worker_by_name(run_id, updated["recipient"])
+                w = refreshed.get(updated["recipient"]) or self.db.get_worker_by_name(run_id, updated["recipient"])
                 if w is not None:
                     self._emit("worker_updated", {"run_id": run_id, "worker": w}, run_id=run_id)
                 self._emit("workflow_updated", {"run_id": run_id}, run_id=run_id)
@@ -2036,6 +2227,7 @@ class RpcDispatcher:
             result=result_str,
             cancel=cancel,
         )
+        self._sync_run_agent_models(run_id)
         self._emit(
             "native_action_updated",
             {
@@ -2170,7 +2362,8 @@ class RpcDispatcher:
                     )
 
         compact_step = _strip_step_manifests(step)
-        updated_worker = self.db.get_worker_by_name(run_id, actor)
+        refreshed = self._sync_run_agent_models(run_id)
+        updated_worker = refreshed.get(actor) or self.db.get_worker_by_name(run_id, actor)
         if updated_worker is not None:
             self._emit("worker_updated", {"run_id": run_id, "worker": updated_worker}, run_id=run_id)
         self._emit("workflow_updated", {"run_id": run_id, "step": compact_step}, run_id=run_id)
@@ -2277,7 +2470,8 @@ class RpcDispatcher:
             artifact["verify_command_hint"] = verify_hint
             artifact["cli_executables"] = cli_exes
 
-            updated_worker = self.db.get_worker_by_name(run_id, verifier)
+            refreshed = self._sync_run_agent_models(run_id)
+            updated_worker = refreshed.get(verifier) or self.db.get_worker_by_name(run_id, verifier)
             if updated_worker is not None:
                 self._emit("worker_updated", {"run_id": run_id, "worker": updated_worker}, run_id=run_id)
             if ack_msg_out is not None:
@@ -2420,7 +2614,8 @@ class RpcDispatcher:
             step = self.workflow.get_step(step_id)
 
         compact_step = _strip_step_manifests(step)
-        updated_worker = self.db.get_worker_by_name(run_id, verifier_name)
+        refreshed = self._sync_run_agent_models(run_id)
+        updated_worker = refreshed.get(verifier_name) or self.db.get_worker_by_name(run_id, verifier_name)
         if updated_worker is not None:
             self._emit("worker_updated", {"run_id": run_id, "worker": updated_worker}, run_id=run_id)
         if ack_msg_final is not None:
@@ -2525,13 +2720,22 @@ class RpcDispatcher:
                 )
 
         stopped_workers: list[str] = []
+        stopped_entries: list[tuple[str, dict[str, Any]]] = []
         for w in self.db.list_workers(run_id=run_id):
             if w["status"] in {"waiting", "working"}:
                 updated_w = self.db.update_worker_status(
                     status="stopped", run_id=run_id, worker_name=w["name"],
                 )
                 stopped_workers.append(w["name"])
-                self._emit("worker_updated", {"run_id": run_id, "worker": updated_w}, run_id=run_id)
+                stopped_entries.append((w["name"], updated_w))
+
+        refreshed = self._sync_run_agent_models(run_id)
+        for worker_name, updated_w in stopped_entries:
+            self._emit(
+                "worker_updated",
+                {"run_id": run_id, "worker": refreshed.get(worker_name, updated_w)},
+                run_id=run_id,
+            )
 
         board_pointer: dict[str, Any] | None = None
         raw_summary = args.get("summary")
@@ -2567,6 +2771,7 @@ class RpcDispatcher:
             run_id,
             project_root=args.get("project_root"),
         )
+        self._sync_run_agent_models(run_id)
         self._emit("session_updated", {"run_id": run_id, "session_id": session_id}, run_id=run_id)
         return {"bound": True, **binding}
 
@@ -2622,9 +2827,14 @@ class RpcDispatcher:
             turn_id = (args.get("turn_id") or "").strip()
             invoked = args.get("has_mode_invocation")
             if turn_id and (invoked is True or bindings or self.db.list_session_turns(session_id)):
+                turn_model, turn_effort = _resolve_live_model_and_effort(
+                    session_id, args.get("model")
+                )
                 turn = self.db.upsert_session_turn(
                     session_id, turn_id, cwd=cwd_text, prompt_preview=args.get("prompt_preview", ""),
                     active_run_id=selected[1]["id"] if selected else None,
+                    model=turn_model,
+                    reasoning_effort=turn_effort,
                 )
                 self._emit(
                     "session_updated",
@@ -2638,6 +2848,56 @@ class RpcDispatcher:
             if invoked is False:
                 return {**empty, "bound": True, "run_id": run["id"], "project_root": binding["project_root"]}
             return self._session_run_hook_result(args, binding, run, check_stop=False)
+
+        turn_id = _clean_opt_str(args.get("turn_id"))
+        if turn_id and event_name in {"stop", "postcompact", "sessionstart"}:
+            turn = self.db.get_session_turn(session_id, turn_id)
+            if turn is not None and (not turn.get("model") or not turn.get("reasoning_effort")):
+                preferred_turn_model = _clean_opt_str(args.get("model")) or _clean_opt_str(
+                    turn.get("model")
+                )
+                resolved_model, resolved_effort = _resolve_live_model_and_effort(
+                    session_id, preferred_turn_model
+                )
+                existing_turn_model = _clean_opt_str(turn.get("model"))
+                safe_effort = (
+                    resolved_effort
+                    if (not existing_turn_model or existing_turn_model == resolved_model)
+                    else None
+                )
+                if (not existing_turn_model and resolved_model) or (
+                    not turn.get("reasoning_effort") and safe_effort
+                ):
+                    turn = self.db.update_session_turn_model(
+                        session_id,
+                        turn_id,
+                        model=resolved_model if not existing_turn_model else None,
+                        reasoning_effort=safe_effort,
+                    )
+            for _, run, _, _ in matching:
+                if run.get("turn_id") == turn_id and not run.get("trigger_reasoning_effort"):
+                    existing_run_model = _clean_opt_str(run.get("trigger_model"))
+                    preferred_run_model = (
+                        existing_run_model
+                        or _clean_opt_str(args.get("model"))
+                        or (_clean_opt_str(turn.get("model")) if turn is not None else None)
+                    )
+                    run_model, run_effort = _resolve_live_model_and_effort(
+                        session_id, preferred_run_model
+                    )
+                    if existing_run_model:
+                        if run_model == existing_run_model and run_effort:
+                            self.db.update_run_trigger_model(
+                                run["id"],
+                                trigger_model=existing_run_model,
+                                trigger_reasoning_effort=run_effort,
+                            )
+                    elif run_model:
+                        self.db.update_run_trigger_model(
+                            run["id"],
+                            trigger_model=run_model,
+                            trigger_reasoning_effort=run_effort,
+                        )
 
         if not matching:
             return empty

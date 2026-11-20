@@ -306,6 +306,8 @@ def verify(backup_dir: Path) -> dict:
         required.update({"plan_admission_v1", "compact_handoff_v1", "recipient_groups_v1", "progress_classification_v1", "workflow_reviews_v1"})
     if manifest["supported_schema"] >= 8:
         required.update({"macro_rpc_v1", "compact_board_v1", "workflow5_direct_spawn_v1", "session_hooks_v1"})
+    if manifest["supported_schema"] >= 10:
+        required.add("agent_model_tracking_v1")
     if (health.get("status") != "ok" or health.get("ok") is not True
             or type(health.get("pid")) is not int or not process_alive(health["pid"])
             or health.get("software_version") != manifest["source_identity"]["version"]
