@@ -59,7 +59,7 @@ bash scripts/install.sh
 
 ### 旧版本运行库升级
 
-如果本地已存在旧版 Schema 运行库（例如从 `schema <= 9` 升级至 `0.6.2` / `schema 10`），需先结束全部活跃任务并停止守护进程，再使用 `scripts/upgrade.py` 执行受控备份与离线升级，最后通过 Codex 重新安装插件：
+如果本地已存在旧版 Schema 运行库（例如从 `schema <= 9` 升级至 `0.6.3` / `schema 10`），需先结束全部活跃任务并停止守护进程，再使用 `scripts/upgrade.py` 执行受控备份与离线升级，最后通过 Codex 重新安装插件：
 
 ```bash
 python scripts/upgrade.py prepare --source-plugin ./plugin --target-plugin <old-plugin-dir> --data-dir <data-dir> --backup-dir <backup-dir>

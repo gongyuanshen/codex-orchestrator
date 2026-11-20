@@ -156,7 +156,7 @@ def test_workflow5_macro_rpc_primary_path_and_reconciliation_fence(mode: str) ->
     text = _skill_text(mode)
     for required in (
         "workflow5",
-        "0.6.2/schema10",
+        "0.6.3/schema10",
         "workflow_prepare_dispatch",
         "task_name",
         "/root/<task_name>",
