@@ -80,7 +80,7 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
         assert f"name: {path.parent.name}" in text, path
         assert "../route-a-workflow.md" in text, path
     shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
-    assert "workflow5" in shared and "0.6.2/schema10" in shared
+    assert "workflow5" in shared and "0.6.3/schema10" in shared
     assert 'artifact_id=candidate["id"]' in shared
     assert 'recipient_agent_id=next_coordinator_agent_id' in shared
     assert "before native implementation dispatch" in shared

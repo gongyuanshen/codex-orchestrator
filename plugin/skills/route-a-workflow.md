@@ -1,6 +1,6 @@
-# Route A structured workflow (current workflow5 in software 0.6.2/schema10; stored workflow_version=1/2/3/4/5)
+# Route A structured workflow (current workflow5 in software 0.6.3/schema10; stored workflow_version=1/2/3/4/5)
 
-Load this shared contract before executing Boost, Teamwork, or Swarm. In software 0.6.2/schema10, new runs default to `workflow5` (superseding the M3/M4/M5 software 0.5.0/schema7 baseline where New runs use workflow4). Stored `workflow0/1/2/3/4` runs execute strictly by `board_status.workflow.workflow_version` without fabricated historical evidence (`workflow0` legacy, `workflow1` foundation, `workflow2` mode bindings, `workflow3` M2 collector, `workflow4` M3/M4/M5 gates). Unknown versions are unsupported; no public downgrade selector. Never use raw SQL, metadata, worker status or a board PASS to disable gates. A receipt is not independent acceptance.
+Load this shared contract before executing Boost, Teamwork, or Swarm. In software 0.6.3/schema10, new runs default to `workflow5` (superseding the M3/M4/M5 software 0.5.0/schema7 baseline where New runs use workflow4). Stored `workflow0/1/2/3/4` runs execute strictly by `board_status.workflow.workflow_version` without fabricated historical evidence (`workflow0` legacy, `workflow1` foundation, `workflow2` mode bindings, `workflow3` M2 collector, `workflow4` M3/M4/M5 gates). Unknown versions are unsupported; no public downgrade selector. Never use raw SQL, metadata, worker status or a board PASS to disable gates. A receipt is not independent acceptance.
 
 ## M6/M7/M8 workflow5 primary path and Codex V2 native execution
 
