@@ -76,3 +76,65 @@ def test_overview_kpi_strip_highlights_blockers_and_sets_mode_accent():
       assert.ok(html.includes('kpi-card is-alert'));
       assert.equal(el.dashboardShell.getAttribute('data-mode'),'boost');
     })()''')
+
+
+def test_codex_cli_source_url_defaults_and_palette_selection():
+    run_dashboard(r'''(async()=>{
+      const snapshot={id:'job',session_id:'cli-bound',project_id:'db-root',mode:'swarm',
+        title:'Batch Run',updated_at:1,status:'completed'};
+      const run={...snapshot,canonical_project_id:'projection'};
+      const desktopRun={...snapshot,id:'sprint',session_id:'visual',project_id:'desktop-root',status:'active'};
+      const projects=[
+        {id:'desktop-root',name:'Graphical Project',project_origin:'desktop',
+          threads:[{session_id:'visual',title:'Visual Session',client_kind:'desktop',runs:[desktopRun]}]},
+        {id:'projection',name:'Terminal Project',project_origin:'cli',threads:[
+          {session_id:'cli-bound',title:'Batch Session',client_kind:'cli',codex_source:'exec',runs:[run]},
+          {session_id:'interactive',title:'Terminal Discussion',client_kind:'cli',codex_source:'cli',runs:[]},
+        ]},
+      ];
+      const loading=loadProjects();
+      requests[0].resolve({codex_catalog:{available:true,projects}});
+      await new Promise(resolve=>setImmediate(resolve));
+      assert.equal(requests[1].url,'/api/runs/job/snapshot');
+      requests[1].resolve({run:snapshot});
+      await loading;
+      assert.equal(state.run.id,'job');
+      assert.equal(state.loadState,'ready');
+      assert.ok(!el.runSidebarList.innerHTML.includes('Visual Session'));
+      assert.ok(el.runSidebarList.innerHTML.includes('Terminal Discussion'));
+      assert.ok(!el.projectPopoverList.innerHTML.includes('Graphical Project'));
+      const href=nodes.get('nav-teamwork').getAttribute('href');
+      assert.equal(new URLSearchParams(href.split('?')[1]).get('source'),'cli');
+
+      const pickingProject=executeCommandEntry('project','projection');
+      requests.at(-1).resolve({run:snapshot});
+      await pickingProject;
+      assert.equal(state.selectedProjectId,'projection');
+      assert.equal(state.run.id,'job');
+      await executeCommandEntry('thread','interactive');
+      assert.equal(state.selectedSessionId,'interactive');
+      assert.equal(state.selectedRunId,null);
+      assert.ok(el.runSidebarList.innerHTML.includes('data-select-thread="interactive"'));
+      const selecting=executeCommandEntry('run','job');
+      requests.at(-1).resolve({run:snapshot});
+      await selecting;
+      assert.equal(state.run.id,'job');
+      assert.equal(state.loadError,'');
+      assert.equal(state.loadState,'ready');
+      const params=new URLSearchParams(window.location.search);
+      assert.equal(params.get('run_id'),'job');
+      assert.equal(params.get('project_id'),'projection');
+      assert.equal(params.get('source'),'cli');
+      assert.equal(params.get('mode'),'all');
+    })()''', search='?source=cli&mode=all')
+
+
+def test_codex_source_toggle_declares_accessible_default():
+    from pathlib import Path
+
+    html = (Path(__file__).resolve().parents[1] / "plugin/src/orchestrator/web/index.html").read_text(encoding="utf-8")
+    toggle = html.split('id="runSourceToggle"', 1)[1].split("</div>", 1)[0]
+    assert 'role="group" aria-label="来源端筛选"' in toggle
+    assert 'data-run-source="all" aria-pressed="true">全部来源' in toggle
+    assert 'data-run-source="desktop" aria-pressed="false">桌面端' in toggle
+    assert 'data-run-source="cli" aria-pressed="false">CLI' in toggle

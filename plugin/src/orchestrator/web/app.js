@@ -86,6 +86,8 @@
     draft: '草稿',
   };
 
+  const CODEX_SOURCE_LABELS = { desktop: '桌面', cli: 'CLI' };
+
   const state = {
     theme: 'light',
     activeTab: 'overview',
@@ -97,6 +99,7 @@
     projectFixturesOpen: false,
     runSearchQuery: '',
     runStatusFilter: 'all',
+    runSource: 'all',
     allModes: false,
     sessionOpenOverrides: new Map(),
     codexProjectOpenOverrides: new Map(),
@@ -208,7 +211,8 @@
     projectPopoverList: document.getElementById('projectPopoverList'),
     sidebarRunsCount: document.getElementById('sidebarRunsCount'),
     runSearchInput: document.getElementById('runSearchInput'),
-    runFilterPills: Array.from(document.querySelectorAll('.run-filter-pill')),
+    runFilterPills: Array.from(document.querySelectorAll('#runFilterPills [data-run-filter]')),
+    runSourceToggle: document.getElementById('runSourceToggle'),
     runSidebarList: document.getElementById('runSidebarList'),
     runModeToggle: document.getElementById('runModeToggle'),
     runModeCurrentBtn: document.getElementById('runModeCurrentBtn'),
@@ -1135,6 +1139,8 @@
     else params.delete('run_id');
     if (state.allModes) params.set('mode', 'all');
     else params.delete('mode');
+    if (state.runSource !== 'all') params.set('source', state.runSource);
+    else params.delete('source');
     const qs = params.toString();
     const target = qs ? `${window.location.pathname}?${qs}` : window.location.pathname;
     window.history.replaceState(null, '', target);
@@ -1142,8 +1148,14 @@
   }
 
   function renderModeLinks() {
-    const projectId = state.selectedProjectId || new URLSearchParams(window.location.search).get('project_id');
-    const query = projectId ? `?${new URLSearchParams({ project_id: projectId })}` : '';
+    const current = new URLSearchParams(window.location.search);
+    const params = new URLSearchParams();
+    const projectId = state.selectedProjectId || current.get('project_id');
+    if (projectId) params.set('project_id', projectId);
+    const source = current.get('source');
+    if (Object.hasOwn(CODEX_SOURCE_LABELS, source)) params.set('source', source);
+    const qs = params.toString();
+    const query = qs ? `?${qs}` : '';
     for (const link of el.modeLinks) {
       const mode = link.dataset.modeLink;
       link.setAttribute('href', `/${mode}${query}`);
@@ -1162,13 +1174,31 @@
     return true;
   }
 
-  function collectCodexRuns(projectId = ALL_PROJECTS, mode = null) {
+  function codexThreadSource(thread) {
+    return thread.client_kind === 'cli' ? 'cli' : 'desktop';
+  }
+
+  function matchesCodexSource(thread, source = state.runSource) {
+    return source === 'all' || codexThreadSource(thread) === source;
+  }
+
+  function projectsForSource() {
+    const projects = state.codexCatalogAvailable ? state.codexProjects : state.projects;
+    if (state.runSource === 'desktop') return projects.filter((p) => p.project_origin !== 'cli');
+    if (state.runSource === 'cli') {
+      return projects.filter((p) => p.project_origin === 'cli' || p.threads?.some((t) => t.client_kind === 'cli'));
+    }
+    return projects;
+  }
+
+  function collectCodexRuns(projectId = ALL_PROJECTS, mode = null, source = 'all') {
     const runs = [];
     for (const proj of state.codexProjects) {
       if (projectId && projectId !== ALL_PROJECTS && String(proj.id) !== String(projectId)) {
         continue;
       }
       for (const thread of proj.threads || []) {
+        if (!matchesCodexSource(thread, source)) continue;
         for (const run of thread.runs || []) {
           if (!mode || run.mode === mode) {
             runs.push(run);
@@ -1262,6 +1292,8 @@
   async function loadProjects() {
     const params = new URLSearchParams(window.location.search);
     state.allModes = params.get('mode') === 'all';
+    const source = params.get('source');
+    state.runSource = Object.hasOwn(CODEX_SOURCE_LABELS, source) ? source : 'all';
     const requestedProject = state.selectedProjectId || params.get('project_id');
     const requestedRun = state.selectedRunId || params.get('run_id');
     const requestedSession = state.selectedSessionId;
@@ -1321,7 +1353,7 @@
               .filter((r) => String(r.session_id) === String(requestedSession));
             runId = (threadRuns.find((r) => r.status === 'active') || threadRuns[0])?.id || null;
           } else {
-            const catalogRuns = collectCodexRuns(ALL_PROJECTS, modeFilter);
+            const catalogRuns = collectCodexRuns(ALL_PROJECTS, modeFilter, state.runSource);
             const preferred = catalogRuns.find((r) => r.status === 'active') || catalogRuns[0] || null;
             runId = preferred?.id || null;
           }
@@ -1411,7 +1443,8 @@
           const sessionRuns = runs.filter((r) => String(r.session_id) === String(state.selectedSessionId));
           runId = sessionRuns[0]?.id || null;
         } else if (!runId) {
-          runId = runs[0]?.id || null;
+          const matchingRuns = state.runSource === 'all' ? runs : collectCodexRuns(projectId, mode, state.runSource);
+          runId = matchingRuns[0]?.id || null;
         }
         if (runId) {
           const picked = runs.find((r) => String(r.id) === String(runId));
@@ -2162,9 +2195,10 @@
 
   function renderProjectPopover() {
     const q = state.projectSearchQuery.trim().toLowerCase();
+    const projects = projectsForSource();
     if (state.codexCatalogAvailable) {
       const allLabel = '全部项目（Codex 目录）';
-      const list = state.codexProjects.filter((p) => `${projectName(p)} ${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q));
+      const list = projects.filter((p) => [projectName(p), p.name, p.root_path, p.project_origin, CODEX_SOURCE_LABELS[p.project_origin]].join(' ').toLowerCase().includes(q));
       const renderCodexItem = (p, isAll = false) => {
         const selected = String(p.id) === String(state.selectedProjectId);
         const threadBadge = !isAll
@@ -2178,6 +2212,7 @@
               <span class="popover-item-title">${escapeHtml(projectName(p))}</span>
               ${p.active_run_count > 0 ? `<span class="chip-tag tabular tint-success">${escapeHtml(p.active_run_count)} 个活跃</span>` : ''}
               ${threadBadge}
+              ${p.project_origin === 'cli' ? renderCodexSourceBadge('cli') : ''}
               ${p.is_git ? '<span class="chip-tag tint-primary">[Git]</span>' : ''}
             </div>
             ${p.root_path ? `<span class="popover-item-path mono" title="${escapeHtml(p.root_path)}">${escapeHtml(p.root_path)}</span>` : ''}
@@ -2188,14 +2223,14 @@
         el.projectPopoverList,
         (showAll ? renderCodexItem({ id: ALL_PROJECTS, name: allLabel }, true) : '') +
         list.map((p) => renderCodexItem(p, false)).join('') +
-        (!showAll && list.length === 0 ? `<div class="empty-state">${state.codexProjects.length ? '未匹配到相关 Codex 项目' : '暂无 Codex 项目'}</div>` : ''),
+        (list.length === 0 ? `<div class="empty-state">${projects.length ? '未匹配到相关 Codex 项目' : '暂无此来源的 Codex 项目'}</div>` : ''),
         ['data-select-project'],
         el.projectSearchInput
       );
       return;
     }
 
-    const list = state.projects.filter((p) => `${projectName(p)} ${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q));
+    const list = projects.filter((p) => `${projectName(p)} ${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q));
     const renderItem = (p) => {
       const selected = String(p.id) === String(state.selectedProjectId);
       return `
@@ -2251,6 +2286,10 @@
     }
   }
 
+  function renderCodexSourceBadge(source) {
+    return `<span class="chip-tag tint-muted source-badge">${CODEX_SOURCE_LABELS[source]}</span>`;
+  }
+
   function renderRunSidebarCard(r, withSession = false) {
     const selected = String(r.id) === String(state.selectedRunId);
     const status = String(r.status || 'unknown').toLowerCase();
@@ -2291,13 +2330,12 @@
     const replace = (html) => replaceSelectorMarkup(
       el.runSidebarList, html, ['data-select-run', 'data-select-thread'], el.runSearchInput
     );
-    const targetProjects = state.selectedProjectId === ALL_PROJECTS
-      ? state.codexProjects
-      : state.codexProjects.filter((p) => String(p.id) === String(state.selectedProjectId));
+    const targetProjects = projectsForSource().filter((p) =>
+      state.selectedProjectId === ALL_PROJECTS || String(p.id) === String(state.selectedProjectId));
 
     if (targetProjects.length === 0) {
       el.sidebarRunsCount.textContent = '0';
-      const msg = state.loadState === 'loading' ? '正在加载 Codex 目录…' : state.loadState === 'error' ? '目录未加载' : '暂无 Codex 项目';
+      const msg = state.loadState === 'loading' ? '正在加载 Codex 目录…' : state.loadState === 'error' ? '目录未加载' : '暂无此范围和来源的 Codex 项目';
       replace(`<div class="empty-state">${escapeHtml(msg)}</div>`);
       return;
     }
@@ -2311,10 +2349,12 @@
 
     for (const p of targetProjects) {
       const pName = projectName(p);
-      const projectMatches = !q || [pName, p.name, p.root_path].join(' ').toLowerCase().includes(q);
+      const projectMatches = !q || [pName, p.name, p.root_path, p.project_origin, CODEX_SOURCE_LABELS[p.project_origin]].join(' ').toLowerCase().includes(q);
       const visibleThreads = [];
 
       for (const thread of p.threads || []) {
+        if (!matchesCodexSource(thread)) continue;
+        const source = codexThreadSource(thread);
         const modeRuns = mode
           ? (thread.runs || []).filter((r) => r.mode === mode)
           : [...(thread.runs || [])];
@@ -2325,7 +2365,7 @@
           return true;
         });
         const threadHay = [
-          thread.title, thread.session_id, thread.cwd, thread.model, thread.reasoning_effort,
+          thread.title, thread.session_id, thread.cwd, thread.model, thread.reasoning_effort, source, CODEX_SOURCE_LABELS[source],
         ].join(' ').toLowerCase();
         const threadMatches = !q || projectMatches || threadHay.includes(q);
         const matchedRuns = statusRuns.filter((r) => {
@@ -2364,6 +2404,7 @@
     }
 
     const renderThread = (p, t) => {
+      const sourceBadge = renderCodexSourceBadge(codexThreadSource(t.thread));
       if (t.runs.length === 0) {
         const isSelectedThread = String(state.selectedSessionId) === String(t.thread.session_id) && !state.selectedRunId;
         const badge = t.thread.model
@@ -2379,6 +2420,7 @@
             <span class="codex-thread-leaf-main">
               ${t.thread.is_pinned ? pinSvg : ''}
               <span class="codex-thread-leaf-title" title="${escapeHtml(t.thread.title)}">${escapeHtml(t.thread.title)}</span>
+              ${sourceBadge}
             </span>
             ${badge ? `<span class="codex-thread-leaf-meta">${badge}</span>` : ''}
           </button>`;
@@ -2411,6 +2453,7 @@
               ${active ? '<span class="status-dot dot-ok session-pulse" role="img" aria-label="有任务正在运行"></span>' : ''}
               ${t.thread.is_pinned ? pinSvg : ''}
               <span class="session-group-name" title="${escapeHtml(t.thread.title)}">${escapeHtml(t.thread.title)}</span>
+              ${sourceBadge}
             </span>
             <span class="session-group-meta-row">
               ${sessionModelBadge}
@@ -2440,6 +2483,7 @@
         <summary class="codex-project-summary">
           ${folderSvg}
           <span class="codex-project-name" title="${escapeHtml(p.root_path)}">${escapeHtml(projectName(p))}</span>
+          ${p.project_origin === 'cli' ? renderCodexSourceBadge('cli') : ''}
           ${p.active_run_count > 0 ? `<span class="chip-tag tint-success tabular">${escapeHtml(p.active_run_count)}</span>` : ''}
         </summary>
         <div class="codex-project-children">${body}</div>
@@ -2451,6 +2495,11 @@
     const q = state.runSearchQuery.trim().toLowerCase();
     const filter = state.runStatusFilter;
     renderRunModeToggle();
+    for (const pill of el.runSourceToggle.querySelectorAll('[data-run-source]')) {
+      const active = pill.dataset.runSource === state.runSource;
+      pill.classList.toggle('active', active);
+      pill.setAttribute('aria-pressed', String(active));
+    }
 
     if (state.codexCatalogAvailable) {
       renderCodexSidebar(q, filter);
@@ -2458,6 +2507,11 @@
     }
 
     const replace = (html) => replaceSelectorMarkup(el.runSidebarList, html, ['data-select-run'], el.runSearchInput);
+    if (state.runSource === 'cli') {
+      el.sidebarRunsCount.textContent = '0';
+      replace('<div class="empty-state">暂无 CLI 对话或任务</div>');
+      return;
+    }
     el.sidebarRunsCount.textContent = String(state.runs.length);
 
     if (state.runs.length === 0) {
@@ -2548,7 +2602,7 @@
   function getCommandPaletteEntries() {
     const q = state.cmdPaletteQuery.trim().toLowerCase();
     const items = [];
-    const addRun = (r, group) => {
+    const addRun = (r, group, source) => {
       const title = runTitle(r);
       const status = labelRunStatus(r.status);
       const project = projectFor(canonicalRunProject(r));
@@ -2560,6 +2614,7 @@
         title, r.id, r.session_id, status, sessionName(r), r.trigger_prompt,
         name, project?.name, project?.root_path, r.execution_root,
         r.codex_model, r.codex_reasoning_effort, r.trigger_model, r.trigger_reasoning_effort,
+        source, CODEX_SOURCE_LABELS[source],
       ];
       if (!terms.join(' ').toLowerCase().includes(q)) return;
       const sub = [
@@ -2569,64 +2624,66 @@
         modelLabel,
         liveLabel ? `已切换→${liveLabel}` : '',
       ].filter(Boolean).join(' · ');
-      items.push({ kind: 'run', group, id: r.id, title, sub, tone: getRunStatusTone(r.status), badge: status, active: String(r.id) === String(state.selectedRunId) });
+      items.push({ kind: 'run', group, id: r.id, title, sub, source, tone: getRunStatusTone(r.status), badge: status, active: String(r.id) === String(state.selectedRunId) });
     };
 
     if (state.codexCatalogAvailable) {
-      const catalogRuns = collectCodexRuns(ALL_PROJECTS, null);
-      const activeIds = new Set();
-      for (const r of catalogRuns) {
-        if (r.status === 'active') {
-          activeIds.add(r.id);
-          addRun(r, 'active');
-        }
+      const projects = projectsForSource();
+      const threads = projects.flatMap((p) => (p.threads || [])
+        .filter((thread) => matchesCodexSource(thread))
+        .map((thread) => ({ p, thread, source: codexThreadSource(thread) })));
+      const activeRuns = threads.flatMap(({ thread, source }) => (thread.runs || [])
+        .filter((r) => r.status === 'active')
+        .map((r) => ({ r, source })));
+      for (const { r, source } of activeRuns.sort((a, b) => runUpdatedMs(b.r) - runUpdatedMs(a.r))) {
+        addRun(r, 'active', source);
       }
-      if (!state.cmdActiveOnly) {
-        for (const p of state.codexProjects) {
-          const pName = projectName(p);
-          for (const thread of p.threads || []) {
-            const runs = thread.runs || [];
-            for (const r of runs) {
-              if (!activeIds.has(r.id)) addRun(r, 'sessions');
-            }
-            if (runs.length === 0) {
-              const terms = [thread.title, thread.session_id, pName, p.root_path, thread.model, thread.reasoning_effort];
-              if (terms.join(' ').toLowerCase().includes(q)) {
-                const modelText = formatModelText(thread.model, thread.reasoning_effort);
-                items.push({
-                  kind: 'thread',
-                  group: 'sessions',
-                  id: thread.session_id,
-                  projectId: p.id,
-                  title: thread.title,
-                  sub: [pName, 'Codex 对话', modelText || '暂无编排'].filter(Boolean).join(' · '),
-                  tone: 'tint-muted',
-                  badge: '对话',
-                  active: String(state.selectedSessionId) === String(thread.session_id) && !state.selectedRunId,
-                });
-              }
-            }
-          }
+      if (state.cmdActiveOnly) return items;
+      for (const { p, thread, source } of threads) {
+        const runs = thread.runs || [];
+        for (const r of runs) {
+          if (r.status !== 'active') addRun(r, 'sessions', source);
         }
-        for (const p of state.codexProjects) {
-          const name = projectName(p);
-          if (`${name} ${p.name || ''} ${p.root_path || ''}`.toLowerCase().includes(q)) {
-            items.push({
-              kind: 'project',
-              group: 'projects',
-              id: p.id,
-              title: name,
-              sub: p.root_path || '',
-              tone: p.is_git ? 'tint-primary' : 'tint-muted',
-              badge: p.is_git ? 'Git' : '目录',
-              active: String(p.id) === String(state.selectedProjectId),
-            });
-          }
-        }
+        if (runs.length) continue;
+        const pName = projectName(p);
+        const terms = [thread.title, thread.session_id, pName, p.root_path, thread.model, thread.reasoning_effort,
+          source, CODEX_SOURCE_LABELS[source]];
+        if (!terms.join(' ').toLowerCase().includes(q)) continue;
+        const modelText = formatModelText(thread.model, thread.reasoning_effort);
+        items.push({
+          kind: 'thread',
+          group: 'sessions',
+          id: thread.session_id,
+          projectId: p.id,
+          title: thread.title,
+          sub: [pName, 'Codex 对话', modelText || '暂无编排'].filter(Boolean).join(' · '),
+          source,
+          tone: 'tint-muted',
+          badge: '对话',
+          active: String(state.selectedSessionId) === String(thread.session_id) && !state.selectedRunId,
+        });
+      }
+      for (const p of projects) {
+        const name = projectName(p);
+        const source = p.project_origin || 'desktop';
+        const terms = [name, p.name, p.root_path, source, CODEX_SOURCE_LABELS[source]];
+        if (!terms.join(' ').toLowerCase().includes(q)) continue;
+        items.push({
+          kind: 'project',
+          group: 'projects',
+          id: p.id,
+          title: name,
+          sub: p.root_path || '',
+          source,
+          tone: p.is_git ? 'tint-primary' : 'tint-muted',
+          badge: p.is_git ? 'Git' : '目录',
+          active: String(p.id) === String(state.selectedProjectId),
+        });
       }
       return items;
     }
 
+    if (state.runSource === 'cli') return items;
     const entries = new Map();
     const allRuns = [...state.globalSessions.flatMap((session) => session.runs), ...state.runs];
     for (const run of allRuns) entries.set(run.id, run);
@@ -2666,6 +2723,7 @@
             <span class="cmd-item-title">${escapeHtml(item.title)}</span>
             <span class="cmd-item-sub mono">${escapeHtml(item.sub)}</span>
           </div>
+          ${item.source ? renderCodexSourceBadge(item.source) : ''}
           <span class="chip-tag ${item.tone}">${escapeHtml(item.active ? `${item.badge} · 当前` : item.badge)}</span>
         </button>
       `;
@@ -2724,6 +2782,7 @@
   }
 
   function renderProjectSelector() {
+    const visible = projectsForSource();
     el.projectSelect.disabled = state.projects.length === 0;
     if (state.projects.length === 0) {
       const emptyLabel = state.loadState === 'error' ? '项目未加载' : '暂无已注册项目';
@@ -2741,8 +2800,9 @@
     const allLabel = state.codexCatalogAvailable ? '全部项目（Codex 目录）' : ALL_PROJECTS_LABEL;
     const all = state.selectedProjectId === ALL_PROJECTS;
     const current = projectFor(state.selectedProjectId);
-    el.projectSelect.innerHTML = (current || all ? '' : '<option value="">请选择项目</option>') +
-      `<option value="${ALL_PROJECTS}" ${all ? 'selected' : ''}>${allLabel}</option>` + state.projects
+    const currentVisible = visible.includes(current);
+    el.projectSelect.innerHTML = (currentVisible || all ? '' : '<option value="" selected>请选择项目</option>') +
+      `<option value="${ALL_PROJECTS}" ${all ? 'selected' : ''}>${allLabel}</option>` + visible
       .map((p) => {
         const selected = String(p.id) === String(state.selectedProjectId) ? 'selected' : '';
         const kind = p.is_git ? 'Git' : '目录';
@@ -5781,6 +5841,16 @@
     };
     el.runModeCurrentBtn?.addEventListener('click', () => applyRunModeFilter(false));
     el.runModeAllBtn?.addEventListener('click', () => applyRunModeFilter(true));
+
+    el.runSourceToggle.addEventListener('click', (evt) => {
+      const pill = evt.target.closest('[data-run-source]');
+      if (!pill || pill.dataset.runSource === state.runSource) return;
+      state.runSource = pill.dataset.runSource;
+      syncUrlParams();
+      renderProjectSelector();
+      renderRunSidebar();
+      if (state.cmdPaletteOpen) renderCommandPalette();
+    });
 
     for (const pill of el.runFilterPills) {
       pill.addEventListener('click', () => {

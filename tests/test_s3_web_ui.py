@@ -297,3 +297,92 @@ def test_t6_background_sessions_do_not_interrupt_core_fetch_and_react_to_events(
       assert.equal(state.selectedRunId,'r');
       assert.equal(el.globalActiveBadge.textContent,'1 个会话运行中');
     })()''')
+
+
+def test_codex_source_controls_filter_all_catalog_surfaces_and_preserve_selection():
+    run_dashboard(r'''(async()=>{
+      const execRun={id:'exec-bound',session_id:'exec-session',title:'Execute Changes',mode:'boost',
+        status:'active',project_id:'actual-child-project',canonical_project_id:'portable'};
+      const desktopRun={...execRun,id:'visual-run',session_id:'visual-session',title:'Review Changes',
+        project_id:'mixed',canonical_project_id:'mixed'};
+      const leaf={session_id:'visual-leaf',title:'Visual Notes',runs:[]};
+      const interactive={session_id:'terminal-session',title:'Terminal Notes',client_kind:'cli',runs:[]};
+      const catalog={available:true,projects:[
+        {id:'mixed',name:'Shared Repo',project_origin:'desktop',threads:[
+          {...leaf,client_kind:'desktop'},interactive,
+          {session_id:'visual-session',title:'Visual Conversation',runs:[desktopRun]}]},
+        {id:'portable',name:'Portable Repo',project_origin:'cli',threads:[
+          {session_id:'exec-session',title:'Exec Conversation',client_kind:'cli',runs:[execRun]}]},
+        {id:'empty',name:'Empty Desktop',project_origin:'desktop',threads:[]},
+        {id:'empty-terminal',name:'Empty Terminal',project_origin:'cli',threads:[]},
+      ]};
+      const pills=['all','desktop','cli'].map(source=>{
+        const pill=testNode();pill.dataset.runSource=source;return pill;
+      });
+      const sourceToggle=document.getElementById('runSourceToggle');
+      sourceToggle.querySelectorAll=()=>pills;
+      const toggle=(source)=>sourceToggle.dispatchEvent({
+        type:'click',target:{closest:()=>pills.find(pill=>pill.dataset.runSource===source)},
+      });
+      bindEvents();
+      const loading=loadProjects();
+      requests[0].resolve({codex_catalog:catalog});
+      await new Promise(resolve=>setImmediate(resolve));
+      assert.equal(requests[1].url,'/api/runs/exec-bound/snapshot');
+      const snapshot={...execRun};delete snapshot.canonical_project_id;
+      requests[1].resolve({run:snapshot});
+      await loading;
+      assert.equal(state.loadState,'ready');
+      assert.equal(state.run.id,'exec-bound');
+      assert.deepEqual(pills.map(pill=>pill.getAttribute('aria-pressed')),['true','false','false']);
+      const html=el.runSidebarList.innerHTML;
+      const row=(startingAt,endingAt)=>html.split(startingAt,2)[1].split(endingAt,1)[0];
+      assert.match(row('data-select-thread="visual-leaf"','</button>'),/source-badge[^>]*>桌面/);
+      assert.match(row('data-session-group="mixed:visual-session"','</summary>'),/source-badge[^>]*>桌面/);
+      assert.match(row('data-codex-project="portable"','</summary>'),/source-badge[^>]*>CLI/);
+      assert.match(row('data-session-group="portable:exec-session"','</summary>'),/source-badge[^>]*>CLI/);
+      assert.ok(el.projectSelect.innerHTML.includes('Empty Desktop'));
+      assert.ok(el.projectPopoverList.innerHTML.includes('Empty Terminal'));
+
+      toggle('desktop');
+      assert.deepEqual(pills.map(pill=>pill.getAttribute('aria-pressed')),['false','true','false']);
+      const params=new URLSearchParams(window.location.search);
+      assert.equal(params.get('run_id'),'exec-bound');
+      assert.equal(params.get('project_id'),'__all__');
+      assert.equal(params.get('mode'),'all');
+      assert.equal(params.get('source'),'desktop');
+      assert.equal(state.run.id,'exec-bound');
+      assert.ok(el.runSidebarList.innerHTML.includes('Visual Conversation'));
+      assert.ok(!el.runSidebarList.innerHTML.includes('Terminal Notes'));
+      assert.ok(!el.runSidebarList.innerHTML.includes('Exec Conversation'));
+      assert.ok(!el.projectSelect.innerHTML.includes('Portable Repo'));
+      assert.ok(!el.projectPopoverList.innerHTML.includes('Empty Terminal'));
+      assert.ok(el.projectPopoverList.innerHTML.includes('Shared Repo'));
+      assert.ok(!getCommandPaletteEntries().some(entry=>['exec-bound','terminal-session','portable'].includes(entry.id)));
+
+      toggle('cli');
+      assert.deepEqual(pills.map(pill=>pill.getAttribute('aria-pressed')),['false','false','true']);
+      assert.ok(el.runSidebarList.innerHTML.includes('Exec Conversation'));
+      assert.ok(el.runSidebarList.innerHTML.includes('Terminal Notes'));
+      assert.ok(!el.runSidebarList.innerHTML.includes('Visual Conversation'));
+      assert.ok(el.projectSelect.innerHTML.includes('Empty Terminal'));
+      assert.ok(!el.projectSelect.innerHTML.includes('Empty Desktop'));
+      assert.ok(el.projectPopoverList.innerHTML.includes('Shared Repo'));
+      assert.ok(!getCommandPaletteEntries().some(entry=>entry.id==='visual-run'));
+      assert.equal(getCommandPaletteEntries().find(entry=>entry.id==='exec-bound').kind,'run');
+
+      toggle('all');
+      assert.deepEqual(pills.map(pill=>pill.getAttribute('aria-pressed')),['true','false','false']);
+      assert.equal(new URLSearchParams(window.location.search).has('source'),false);
+      el.runSearchInput.value='cli';
+      el.runSearchInput.dispatchEvent({type:'input'});
+      assert.ok(el.runSidebarList.innerHTML.includes('Terminal Notes'));
+      assert.ok(!el.runSidebarList.innerHTML.includes('Visual Notes'));
+      for(const [query,id,badge] of [['cli','exec-bound','CLI'],['desktop','visual-run','桌面'],['桌面','visual-leaf','桌面']]) {
+        state.cmdPaletteQuery=query;
+        renderCommandPalette();
+        assert.ok(getCommandPaletteEntries().some(entry=>entry.id===id),query);
+        const result=el.cmdPaletteResults.innerHTML.split('data-cmd-id="'+id+'"',2)[1].split('</button>',1)[0];
+        assert.match(result,new RegExp('source-badge[^>]*>'+badge));
+      }
+    })()''', search='?project_id=__all__&run_id=exec-bound&mode=all')
