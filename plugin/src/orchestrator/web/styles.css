@@ -1085,8 +1085,8 @@ summary:focus-visible,
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 12px 10px 8px;
-  gap: 8px;
+  padding: 9px 10px 6px;
+  gap: 6px;
 }
 
 .sidebar-runs-header {
@@ -1103,7 +1103,7 @@ summary:focus-visible,
 .sidebar-runs-controls {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: 4px;
   padding: 0 2px;
 }
 
@@ -1339,6 +1339,10 @@ summary:focus-visible,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.source-badge {
+  flex: none;
 }
 
 .codex-project-children {

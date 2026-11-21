@@ -273,6 +273,11 @@
               <button type="button" id="runModeCurrentBtn" class="run-filter-pill active" data-run-mode="current" aria-pressed="true" title="仅显示当前工作模式下的任务">仅本模式</button>
               <button type="button" id="runModeAllBtn" class="run-filter-pill" data-run-mode="all" aria-pressed="false" title="同时显示 Boost、Teamwork 与 Swarm 全部工作模式">全部工作模式</button>
             </div>
+            <div id="runSourceToggle" class="run-filter-pills" role="group" aria-label="来源端筛选">
+              <button type="button" class="run-filter-pill active" data-run-source="all" aria-pressed="true">全部来源</button>
+              <button type="button" class="run-filter-pill" data-run-source="desktop" aria-pressed="false">桌面端</button>
+              <button type="button" class="run-filter-pill" data-run-source="cli" aria-pressed="false">CLI</button>
+            </div>
           </div>
 
           <div id="runSidebarList" class="run-sidebar-list" role="group" aria-label="会话与任务">
