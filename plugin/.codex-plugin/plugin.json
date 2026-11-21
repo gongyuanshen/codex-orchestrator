@@ -1,6 +1,6 @@
 {
   "name": "tri-orchestrator",
-  "version": "0.6.4",
+  "version": "0.6.5",
   "description": "面向 Codex 的多代理编排插件（$boost、$teamwork、$swarm），内置单例守护进程、SQLite WAL #seq 消息板、隔离工作区与实时 Web 控制台，并提供 SessionStart / PostCompact / UserPromptSubmit / Stop 生命周期钩子。",
   "author": {
     "name": "tri-orchestrator"
