@@ -55,28 +55,35 @@ class _CodexCatalogThread(TypedDict):
     session_id: str
     title: str
     cwd: str
-    codex_project_id: str
-    codex_project_name: str
-    codex_project_root: str
+    codex_project_id: str | None
+    codex_project_name: str | None
+    codex_project_root: str | None
     is_pinned: bool
     created_at: float | None
     updated_at: float | None
     model: str | None
     reasoning_effort: str | None
     model_provider: str | None
+    codex_source: str | None
+    client_kind: str
 
 
 class _CodexCatalogProject(TypedDict):
     codex_project_id: str
     name: str
     root_path: str
+    root_paths: list[str]
     position: int
     is_git: bool
     threads: list[_CodexCatalogThread]
+    project_origin: str
+    client_kinds: list[str]
 
 
 class _CodexCatalog(TypedDict):
     projects: list[_CodexCatalogProject]
+    unmatched_cli_threads: list[_CodexCatalogThread]
+    missing_session_ids: list[str]
 
 
 _FileState = tuple[int, int, int]
@@ -95,6 +102,7 @@ class _Snapshot:
 @dataclass
 class _CatalogSnapshot:
     state: tuple[Path, tuple[_FileState | None, ...]]
+    bound_ids: frozenset[str]
     expires_at: float
     catalog: _CodexCatalog
 
@@ -233,9 +241,11 @@ def _read_threads(
     assert snapshot.names is not None
     found: dict[str, _Thread | None] = dict.fromkeys(session_ids)
     columns = _table_columns(conn, "threads")
-    model_expr = "model" if "model" in columns else "NULL AS model"
-    effort_expr = "reasoning_effort" if "reasoning_effort" in columns else "NULL AS reasoning_effort"
-    provider_expr = "model_provider" if "model_provider" in columns else "NULL AS model_provider"
+    fields = ", ".join(col if col in columns else "NULL" for col in (
+        "cwd", "project_id", "name", "title", "first_user_message", "model", "reasoning_effort", "model_provider",
+    ))
+    tsource_expr = "thread_source" if "thread_source" in columns else "NULL"
+    source_expr = "source" if "source" in columns else "NULL"
     batch = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
     for start in range(0, len(session_ids), batch):
         ids = session_ids[start:start + batch]
@@ -251,12 +261,11 @@ def _read_threads(
             reasoning_effort,
             model_provider,
         ) in conn.execute(
-            f"""SELECT id, cwd, project_id, name, title, first_user_message,
-                       {model_expr}, {effort_expr}, {provider_expr}
+            f"""SELECT id, {fields}
                 FROM threads
                 WHERE id IN ({params})
-                AND lower(coalesce(thread_source, '')) NOT IN ('subagent', 'guardian_review')
-                AND instr(lower(coalesce(source, '')), 'subagent') = 0""",
+                AND lower(coalesce({tsource_expr}, '')) NOT IN ('subagent', 'guardian_review')
+                AND instr(lower(coalesce({source_expr}, '')), 'subagent') = 0""",
             ids,
         ):
             cwd = _strip_win_extended_prefix(raw_cwd or "")
@@ -497,11 +506,24 @@ def _copy_catalog(catalog: _CodexCatalog) -> _CodexCatalog:
         "projects": [
             {
                 **project,
+                "root_paths": project["root_paths"].copy(),
+                "client_kinds": project["client_kinds"].copy(),
                 "threads": [thread.copy() for thread in project["threads"]],
             }
             for project in catalog["projects"]
-        ]
+        ],
+        "unmatched_cli_threads": [thread.copy() for thread in catalog["unmatched_cli_threads"]],
+        "missing_session_ids": catalog["missing_session_ids"].copy(),
     }
+
+
+def _catalog_thread_sort_key(thread: _CodexCatalogThread) -> tuple[int, float, float, str]:
+    return (
+        -int(thread["is_pinned"]),
+        -(thread["updated_at"] or 0.0),
+        -(thread["created_at"] or 0.0),
+        thread["session_id"],
+    )
 
 
 def get_codex_state_fingerprint() -> tuple[str, tuple[_FileState | None, ...]] | None:
@@ -527,9 +549,10 @@ def invalidate_catalog_cache() -> None:
         _catalog_cache = None
 
 
-def get_codex_catalog() -> _CodexCatalog | None:
-    """Return the visible Codex local project tree and non-archived interactive threads."""
+def get_codex_catalog(include_exec_session_ids: Iterable[str] | None = None) -> _CodexCatalog | None:
+    """Read Desktop and CLI threads, exposing headless exec only for run-bound IDs."""
     global _catalog_cache
+    bound_ids = frozenset(include_exec_session_ids or ())
     home = _resolve_codex_home()
     if home is None:
         return None
@@ -544,7 +567,8 @@ def get_codex_catalog() -> _CodexCatalog | None:
             return None
         state = (db.absolute(), (db_state, _file_state(wal), _file_state(index), _file_state(gs_path)))
         now = monotonic()
-        if _catalog_cache is not None and _catalog_cache.state == state and now < _catalog_cache.expires_at:
+        if (_catalog_cache is not None and _catalog_cache.state == state
+                and _catalog_cache.bound_ids == bound_ids and now < _catalog_cache.expires_at):
             return _copy_catalog(_catalog_cache.catalog)
 
         for attempt in range(3):
@@ -558,12 +582,9 @@ def get_codex_catalog() -> _CodexCatalog | None:
             try:
                 with _connect(state[0], wal, state[1][:3]) as conn:
                     conn.execute("BEGIN")
-                    if not (
-                        _table_exists(conn, "projects")
-                        and _table_exists(conn, "project_roots")
-                        and _table_exists(conn, "threads")
-                    ):
+                    if not _table_exists(conn, "threads"):
                         return None
+                    has_desktop = _table_exists(conn, "projects") and _table_exists(conn, "project_roots")
                     (
                         pending_deleted_ids,
                         _legacy_to_app_id,
@@ -576,17 +597,18 @@ def get_codex_catalog() -> _CodexCatalog | None:
                     proj_cols = _table_columns(conn, "projects")
                     root_cols = _table_columns(conn, "project_roots")
                     pos_expr = "coalesce(p.position, 0)" if "position" in proj_cols else "0"
-                    root_pos_expr = "coalesce(r.position, 0)" if "position" in root_cols else "0"
+                    root_pos_expr = "coalesce(r.position, 0)" if "position" in root_cols else "NULL"
 
                     grouped_roots: dict[str, tuple[str, int, list[str]]] = {}
-                    for pid, pname, db_pos, raw_root in conn.execute(
+                    project_rows = conn.execute(
                         f"""
-                        SELECT p.id, p.name, {pos_expr}, r.path
+                        SELECT p.id, p.name, {pos_expr} AS project_position, r.path
                         FROM projects AS p
                         JOIN project_roots AS r ON p.id = r.project_id
-                        ORDER BY {pos_expr} ASC, p.id ASC, {root_pos_expr} ASC, r.path ASC
+                        ORDER BY project_position ASC, p.id ASC, {root_pos_expr} ASC, r.path ASC
                         """
-                    ):
+                    ) if has_desktop else ()
+                    for pid, pname, db_pos, raw_root in project_rows:
                         clean_pid = _clean_opt_str(pid)
                         clean_root = _strip_win_extended_prefix(_clean_opt_str(raw_root) or "")
                         if not clean_pid or not clean_root:
@@ -619,9 +641,12 @@ def get_codex_catalog() -> _CodexCatalog | None:
                             "codex_project_id": pid,
                             "name": pname,
                             "root_path": primary_root,
+                            "root_paths": roots,
                             "position": db_pos,
                             "is_git": is_git,
                             "threads": [],
+                            "project_origin": "desktop",
+                            "client_kinds": [],
                         }
                         candidates.append(((rank, db_pos, pname.casefold(), pid), proj_obj, roots))
 
@@ -659,14 +684,15 @@ def get_codex_catalog() -> _CodexCatalog | None:
                     names = _read_names(index)
                     thread_sql = f"""
                         SELECT id, {cwd_expr}, {pid_expr}, {name_expr}, {title_expr}, {msg_expr},
-                               {tsource_expr}, {pinned_expr}, {created_expr}, {updated_expr},
+                               {tsource_expr}, {source_expr}, {pinned_expr}, {created_expr}, {updated_expr},
                                {model_expr}, {effort_expr}, {provider_expr}
                         FROM threads
                         WHERE {archived_cond}
                           AND lower(coalesce({tsource_expr}, '')) NOT IN ('subagent', 'guardian_review')
                           AND instr(lower(coalesce({source_expr}, '')), 'subagent') = 0
-                          AND lower(coalesce({source_expr}, '')) != 'exec'
                     """
+                    unmatched: list[_CodexCatalogThread] = []
+                    missing_ids = set(bound_ids)
                     for (
                         tid,
                         raw_cwd,
@@ -675,6 +701,7 @@ def get_codex_catalog() -> _CodexCatalog | None:
                         ttitle,
                         tmsg,
                         tsource,
+                        raw_source,
                         is_pinned,
                         created_at,
                         updated_at,
@@ -684,6 +711,11 @@ def get_codex_catalog() -> _CodexCatalog | None:
                     ) in conn.execute(thread_sql):
                         if not isinstance(tid, str) or not tid:
                             continue
+                        missing_ids.discard(tid)
+                        source = (_clean_opt_str(raw_source) or "").lower() or None
+                        if source == "exec" and tid not in bound_ids:
+                            continue
+                        is_cli = source in {"cli", "exec"}
                         cwd = _strip_win_extended_prefix(raw_cwd or "")
                         resolved_title = (
                             names.get(tid)
@@ -691,51 +723,67 @@ def get_codex_catalog() -> _CodexCatalog | None:
                             or _first_line(ttitle)
                             or _first_line(tmsg)
                         )
-                        if not resolved_title and not _clean_opt_str(tsource):
+                        if not resolved_title and not _clean_opt_str(tsource) and not is_cli:
                             continue
 
                         clean_pid = _clean_opt_str(raw_pid)
-                        target_proj: _CodexCatalogProject | None = None
-                        if clean_pid is not None:
-                            target_proj = visible_by_id.get(clean_pid)
-                        elif tid in thread_assignments:
-                            target_proj = visible_by_id.get(thread_assignments[tid])
-                        elif tid in excluded_assigned_threads:
-                            target_proj = None
-                        else:
+                        if is_cli and (
+                            tid in excluded_assigned_threads
+                            or clean_pid in pending_deleted_ids
+                            or (clean_pid in grouped_roots and clean_pid not in visible_by_id)
+                            or _is_internal_chatgpt_project_root(cwd)
+                        ):
+                            continue
+                        assigned_pid = clean_pid or thread_assignments.get(tid)
+                        target_proj = visible_by_id.get(assigned_pid) if assigned_pid else None
+                        if target_proj is None and (is_cli or (
+                            assigned_pid is None and tid not in excluded_assigned_threads
+                        )):
                             matched = _match_project(cwd, visible_root_entries)
                             if matched is not None:
                                 target_proj = visible_by_id.get(matched["project_id"])
-                        if target_proj is None:
+                        if target_proj is None and not is_cli:
                             continue
 
-                        target_proj["threads"].append({
+                        thread: _CodexCatalogThread = {
                             "session_id": tid,
                             "title": resolved_title or tid,
                             "cwd": cwd,
-                            "codex_project_id": target_proj["codex_project_id"],
-                            "codex_project_name": target_proj["name"],
-                            "codex_project_root": target_proj["root_path"],
+                            "codex_project_id": target_proj["codex_project_id"] if target_proj else clean_pid,
+                            "codex_project_name": target_proj["name"] if target_proj else None,
+                            "codex_project_root": target_proj["root_path"] if target_proj else None,
                             "is_pinned": bool(is_pinned),
                             "created_at": float(created_at) if created_at is not None else None,
                             "updated_at": float(updated_at) if updated_at is not None else None,
                             "model": _clean_opt_str(model),
                             "reasoning_effort": _clean_opt_str(reasoning_effort),
                             "model_provider": _clean_opt_str(model_provider),
-                        })
+                            "codex_source": source,
+                            "client_kind": "cli" if is_cli else "desktop",
+                        }
+                        (target_proj["threads"] if target_proj else unmatched).append(thread)
 
                     for proj in visible_projects:
-                        proj["threads"].sort(
-                            key=lambda t: (
-                                -int(t["is_pinned"]),
-                                -(t["updated_at"] or 0.0),
-                                -(t["created_at"] or 0.0),
-                                t["session_id"],
-                            )
-                        )
-
-                    catalog: _CodexCatalog = {"projects": visible_projects}
-                    _catalog_cache = _CatalogSnapshot(state, monotonic() + _CACHE_TTL, catalog)
+                        proj["threads"].sort(key=_catalog_thread_sort_key)
+                        proj["client_kinds"] = sorted({t["client_kind"] for t in proj["threads"]}) or ["desktop"]
+                    unmatched.sort(key=_catalog_thread_sort_key)
+                    # A deliberately hidden row is not missing and must not be synthesized from a run.
+                    candidate_ids = tuple(missing_ids)
+                    batch_size = conn.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+                    for start in range(0, len(candidate_ids), batch_size):
+                        batch = candidate_ids[start:start + batch_size]
+                        placeholders = ",".join("?" for _ in batch)
+                        missing_ids.difference_update(row[0] for row in conn.execute(
+                            f"SELECT id FROM threads WHERE id IN ({placeholders})", batch,
+                        ))
+                    if not has_desktop and not unmatched and not missing_ids:
+                        return None
+                    catalog: _CodexCatalog = {
+                        "projects": visible_projects,
+                        "unmatched_cli_threads": unmatched,
+                        "missing_session_ids": sorted(missing_ids),
+                    }
+                    _catalog_cache = _CatalogSnapshot(state, bound_ids, monotonic() + _CACHE_TTL, catalog)
                     return _copy_catalog(catalog)
             except OSError as exc:
                 if attempt < 2 and "changed while copying" in str(exc):
@@ -781,7 +829,7 @@ def _lookup(
                                 JOIN project_roots AS r ON p.id = r.project_id
                                 ORDER BY p.id, r.path
                             """)
-                        ]
+                        ] if _table_exists(conn, "projects") and _table_exists(conn, "project_roots") else []
                         snapshot = _Snapshot(state, now + _CACHE_TTL, projects)
                     if missing_threads:
                         if snapshot.names is None:
