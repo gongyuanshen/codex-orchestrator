@@ -1,4 +1,4 @@
-"""Conservative ownership normalization shared by workflow4 admission and hints."""
+"""Conservative ownership normalization shared by workflow admission and hints."""
 from pathlib import Path, PureWindowsPath
 import os
 

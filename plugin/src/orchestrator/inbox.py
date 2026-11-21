@@ -382,7 +382,7 @@ INBOX_TOOL_DEFINITIONS = [{'name': 'inbox_send',
                                  'summary': {'type': 'string'},
                                  'body_md': {'type': 'string'},
                                  'step_id': {'type': 'string',
-                                             'description': 'Same-run step; required for workflow2 '
+                                             'description': 'Same-run step; required for workflow2+ '
                                                             'Swarm task/rework/review/result.'}},
                   'required': ['run_id',
                                'sender',

@@ -5,7 +5,7 @@ Design & Safety Red-Lines (M9 / Section 3.4.2):
 2. Strict `<= 1.5s` HTTP timeout against `/api/rpc` ONLY (bypassing system proxies on loopback).
    If the daemon is unavailable, emit only local startup or explicit mode context;
    NEVER auto-spawn the daemon or touch SQLite files directly!
-3. All stdout payloads conform 100% to Codex `0.166.0-alpha.5.1` wire JSON schemas
+3. All stdout payloads conform 100% to Codex plugin hook wire JSON schemas
    (`additionalProperties: false`):
    - `SessionStart`: `startup` injects concise local `session_id` (`<= 220 chars`) or bound `resume_context`; `compact`/`resume` injects `hookSpecificOutput` (`hookEventName="SessionStart"`, `additionalContext <= 800 chars`)
    - `PostCompact`: `{"systemMessage": "<resume_context <= 800 chars>"}`

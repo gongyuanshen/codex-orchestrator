@@ -185,11 +185,6 @@ def fetch_health(settings: Settings, *, timeout_sec: float = 0.8, _probe_first: 
     return data
 
 
-def probe_health(settings: Settings, *, timeout_sec: float = 0.8) -> bool:
-    """Return True if the singleton daemon responds healthy on /api/health."""
-    return fetch_health(settings, timeout_sec=timeout_sec) is not None
-
-
 def _is_pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False

@@ -153,14 +153,6 @@ class Settings:
     def base_url(self) -> str:
         return f"http://{self.host}:{self.port}"
 
-    @property
-    def port_range_start(self) -> int:
-        return self.port_range[0]
-
-    @property
-    def port_range_end(self) -> int:
-        return self.port_range[1]
-
     def ensure_data_dir(self) -> Path:
         """Create data_dir on disk if it does not already exist and return it."""
         self.data_dir.mkdir(parents=True, exist_ok=True)

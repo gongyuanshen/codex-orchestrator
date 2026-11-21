@@ -599,30 +599,6 @@
   }
 
 
-  function isAppServerAgentId(agentId) {
-    return typeof agentId === 'string' && agentId.startsWith('appserver://');
-  }
-
-  function isAppServerStep(step) {
-    if (!step || typeof step !== 'object') return false;
-    const execKind = step.execution_kind || step.checkpoint?.execution_kind || '';
-    if (execKind === 'app_server_pipeline') return true;
-    if (execKind === 'native' || execKind === 'coordinator_local') {
-      return isAppServerAgentId(step.owner_agent_id) || isAppServerAgentId(step.verifier_agent_id);
-    }
-    return isAppServerAgentId(step.owner_agent_id) || isAppServerAgentId(step.verifier_agent_id) ||
-      isAppServerAgentId(step.checkpoint?.original_bindings?.owner_agent_id) ||
-      isAppServerAgentId(step.checkpoint?.original_bindings?.verifier_agent_id);
-  }
-
-  function isAppServerWorker(worker) {
-    return Boolean(worker && isAppServerAgentId(worker.agent_id));
-  }
-
-  function renderAppServerBadge() {
-    return '<span class="pill-badge badge-appserver" title="由宿主终端 tri-orchestrator-pipeline 驱动的独立 App-Server 管线线程（appserver://），非聊天内原生 V2 子代理（/root/...）">App-Server 管线</span>';
-  }
-
   function formatModelText(model, effort) {
     const m = String(model || '').trim();
     if (!m) return '';
@@ -3214,7 +3190,6 @@
               <span class="member-name">@${escapeHtml(normalizeHandle(w.name))}</span>
               <span class="member-role">${escapeHtml(labelRole(role))}</span>
               ${modelBadge}
-              ${isAppServerWorker(w) ? renderAppServerBadge() : ''}
               <span class="pill-badge ${getWorkerStatusTone(status, false)}">登记：${escapeHtml(labelWorkerStatus(status))}</span>
               ${stalled ? '<span class="pill-badge tint-danger">心跳超时告警</span>' : ''}
             </div>
@@ -3348,8 +3323,6 @@
       state.activeChannel = 'all';
     }
 
-    const retired = state.workers.filter((w) => ['stopped', 'killed'].includes(w.status));
-    const current = state.workers.filter((w) => !['stopped', 'killed'].includes(w.status));
     const counts = new Map();
     counts.set('all', state.messages.length);
     for (const ch of ordered) {
@@ -3526,10 +3499,7 @@
   function renderWorkflowStep(step) {
     const attention = ['needs_decision', 'reconciliation_required', 'rework', 'handoff'].includes(step.state);
     const stateBadge = `<span class="pill-badge ${attention ? 'tint-warning' : step.state === 'done' ? 'tint-success' : 'tint-muted'}">${escapeHtml(labelWorkflowState(step.state))}</span>`;
-    const badges = isAppServerStep(step)
-      ? `<span class="workflow-step-badges">${renderAppServerBadge()}${stateBadge}</span>`
-      : stateBadge;
-    return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(step.step_key)}">${escapeHtml(step.step_key)}</span>${badges}<span class="muted-caption tabular">返工 ${escapeHtml(step.attempt)} / 3</span></li>`;
+    return `<li class="workflow-step"><span class="workflow-step-name" title="${escapeHtml(step.step_key)}">${escapeHtml(step.step_key)}</span>${stateBadge}<span class="muted-caption tabular">返工 ${escapeHtml(step.attempt)} / 3</span></li>`;
   }
 
   function renderProgressStatus() {
@@ -3639,7 +3609,7 @@
     const btn = `          <button type="button" class="overview-member" data-worker-id="${escapeHtml(w.id)}">
             <span class="overview-member-role">${renderRoleBadge(w.role, false)}<span>${escapeHtml(labelRole(w.role))}<small>@${escapeHtml(w.name)}</small></span></span>
             <span class="overview-member-work"><span>${escapeHtml(roleResponsibility(w.role))}</span><span class="overview-current-task">最近登记工作：${escapeHtml(w.current_task || '尚未记录')}</span></span>
-            <span class="overview-member-state">${modelBadge}${isAppServerWorker(w) ? renderAppServerBadge() : ''}<span class="pill-badge ${statusTone}">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
+            <span class="overview-member-state">${modelBadge}<span class="pill-badge ${statusTone}">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
           </button>`;
     return subTree ? `<div class="overview-member-wrap">${btn}${subTree}</div>` : btn;
   }
@@ -4445,7 +4415,6 @@
         el.graphDetailBar.innerHTML = `
           <div class="graph-detail-main">
             <span class="mono" style="font-weight:600;">${escapeHtml(displayName)}</span>
-            ${isAppServerWorker(node.worker) ? renderAppServerBadge() : ''}
             <span class="pill-badge tint-muted">${escapeHtml(roleLabel)}${escapeHtml(statusStr)}</span>
             ${nodeModelBadge}
             ${metaParts ? `<span class="muted-caption mono">${escapeHtml(metaParts)}</span>` : ''}
@@ -4818,22 +4787,15 @@
   }
 
   function renderWorkerControl(worker) {
-    const isAppServer = typeof worker?.agent_id === 'string' && worker.agent_id.startsWith('appserver://');
     const labels = {
-      pending: isAppServer ? '待处理（等待管线运行器 turn/interrupt 中断回执）' : '待处理（等待协调者原生中断回执）',
+      pending: '待处理（等待协调者原生中断回执）',
       applied: '已执行',
       failed: '执行失败',
     };
     const requests = state.controlRequests.filter((item) => String(item.worker_id) === String(worker.id));
-    const bindingBadge = isAppServer
-      ? ' <span class="pill-badge badge-appserver" title="由宿主终端 tri-orchestrator-pipeline 驱动的独立 App-Server 管线线程（appserver://），非聊天内原生 V2 子代理（/root/...）">App-Server 管线</span>'
-      : '';
-    const bindingNote = isAppServer
-      ? '请求暂停 / 结束任务：tri-orchestrator-pipeline 在 <=2s 内发送 turn/interrupt 中断当前回合，工作区文件完整保留。'
-      : '请求结束任务：协调者中断代理并停止分配任务，不终止操作系统进程；工作区文件保留。';
-    return `<div class="inspector-section"><div class="kv-key">${isAppServer ? '执行线程绑定' : '原生代理绑定'}</div>
-      <div class="kv-val mono">${escapeHtml(worker.agent_id || '未绑定（不可控制）')}${bindingBadge}</div>
-      <div class="actions-note">${bindingNote}</div>
+    return `<div class="inspector-section"><div class="kv-key">原生代理绑定</div>
+      <div class="kv-val mono">${escapeHtml(worker.agent_id || '未绑定（不可控制）')}</div>
+      <div class="actions-note">请求结束任务：协调者中断代理并停止分配任务，不终止操作系统进程；工作区文件保留。</div>
       ${requests.map((item) => `<div class="actions-note">${escapeHtml(item.requested_status === 'stopped' ? '请求暂停' : '请求结束任务')} · ${escapeHtml(labels[item.status])}<div>${escapeHtml(item.result || '')}</div></div>`).join('')}</div>`;
   }
 
@@ -4915,7 +4877,7 @@
         <div class="inspector-section">
           <div class="inspector-kv-list">
             <div class="kv-key">成员名称</div>
-            <div class="kv-val mono">${escapeHtml(workerHandle)} ${isAppServerWorker(worker) ? renderAppServerBadge() : ''}<span class="pill-badge ${getWorkerStatusTone(workerStatus, isWorkerStalled(worker))}">${escapeHtml(labelWorkerStatus(workerStatus))}</span></div>
+            <div class="kv-val mono">${escapeHtml(workerHandle)} <span class="pill-badge ${getWorkerStatusTone(workerStatus, isWorkerStalled(worker))}">${escapeHtml(labelWorkerStatus(workerStatus))}</span></div>
             <div class="kv-key">成员职责</div>
             <div class="kv-val">${escapeHtml(roleLabel)}</div>
             <div class="kv-key">当前任务</div>
@@ -4967,7 +4929,6 @@
           <div class="kv-key">成员状态</div>
           <div class="kv-val">
             <span class="mono">${escapeHtml(workerHandle)}</span>
-            ${isAppServerWorker(worker) ? renderAppServerBadge() : ''}
             <span class="pill-badge ${getWorkerStatusTone(workerStatus, isWorkerStalled(worker))}">${escapeHtml(labelWorkerStatus(workerStatus))}</span>
           </div>
           ${renderInspectorModelRows(worker)}
@@ -5283,11 +5244,7 @@
         });
         if (version !== state.contextVersion) return;
         acceptControlResponse(resp, workerId, nextStatus);
-        const targetWorker = state.workers.find((w) => String(w.id) === String(workerId));
-        const pendingHint = isAppServerWorker(targetWorker)
-          ? '等待 tri-orchestrator-pipeline 在 <=2s 内触发 turn/interrupt 并返回回执；成员状态尚未改变。'
-          : '等待协调者调用原生中断工具并返回执行回执；成员状态尚未改变。';
-        showToast('控制请求待处理', pendingHint, 'warning');
+        showToast('控制请求待处理', '等待协调者调用原生中断工具并返回执行回执；成员状态尚未改变。', 'warning');
       } else if (action === 'cleanup-workspace' && workspaceId) {
         try {
           const resp = await apiRequest(`/api/workspaces/${encodeURIComponent(workspaceId)}/cleanup`, {
