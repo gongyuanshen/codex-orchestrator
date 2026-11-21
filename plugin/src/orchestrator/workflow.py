@@ -878,11 +878,14 @@ class WorkflowService:
             raise WorkflowConflictError(f'Action {action} is not permitted from {state}')
 
     def capture(self, step_id: str, scope: str = 'candidate', paths: list[str] | None = None,
-                verification_commands: list[dict] | None = None, env_profile: str = 'none') -> dict:
+                verification_commands: list[dict] | None = None, env_profile: str = 'none',
+                max_parallel: int | None = None) -> dict:
         if scope not in {'candidate', 'integrated'}:
             raise ValueError('Artifact scope must be candidate or integrated')
         if env_profile not in ENV_PROFILES:
             raise ValueError(f'Invalid env_profile {env_profile!r}; expected one of {sorted(ENV_PROFILES)}')
+        if max_parallel is not None and (type(max_parallel) is not int or max_parallel < 1):
+            raise ValueError('max_parallel must be a positive integer')
         resolved_commands: list[dict] | None = None
         if verification_commands is not None:
             if not isinstance(verification_commands, list):
@@ -924,7 +927,7 @@ class WorkflowService:
                     raise ValueError('Artifact scope paths must be a nonempty list of relative paths')
                 manifest_path = self.db.db_path.parent / 'verification-manifests' / (identity + '.json')
                 validate_evidence_path(manifest_path.resolve(), {'root': str(root), 'paths': paths})
-            elif resolved_commands is not None or env_profile != 'none':
+            elif resolved_commands is not None or env_profile != 'none' or max_parallel is not None:
                 raise ValueError('verification_commands requires workflow3')
             descriptor = capture_content(root, paths=paths, mode=mode, baseline=baseline)
             required = self._required_capture_scope(step, scope)
@@ -937,6 +940,8 @@ class WorkflowService:
                     'attempt': step['attempt'], 'contract_revision': step['contract_revision'],
                     'verifier': step['verifier'], 'verifier_agent_id': step['verifier_agent_id'],
                     'artifact': dict(descriptor), 'commands': resolved_commands}
+                if max_parallel is not None:
+                    manifest['max_parallel'] = max_parallel
                 validate_manifest(manifest)
                 if {criterion for cmd in resolved_commands for criterion in cmd['criteria']} != set(step['criteria']):
                     raise ValueError('verification_commands must cover exactly the step criteria')

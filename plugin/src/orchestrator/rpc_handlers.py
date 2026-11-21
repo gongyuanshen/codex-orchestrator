@@ -11,6 +11,7 @@ import shutil
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 from collections import deque
 from collections.abc import Callable
@@ -34,6 +35,7 @@ from orchestrator.db import (
 from orchestrator.gc import _dir_size_bytes
 from orchestrator.workspace_mgr import (
     VALID_DEP_MODES,
+    VALID_GIT_BACKENDS,
     VALID_MERGE_STRATEGIES,
     WORKSPACES_DIRNAME,
     WorkspaceCleanupGuardError,
@@ -481,6 +483,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                     "enum": sorted(VALID_DEP_MODES),
                     "default": "none",
                 },
+                "git_backend": {
+                    "type": "string",
+                    "enum": sorted(VALID_GIT_BACKENDS),
+                    "default": "auto",
+                },
             },
             "required": ["run_id", "worker_name"],
             "additionalProperties": False,
@@ -641,8 +648,10 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                         "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
                         "cwd": {"type": "string"}, "timeout_sec": {"type": "number", "exclusiveMinimum": 0},
                         "env_keys": {"type": "array", "uniqueItems": True, "items": {"type": "string"}, "default": []},
-                        "criteria": {"type": "array", "minItems": 1, "uniqueItems": True, "items": {"type": "string"}}},
+                        "criteria": {"type": "array", "minItems": 1, "uniqueItems": True, "items": {"type": "string"}},
+                        "parallel_group": {"type": ["string", "null"], "minLength": 1}},
                     "required": ["id", "argv", "cwd", "timeout_sec", "criteria"], "additionalProperties": False}},
+                "max_parallel": {"type": "integer", "minimum": 1},
             },
             "required": ["step_id"], "additionalProperties": False,
         },
@@ -697,7 +706,12 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                 "workspace_id": {"type": "string"},
                 "workspace_base_mode": {
                     "type": "string",
-                    "enum": ["auto", "git_clone", "snapshot"],
+                    "enum": ["auto", "git_clone", "git_worktree", "snapshot"],
+                    "default": "auto",
+                },
+                "git_backend": {
+                    "type": "string",
+                    "enum": sorted(VALID_GIT_BACKENDS),
                     "default": "auto",
                 },
                 "copy_env": {"type": "boolean", "default": True},
@@ -822,6 +836,7 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                 "paths": {"type": "array", "items": {"type": "string"}},
                 "verification_commands": {"type": "array", "items": {"type": "object"}},
                 "env_profile": {"type": "string"},
+                "max_parallel": {"type": "integer", "minimum": 1},
                 "artifact_id": {"type": "string"},
                 "verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
                 "criteria_results": {"type": "array", "items": {"type": "object"}},
@@ -1520,7 +1535,9 @@ class RpcDispatcher:
 
     def _handle_artifact_capture(self, args: dict[str, Any]) -> dict[str, Any]:
         artifact = self.workflow.capture(**args)
-        run_id = self.workflow.get_step(artifact["step_id"])["run_id"]
+        step = self.workflow.get_step(artifact["step_id"])
+        run_id = step["run_id"]
+        verifier = step["verifier"]
         result = _strip_artifact_manifests(artifact)
         self._emit("workflow_updated", {"run_id": run_id, "artifact": result}, run_id=run_id)
         # Include CLI executables and ready-to-run verify template outside workspace root.
@@ -1532,11 +1549,17 @@ class RpcDispatcher:
         if manifest_path:
             suggested_out = str((self.db.db_path.parent / "verification-receipts" / result["id"]).resolve())
             exe_or_name = verify_exe or "tri-orchestrator-verify"
+            hb_url = (
+                f"{self.db.settings.base_url}/api/runs/"
+                f"{urllib.parse.quote(run_id, safe='')}/workers/"
+                f"{urllib.parse.quote(verifier, safe='')}/heartbeat"
+            )
             result["verify_argv_template"] = [
                 exe_or_name, "--manifest", manifest_path, "--output-dir", suggested_out,
+                "--heartbeat-url", hb_url,
             ]
             result["verify_command_hint"] = (
-                f'"{exe_or_name}" --manifest "{manifest_path}" --output-dir "{suggested_out}"'
+                f'"{exe_or_name}" --manifest "{manifest_path}" --output-dir "{suggested_out}" --heartbeat-url "{hb_url}"'
             )
         else:
             result["verify_argv_template"] = None
@@ -1568,6 +1591,7 @@ class RpcDispatcher:
             project_root=args.get("project_root"),
             copy_env=bool(args.get("copy_env", True)),
             dep_mode=str(args.get("dep_mode") or "none"),
+            git_backend=str(args.get("git_backend") or "auto"),
         )
         copy_stats = _extract_workspace_copy_stats(ws)
         if copy_stats:
@@ -1738,17 +1762,22 @@ class RpcDispatcher:
                 requested_ws_id = args.get("workspace_id").strip() if isinstance(args.get("workspace_id"), str) and args.get("workspace_id").strip() else None
                 if create_ws:
                     base_mode = str(args.get("workspace_base_mode") or "auto").strip()
-                    if base_mode not in {"auto", "git_clone", "snapshot"}:
+                    if base_mode not in {"auto", "git_clone", "git_worktree", "snapshot"}:
                         raise ValueError(f"Invalid workspace_base_mode: {base_mode!r}")
+                    git_backend_arg = str(args.get("git_backend") or "auto").strip()
+                    if base_mode == "git_worktree" and git_backend_arg == "auto":
+                        git_backend_arg = "worktree"
                     ws = self.workspace_mgr.workspace_create(
                         run_id,
                         target_worker_name,
                         copy_env=bool(args.get("copy_env", True)),
                         dep_mode=str(args.get("dep_mode") or "none"),
+                        git_backend=git_backend_arg,
                     )
                     created_ws_stats = _extract_workspace_copy_stats(ws)
                     created_ws_dir = Path(ws["path"])
-                    if base_mode != "auto" and ws["mode"] != base_mode:
+                    expected_db_mode = "git_clone" if base_mode == "git_worktree" else base_mode
+                    if base_mode != "auto" and ws["mode"] != expected_db_mode:
                         raise ValueError(
                             f"Requested workspace_base_mode={base_mode!r}, but repository produced {ws['mode']!r}"
                         )
@@ -2473,7 +2502,7 @@ class RpcDispatcher:
                         "step_id": step_id,
                         "scope": scope,
                     }
-                    for key_name in ("paths", "verification_commands", "env_profile"):
+                    for key_name in ("paths", "verification_commands", "env_profile", "max_parallel"):
                         if args.get(key_name) is not None:
                             capture_kwargs[key_name] = args[key_name]
                     raw_artifact = self.workflow.capture(**capture_kwargs)
@@ -2496,11 +2525,17 @@ class RpcDispatcher:
             if manifest_path:
                 suggested_out = str((self.db.db_path.parent / "verification-receipts" / artifact["id"]).resolve())
                 exe_or_name = verify_exe or "tri-orchestrator-verify"
+                hb_url = (
+                    f"{self.db.settings.base_url}/api/runs/"
+                    f"{urllib.parse.quote(run_id, safe='')}/workers/"
+                    f"{urllib.parse.quote(verifier, safe='')}/heartbeat"
+                )
                 verify_argv_template = [
                     exe_or_name, "--manifest", manifest_path, "--output-dir", suggested_out,
+                    "--heartbeat-url", hb_url,
                 ]
                 verify_hint = (
-                    f'"{exe_or_name}" --manifest "{manifest_path}" --output-dir "{suggested_out}"'
+                    f'"{exe_or_name}" --manifest "{manifest_path}" --output-dir "{suggested_out}" --heartbeat-url "{hb_url}"'
                 )
             artifact["verify_executable"] = verify_exe
             artifact["verify_argv_template"] = verify_argv_template

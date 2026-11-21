@@ -49,7 +49,7 @@ def test_modes_and_inline_roles_inherit_verification_collector(mode):
     assert "software 0.5.0/schema7" not in text
     for term in (
         "workflow5",
-        "0.6.5/schema10",
+        "0.6.6/schema10",
         "../route-a-workflow.md",
         "workflow_verifier_turn",
         "tri-orchestrator-verify",

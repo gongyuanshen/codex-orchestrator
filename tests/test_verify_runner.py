@@ -210,3 +210,114 @@ def test_case_insensitive_systemroot_and_env_profile_never_leak_or_serialize(tmp
     assert 'never-inherit-or-write' not in receipt_raw
     if os.name == 'nt' and os.environ.get('SYSTEMROOT'):
         assert os.environ['SYSTEMROOT'] not in receipt_raw
+
+
+def test_parallel_group_batches_barriers_and_heartbeat_keepalive(tmp_path):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    import threading
+    import time
+
+    heartbeats = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get('Content-Length') or 0)
+            body = json.loads(self.rfile.read(length).decode('utf-8'))
+            heartbeats.append((self.path, body))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
+
+        def log_message(self, format, *args):
+            return
+
+    server = HTTPServer(('127.0.0.1', 0), Handler)
+    port = server.server_port
+    srv_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    srv_thread.start()
+    try:
+        source = tmp_path / 'source'
+        source.mkdir()
+        (source / 'a.txt').write_text('original')
+        manifest = dict(
+            schema_version=1,
+            evidence_level='local_collector_v1',
+            run_id='r',
+            step_id='s',
+            artifact_id='a',
+            scope='candidate',
+            packet_version=1,
+            attempt=1,
+            contract_revision=1,
+            verifier='v',
+            verifier_agent_id='va',
+            max_parallel=2,
+            artifact=capture_content(source),
+            commands=[
+                dict(
+                    id='barrier-build',
+                    argv=[sys.executable, '-c', "print('built')"],
+                    cwd=str(tmp_path),
+                    timeout_sec=5,
+                    env_keys=[],
+                    criteria=['c1'],
+                ),
+                dict(
+                    id='par-1',
+                    argv=[sys.executable, '-c', "import time; time.sleep(0.25); print('p1')"],
+                    cwd=str(tmp_path),
+                    timeout_sec=5,
+                    env_keys=[],
+                    criteria=['c2'],
+                    parallel_group='checks',
+                ),
+                dict(
+                    id='par-2',
+                    argv=[sys.executable, '-c', "import time; time.sleep(0.25); print('p2')"],
+                    cwd=str(tmp_path),
+                    timeout_sec=5,
+                    env_keys=[],
+                    criteria=['c3'],
+                    parallel_group='checks',
+                ),
+                dict(
+                    id='barrier-post',
+                    argv=[sys.executable, '-c', "print('done')"],
+                    cwd=str(tmp_path),
+                    timeout_sec=5,
+                    env_keys=[],
+                    criteria=['c4'],
+                ),
+            ],
+        )
+        m_path = tmp_path / 'manifest.json'
+        m_path.write_text(json.dumps(manifest), encoding='utf-8')
+        out_dir = tmp_path / 'par-out'
+        receipt = collect(
+            m_path,
+            out_dir,
+            heartbeat_url=f'http://127.0.0.1:{port}/api/runs/r/workers/v/heartbeat',
+            heartbeat_interval_sec=0.08,
+        )
+        assert receipt['status'] == 'finished'
+        assert [c['command_id'] for c in receipt['commands']] == [
+            'barrier-build',
+            'par-1',
+            'par-2',
+            'barrier-post',
+        ]
+        assert all(c['exit_code'] == 0 for c in receipt['commands'])
+        validate_receipt(manifest, out_dir / 'receipt.json', require_success=True)
+        assert len(heartbeats) >= 1
+        assert heartbeats[0][0] == '/api/runs/r/workers/v/heartbeat'
+        assert 'active_commands' in heartbeats[0][1]
+
+        # Tampering barrier-post to start before par-2 ended must be rejected by validate_receipt.
+        tampered = json.loads((out_dir / 'receipt.json').read_text('utf-8'))
+        tampered['commands'][3]['started_at'] = tampered['commands'][0]['started_at']
+        (out_dir / 'receipt.json').write_text(json.dumps(tampered), encoding='utf-8')
+        with pytest.raises(ValueError, match='invalid command timing'):
+            validate_receipt(manifest, out_dir / 'receipt.json', require_success=True)
+    finally:
+        server.shutdown()
+        server.server_close()
