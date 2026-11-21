@@ -59,7 +59,7 @@ bash scripts/install.sh
 
 ### 旧版本运行库升级
 
-如果本地已存在旧版 Schema 运行库（例如从 `schema <= 9` 升级至 `0.6.3` / `schema 10`），需先结束全部活跃任务并停止守护进程，再使用 `scripts/upgrade.py` 执行受控备份与离线升级，最后通过 Codex 重新安装插件：
+如果本地已存在旧版 Schema 运行库（例如从 `schema <= 9` 升级至 `0.6.4` / `schema 10`），需先结束全部活跃任务并停止守护进程，再使用 `scripts/upgrade.py` 执行受控备份与离线升级，最后通过 Codex 重新安装插件：
 
 ```bash
 python scripts/upgrade.py prepare --source-plugin ./plugin --target-plugin <old-plugin-dir> --data-dir <data-dir> --backup-dir <backup-dir>
@@ -177,7 +177,7 @@ flowchart LR
 ### 核心构建机制
 
 - **单轮直达与对账栅栏（`workflow5`）**：派发遵循 `workflow_prepare_dispatch` → 1 轮 `spawn_agent` → `native_action_record_call`，消除子代理首轮空等；若调用超时或中断，动作会锁入 `needs_reconciliation`，协调者必须先调用 `list_agents` 核实宿主状态再执行 `reconcile`，严禁盲目重放 `spawn_agent`。
-- **受控辅助子代理分层（`max_depth = 2`）**：仅深度 1 的 `planner`、`coder`、`swarm_worker` 与 `verifier` 可按需派生只读 `investigator` 辅助查链；`interviewer`、`investigator` 与盲审 `challenger` 禁止再派生子代理，确保拓扑可控、成本与权限边界清晰。
+- **受控辅助子代理分层（`max_depth = 2`）**：仅深度 1 的 `planner`、`coder`、`swarm_worker` 与 `verifier` 可按需派生只读 `investigator` 辅助查链；`interviewer`、`investigator` 与盲审 `challenger`（由无历史上下文的只读 `investigator` 代理或宿主侧 `tri-orchestrator-challenge` CLI 承担，并非独立 `.toml` 角色文件）禁止再派生子代理，确保拓扑可控、成本与权限边界清晰。
 - **原班返工上限与双门禁冻结**：首次候选绑定后即永久冻结 `original_bindings`，后续返工（最多 3 轮，超限自动转入 `needs_decision` 待人工决策）与 `integrated` 终验均强制复用同一作者与同一验收者，杜绝“换人重跑”掩盖缺陷。
 
 ---
@@ -277,9 +277,10 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
 ├── .agents/plugins/marketplace.json   # Codex 本地市场清单
 ├── plugin/                            # 自包含 Codex 插件包
 │   ├── .codex-plugin/plugin.json      # 插件元数据、skills/hooks/mcp 声明
-│   ├── .mcp.json & mcp.json           # Codex MCP 启动配置
+│   ├── .mcp.json                      # Codex MCP 启动配置与环境变量透传白名单
+│   ├── assets/                        # 插件图标资源（icon.svg / logo.svg）
 │   ├── hooks/hooks.json               # SessionStart / PostCompact / UserPromptSubmit / Stop
-│   ├── agents/*.toml                  # 6 个角色定义（interviewer/planner/investigator/coder/verifier/swarm_worker）
+│   ├── agents/*.toml                  # 6 个角色定义（interviewer/planner/investigator/coder/verifier/swarm_worker；盲审 challenger 复用只读 investigator）
 │   ├── skills/                        # route-a-workflow.md 与 {boost,teamwork,swarm}/SKILL.md
 │   ├── src/orchestrator/              # 守护进程、MCP shim、桥接器、钩子、验收/盲审运行器与 Web 前端
 │   └── pyproject.toml & uv.lock       # 插件运行时依赖与 CLI 入口定义
@@ -320,6 +321,8 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
 ---
 
 ## 运行时环境变量
+
+> `plugin/.mcp.json` 的 `env_vars` 白名单会将 `CODEX_HOME`、`LOCALAPPDATA`、`USERPROFILE`、`HOME`、`PATH` 以及下表中所有 MCP/守护进程配置变量（`TRI_ORCH_HOST`、`TRI_ORCH_PORT`、`TRI_ORCH_DATA_DIR`、`TRI_ORCH_STALL_SEC`、`TRI_ORCH_WATCHDOG_INTERVAL_SEC`、`TRI_ORCH_PORT_RANGE`、`TRI_ORCH_MAX_SNAPSHOT_MB`、`TRI_ORCH_GC_INTERVAL_SEC`、`TRI_ORCH_RESULT_TTL_SEC`、`TRI_ORCH_RESULT_MAX_FILES`、`TRI_ORCH_WORKSPACE_RETENTION_SEC`）透传给 `mcp_shim` 与守护进程；`TRI_ORCH_HOOK_TIMEOUT_SEC` 与 `TRI_ORCH_BASE_URL` 仅作用于 `hooks.json` 拉起的 `tri-orchestrator-hook`。
 
 | 变量名 | 默认值 | 说明 |
 | :--- | :--- | :--- |

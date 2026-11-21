@@ -1335,17 +1335,6 @@ class Database:
                 return port
         raise RuntimeError(f"No free TCP ports available in range {start}..{end}")
 
-    def allocate_port(
-        self,
-        port_range: tuple[int, int] | None = None,
-        *,
-        exclude_ports: set[int] | None = None,
-    ) -> int:
-        """Select a port in port_range unused by active workspaces and bindable on localhost."""
-        bounds = port_range or self.settings.port_range
-        with self.transaction() as conn:
-            return self._allocate_port_in_tx(conn, bounds, exclude_ports)
-
     def create_workspace(
         self,
         run_id: str,
@@ -2261,14 +2250,6 @@ class Database:
                 params,
             ).fetchall()
             return [_board_message_from_row(r) for r in rows]
-
-    def get_latest_seq(self, run_id: str) -> int:
-        with self.read_connection() as conn:
-            row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) AS latest_seq FROM board_messages WHERE run_id = ?;",
-                (run_id,),
-            ).fetchone()
-            return int(row["latest_seq"]) if row is not None else 0
 
     def get_read_cursor(
         self, run_id: str, reader_name: str, channel: str = "main"

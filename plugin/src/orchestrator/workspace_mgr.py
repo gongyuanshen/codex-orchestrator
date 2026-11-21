@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from orchestrator.config import Settings, get_settings
+from orchestrator.config import Settings
 from orchestrator.db import Database, NotFoundError, resolve_execution_root
 
 logger = logging.getLogger(__name__)

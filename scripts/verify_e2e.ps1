@@ -55,6 +55,7 @@ $ExpectedTools = @(
     "board_read",
     "board_status",
     "board_channel_list",
+    "worker_control_ack",
     "worker_register",
     "worker_heartbeat",
     "worker_status_update",
@@ -63,7 +64,23 @@ $ExpectedTools = @(
     "workspace_status",
     "workspace_merge_preview",
     "workspace_merge",
-    "workspace_cleanup"
+    "workspace_cleanup",
+    "native_action_update",
+    "inbox_send",
+    "inbox_get",
+    "inbox_ack",
+    "inbox_wait",
+    "workflow_step_save",
+    "workflow_step_advance",
+    "artifact_capture",
+    "verification_record",
+    "workflow_review",
+    "workflow_prepare_dispatch",
+    "native_action_record_call",
+    "workflow_author_turn",
+    "workflow_verifier_turn",
+    "workflow_closeout_run",
+    "session_bind"
 )
 
 function Format-Win32Arg {
@@ -253,11 +270,11 @@ json_files = sorted(
     [p for p in (root / "plugin").rglob("*.json") if ".venv" not in p.parts]
 )
 assert not (root / "plugin" / "plugin.json").exists(), "Legacy root plugin/plugin.json must be removed"
+assert not (root / "plugin" / "mcp.json").exists(), "Legacy plugin/mcp.json must be removed; use plugin/.mcp.json"
 expected_core_json = {
     root / ".agents" / "plugins" / "marketplace.json",
     root / "plugin" / ".codex-plugin" / "plugin.json",
     root / "plugin" / "hooks" / "hooks.json",
-    root / "plugin" / "mcp.json",
     root / "plugin" / ".mcp.json",
 }
 for jf in expected_core_json:
@@ -270,20 +287,18 @@ for jf in json_files:
     m = bad_path_re.search(raw)
     assert not m, f"Hardcoded local path {m.group(0)!r} found in {jf}"
 
-mcp1 = json.loads((root / "plugin" / "mcp.json").read_text(encoding="utf-8"))
-mcp2 = json.loads((root / "plugin" / ".mcp.json").read_text(encoding="utf-8"))
-srv1 = mcp1["mcpServers"]["tri_orchestrator"]
-srv2 = mcp2["mcpServers"]["tri_orchestrator"]
-for label, srv in [("plugin/mcp.json", srv1), ("plugin/.mcp.json", srv2)]:
-    assert srv.get("command") == "uv", f"{label} must use command='uv', got {srv.get('command')!r}"
-    args_str = " ".join(srv.get("args", []))
-    assert "--offline" not in args_str and "--no-sync" not in args_str, f"{label} must not contain --offline or --no-sync: {args_str}"
-assert srv1.get("cwd") == "${PLUGIN_ROOT}", f"plugin/mcp.json cwd must be '${{PLUGIN_ROOT}}', got {srv1.get('cwd')!r}"
+mcp_cfg = json.loads((root / "plugin" / ".mcp.json").read_text(encoding="utf-8"))
+srv = mcp_cfg["mcpServers"]["tri_orchestrator"]
+assert srv.get("command") == "uv", f"plugin/.mcp.json must use command='uv', got {srv.get('command')!r}"
+args_str = " ".join(srv.get("args", []))
+assert "--offline" not in args_str and "--no-sync" not in args_str, f"plugin/.mcp.json must not contain --offline or --no-sync: {args_str}"
+assert srv.get("cwd") == ".", f"plugin/.mcp.json cwd must be '.', got {srv.get('cwd')!r}"
 
 p2 = json.loads((root / "plugin" / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
 assert p2["name"] == "tri-orchestrator"
-assert p2["version"] == "0.6.0"
+assert p2["version"] == "0.6.4"
 assert p2.get("hooks") == "./hooks/hooks.json"
+assert p2.get("mcpServers") == "./.mcp.json"
 hooks_cfg = json.loads((root / "plugin" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
 assert set(hooks_cfg.get("hooks", {}).keys()) == {"SessionStart", "PostCompact", "UserPromptSubmit", "Stop"}
 short_desc = p2["interface"]["shortDescription"]

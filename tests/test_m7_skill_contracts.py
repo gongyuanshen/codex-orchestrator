@@ -43,7 +43,7 @@ def test_zero_script_agent_type_omission_and_full_model_and_reasoning_effort_inh
     assert "NEVER pass a hardcoded `model` or `reasoning_effort` parameter" in rules
 
 
-def test_zero_functions_exec_and_zero_default_agent_type_across_all_skills_and_roles() -> None:
+def test_zero_legacy_v1_or_stale_version_artifacts_across_all_skills_and_roles() -> None:
     all_docs = [ROOT / "skills/route-a-workflow.md"]
     all_docs += [ROOT / "skills" / name / "SKILL.md" for name in ALL_SKILLS]
     all_docs += sorted((ROOT / "agents").glob("*.toml"))
@@ -53,6 +53,11 @@ def test_zero_functions_exec_and_zero_default_agent_type_across_all_skills_and_r
         assert 'agent_type="default"' not in text, f"{path} still instructs agent_type=\"default\""
         assert 'agent_type: "default"' not in text, f"{path} still instructs agent_type: \"default\""
         assert "xhigh" not in text, f"{path} still hardcodes xhigh reasoning effort"
+        assert "send_input" not in text, f"{path} still references obsolete Codex V1 send_input"
+        assert "Codex V1" not in text, f"{path} still references obsolete Codex V1"
+        assert "software 0.5.0/schema7" not in text, f"{path} still carries stale 0.5.0/schema7 claim"
+        assert "Software 0.4.0/schema6" not in text, f"{path} still carries stale 0.4.0/schema6 claim"
+        assert "New runs use workflow4" not in text, f"{path} still carries stale workflow4 default claim"
 
 
 @pytest.mark.parametrize("path", sorted((ROOT / "agents").glob("*.toml")), ids=lambda p: p.stem)
@@ -156,7 +161,7 @@ def test_workflow5_macro_rpc_primary_path_and_reconciliation_fence(mode: str) ->
     text = _skill_text(mode)
     for required in (
         "workflow5",
-        "0.6.3/schema10",
+        "0.6.4/schema10",
         "workflow_prepare_dispatch",
         "task_name",
         "/root/<task_name>",
@@ -181,7 +186,7 @@ def test_workflow5_macro_rpc_primary_path_and_reconciliation_fence(mode: str) ->
         assert required in text, (mode, required)
 
 
-def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_verifier_closeout_macros() -> None:
+def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_role_focused_macros() -> None:
     shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
     for required in (
         "workflow_prepare_dispatch",
@@ -209,17 +214,29 @@ def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_verifier_cl
         data = tomllib.loads(raw)
         instructions = data["developer_instructions"]
         assert "workflow5" in instructions, path
+        assert "0.6.4/schema10" in instructions, path
         assert "board_status.workflow.workflow_version" in instructions, path
-        assert "workflow_prepare_dispatch" in instructions, path
-        assert "native_action_record_call" in instructions, path
         assert "skills/route-a-workflow.md" not in instructions, f"{path} must not require broken relative path"
         assert "self-contained" in instructions, path
-        assert "cli_executables" in instructions, path
-        assert "tri-orchestrator-challenge" in instructions, path
-        assert 'execution_kind' in instructions, path
         # Streamlined Route A footer stays compact (<= 6 bullet lines under ## Route A structured workflow)
         footer = instructions.split("## Route A structured workflow", 1)[1].strip().splitlines()
         assert len(footer) <= 6, (path, len(footer))
+
+    # Read-only interviewer/investigator stay free of coordinator dispatch/closeout boilerplate
+    for readonly_role in ("interviewer", "investigator"):
+        instructions = tomllib.loads((ROOT / f"agents/{readonly_role}.toml").read_text(encoding="utf-8"))["developer_instructions"]
+        assert "workflow_prepare_dispatch" not in instructions, readonly_role
+        assert "workflow_closeout_run" not in instructions, readonly_role
+
+    investigator = tomllib.loads((ROOT / "agents/investigator.toml").read_text(encoding="utf-8"))["developer_instructions"]
+    assert "tri-orchestrator-challenge" in investigator and "cli_executables" in investigator
+
+    for role_name in ("coder", "swarm_worker"):
+        instructions = tomllib.loads((ROOT / f"agents/{role_name}.toml").read_text(encoding="utf-8"))["developer_instructions"]
+        assert "workflow_author_turn" in instructions and "execution_kind" in instructions, role_name
+
+    planner = tomllib.loads((ROOT / "agents/planner.toml").read_text(encoding="utf-8"))["developer_instructions"]
+    assert "execution_kind" in planner
 
     verifier = tomllib.loads((ROOT / "agents/verifier.toml").read_text(encoding="utf-8"))["developer_instructions"]
     for term in (
@@ -230,7 +247,9 @@ def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_verifier_cl
         'inbox_ack(status="completed")',
         'action="challenge"',
         "verify_executable",
-        "verify_command_hint",
+        "cli_executables",
+        "tri-orchestrator-challenge",
+        "execution_kind",
     ):
         assert term in verifier, term
 

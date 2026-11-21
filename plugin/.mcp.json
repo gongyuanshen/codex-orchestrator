@@ -17,6 +17,7 @@
         "PYTHONIOENCODING": "utf-8"
       },
       "env_vars": [
+        "CODEX_HOME",
         "LOCALAPPDATA",
         "USERPROFILE",
         "HOME",
@@ -26,7 +27,12 @@
         "TRI_ORCH_DATA_DIR",
         "TRI_ORCH_STALL_SEC",
         "TRI_ORCH_WATCHDOG_INTERVAL_SEC",
-        "TRI_ORCH_PORT_RANGE"
+        "TRI_ORCH_PORT_RANGE",
+        "TRI_ORCH_MAX_SNAPSHOT_MB",
+        "TRI_ORCH_GC_INTERVAL_SEC",
+        "TRI_ORCH_RESULT_TTL_SEC",
+        "TRI_ORCH_RESULT_MAX_FILES",
+        "TRI_ORCH_WORKSPACE_RETENTION_SEC"
       ],
       "startup_timeout_sec": 60,
       "tool_timeout_sec": 300

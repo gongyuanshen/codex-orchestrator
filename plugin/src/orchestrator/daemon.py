@@ -12,7 +12,6 @@ import os
 import shutil
 import socket
 import subprocess
-import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -402,9 +401,6 @@ def build_markdown_report(bundle: dict[str, Any]) -> str:
         lines.append("_暂无消息记录。_")
     lines.append("")
     return "\n".join(lines)
-
-
-_render_run_markdown = build_markdown_report
 
 
 def _resolve_live_model_fields(

@@ -531,7 +531,7 @@ class WorkflowService:
         with self.db.transaction() as conn:
             run = self._run(run_id)
             if execution_kind == 'coordinator_local' and (run['workflow_version'] not in {4, 5} or run['mode'] != 'boost' or workspace_id is not None):
-                raise WorkflowConflictError('Coordinator-local execution requires workflow4 Boost without a workspace')
+                raise WorkflowConflictError('Coordinator-local execution requires workflow4/5 Boost without a workspace')
             packet = self.db.get_task_packet(run_id)
             if packet is None:
                 raise WorkflowConflictError('Freeze a task packet before creating workflow steps')
@@ -1021,7 +1021,7 @@ class WorkflowService:
             self._packet(step)
             self._bindings(step)
             if run['workflow_version'] not in {4, 5} or step['checkpoint'].get('complexity') != 'high':
-                raise WorkflowConflictError('Challenger findings require frozen high complexity workflow4')
+                raise WorkflowConflictError('Challenger findings require frozen high complexity workflow4/5')
             if step['revision'] != expected_revision:
                 raise WorkflowConflictError('Workflow revision conflict')
             if criterion not in step['criteria']:
@@ -1098,7 +1098,7 @@ class WorkflowService:
             if review_dimensions is not None:
                 if run['workflow_version'] not in {4, 5} or not isinstance(review_dimensions, dict) or set(review_dimensions) != {'specification', 'code', 'stress', 'evidence'} or any(
                         value not in {'PASS', 'FAIL', 'NOT_RUN'} for value in review_dimensions.values()):
-                    raise ValueError('Review dimensions require workflow4 specification/code/stress/evidence statuses')
+                    raise ValueError('Review dimensions require workflow4/5 specification/code/stress/evidence statuses')
                 if verdict == 'PASS' and 'FAIL' in review_dimensions.values():
                     raise WorkflowConflictError('Failed review dimension blocks PASS')
             if run['workflow_version'] in {4, 5} and step['checkpoint'].get('complexity') == 'high':

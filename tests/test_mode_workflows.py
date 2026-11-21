@@ -74,7 +74,7 @@ def finish(service, step, evidence):
     return advance(service, service.get_step(step['id']), 'complete')
 
 
-def test_new_runs_use_workflow4_schema7_and_rpc_cannot_choose_version(tmp_path):
+def test_new_runs_use_workflow5_schema10_and_rpc_cannot_choose_version(tmp_path):
     settings = Settings(data_dir=tmp_path / 'data')
     db = Database(settings=settings)
     try:

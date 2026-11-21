@@ -61,10 +61,6 @@
   --swarm-dot: #06b6d4;
   --swarm-tint: rgba(6, 182, 212, 0.14);
 
-  --pipeline-fg: #312e81;
-  --pipeline-bg: rgba(79, 70, 229, 0.11);
-  --pipeline-border: rgba(79, 70, 229, 0.36);
-
   --muted-tint: rgba(71, 85, 105, 0.09);
 
   --diff-add-bg: #ecfdf5;
@@ -144,10 +140,6 @@
   --swarm: #38bdf8;
   --swarm-dot: #06b6d4;
   --swarm-tint: rgba(56, 189, 248, 0.18);
-
-  --pipeline-fg: #c7d2fe;
-  --pipeline-bg: rgba(99, 102, 241, 0.18);
-  --pipeline-border: rgba(129, 140, 248, 0.42);
 
   --muted-tint: rgba(148, 163, 184, 0.15);
 
@@ -1716,14 +1708,6 @@ summary:focus-visible,
   white-space: nowrap;
 }
 
-.badge-appserver {
-  background: var(--pipeline-bg);
-  color: var(--pipeline-fg);
-  border: 1px solid var(--pipeline-border);
-  font-weight: 600;
-  letter-spacing: 0.01em;
-}
-
 .chip-tag {
   display: inline-flex;
   align-items: center;
@@ -2358,7 +2342,6 @@ summary:focus-visible,
 .workflow-step:last-child { border-bottom: none; }
 .workflow-step-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workflow-step-name { font-weight: 500; }
-.workflow-step-badges { display: inline-flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .workflow-warning { color: var(--warning); font-weight: 600; }
 
 .workflow-more,

@@ -1,4 +1,4 @@
-"""Mode2 & workflow5 role/skill instructions agree with executable backend interfaces."""
+"""Workflow5 role/skill instructions agree with executable backend interfaces."""
 from pathlib import Path
 import re
 import tomllib
@@ -72,7 +72,8 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
     assert {path.parent.name for path in skill_paths} == {"boost", "teamwork", "swarm"}
     for path in list((ROOT / "agents").glob("*.toml")) + skill_paths:
         text = path.read_text(encoding="utf-8")
-        assert "workflow_version=1/2/3/4/5" in text, path
+        assert "workflow5" in text and "0.6.4/schema10" in text, path
+        assert "workflow0..4" in text, path
         assert "board_status.workflow.workflow_version" in text, path
     for path in skill_paths:
         text = path.read_text(encoding="utf-8")
@@ -80,11 +81,11 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
         assert f"name: {path.parent.name}" in text, path
         assert "../route-a-workflow.md" in text, path
     shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
-    assert "workflow5" in shared and "0.6.3/schema10" in shared
+    assert "workflow5" in shared and "0.6.4/schema10" in shared
     assert 'artifact_id=candidate["id"]' in shared
     assert 'recipient_agent_id=next_coordinator_agent_id' in shared
-    assert "before native implementation dispatch" in shared
-    assert "workflow1" in shared and "workflow2" in shared
+    assert "admission precedes native implementation dispatch" in shared
+    assert "workflow1..4" in shared and "workflow0..4" in shared
 
 
 def test_interactive_modes_and_agents_enforce_native_and_local_execution_kinds():
@@ -93,11 +94,13 @@ def test_interactive_modes_and_agents_enforce_native_and_local_execution_kinds()
         assert 'execution_kind="native"' in native_text
         assert "app_server_pipeline" not in native_text
         assert "$pipeline" not in native_text
+        assert "send_input" not in native_text
 
     for toml_path in sorted((ROOT / "agents").glob("*.toml")):
         instructions = tomllib.loads(toml_path.read_text(encoding="utf-8"))["developer_instructions"]
         assert "app_server_pipeline" not in instructions, toml_path
         assert "$pipeline" not in instructions, toml_path
+        assert "send_input" not in instructions, toml_path
 
 
 def test_mode_specific_stage_and_bounded_native_wakeup_contracts():
@@ -108,7 +111,7 @@ def test_mode_specific_stage_and_bounded_native_wakeup_contracts():
     assert "milestone's existing attempt counter" in teamwork
     assert "intended recipient" in teamwork
     assert 'step_id=step["id"]' in swarm
-    assert "one inbox_wait per worker turn" in swarm
+    assert "one `inbox_wait` per worker turn" in swarm
     assert "heartbeat timeout is not evidence of death" in swarm
     recovery = swarm.split("**Stall & Silent-Exit Recovery**", 1)[1].split("### 5.", 1)[0]
     assert "actual native observation" in recovery
@@ -126,7 +129,7 @@ def test_implementation_sequences_support_workflow5_direct_and_legacy_fallback()
         assert "native_action_record_call" in implementation, mode
         assert "followup_task" in implementation, mode
         # Stored workflow1..4 fallback preserved via board_status.workflow.workflow_version
-        assert "bootstrap-only" in implementation, mode
+        assert "`workflow1..4` fallback" in implementation, mode
         assert "workflow_step_advance" in implementation, mode
         assert "prebound verifier" in implementation, mode
 
