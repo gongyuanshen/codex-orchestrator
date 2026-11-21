@@ -358,6 +358,153 @@ def test_daemon_codex_catalog_projection_and_sse_live_sync(tmp_path: Path, monke
         codex_bridge.invalidate_catalog_cache()
 
 
+def test_catalog_merges_run_bound_cli_and_keeps_standalone_projects(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex_home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    db_path = _init_catalog_codex_home(codex_home)
+    desktop = tmp_path / "desktop"
+    second_root = tmp_path / "secondary-desktop"
+    cli_repo = tmp_path / "codex-swarm-smoke-20261121"
+    unregistered_repo = tmp_path / "unregistered"
+    for path in (desktop, second_root, cli_repo, unregistered_repo):
+        path.mkdir()
+    (cli_repo / ".git").mkdir()
+    (unregistered_repo / ".git").mkdir()
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.execute("INSERT INTO projects VALUES ('desktop', 'Desktop', 0)")
+        conn.executemany("INSERT INTO project_roots VALUES ('desktop', ?, ?)", [
+            (0, str(desktop)), (1, str(second_root)),
+        ])
+        conn.executemany(
+            """INSERT INTO threads
+               (id, cwd, project_id, title, thread_source, source, archived,
+                model, reasoning_effort, model_provider)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                ("desktop-chat", str(desktop), "desktop", "Desktop Chat", "user", "vscode", 0, None, None, None),
+                ("secondary-cli", str(second_root / "src"), None, "CLI Chat", "user", "cli", 0, None, None, None),
+                ("merged-exec", str(tmp_path / "different-cwd"), None, "Work", "user", "exec", 0,
+                 "gpt-6.2-sol", "ultra", "local"),
+                ("standalone-cli", str(cli_repo / "src"), None, "Standalone CLI Chat", "user", "cli", 0,
+                 None, None, None),
+                ("standalone-exec", str(cli_repo / "src"), None, "Exec Title", "user", "exec", 0,
+                 "gpt-6.2-sol", "high", "openai"),
+                ("challenge-exec", str(cli_repo), None, "Challenge", "user", "exec", 0, None, None, None),
+                ("archived-cli", str(cli_repo), None, "Archived", "user", "cli", 1, None, None, None),
+                ("internal-cli", str(cli_repo), None, "Internal Run", "guardian_review", "cli", 0, None, None, None),
+                ("unregistered-cli", str(unregistered_repo / "src"), None, "Solo CLI", "user", "cli", 0,
+                 None, None, None),
+            ],
+        )
+
+    settings = Settings(host="127.0.0.1", port=_free_port(), data_dir=tmp_path / "data")
+    with Database(settings=settings) as db:
+        desktop_project = db.ensure_project(desktop)
+        child = db.ensure_project(second_root / "src")
+        standalone = db.ensure_project(cli_repo)
+        merged_run = db.create_run(project_id=child["id"], mode="swarm", title="Registered run", session_id="merged-exec")
+        cli_run = db.create_run(project_id=standalone["id"], mode="swarm", title="Run", session_id="standalone-exec")
+        missing_run = db.create_run(
+            project_id=standalone["id"], mode="boost", title="Missing SQLite row", session_id="missing",
+            metadata={"codex_source": "exec"},
+        )
+        for session_id in ("archived-cli", "internal-cli"):
+            db.create_run(project_id=standalone["id"], mode="swarm", title="Hidden", session_id=session_id)
+
+        with TestClient(create_app(settings, db=db, start_watchdog=False)) as client:
+            catalog = client.get("/api/codex/catalog").json()
+            assert client.get("/api/projects").json()["codex_catalog"] == catalog
+            assert catalog["available"] is True
+            desktop_node, cli_node, unregistered_node = catalog["projects"]
+            assert desktop_node["id"] == desktop_project["id"]
+            assert desktop_node["project_origin"] == "desktop"
+            assert desktop_node["client_kinds"] == ["cli", "desktop"]
+            desktop_threads = {t["session_id"]: t for t in desktop_node["threads"]}
+            assert set(desktop_threads) == {"desktop-chat", "secondary-cli", "merged-exec"}
+            merged = desktop_threads["merged-exec"]
+            assert (merged["codex_source"], merged["client_kind"], merged["cwd"]) == (
+                "exec", "cli", str(tmp_path / "different-cwd"),
+            )
+            assert (merged["title"], merged["model"], merged["reasoning_effort"], merged["model_provider"]) == (
+                "Work", "gpt-6.2-sol", "ultra", "local",
+            )
+            [run] = merged["runs"]
+            assert (run["id"], run["project_id"], run["canonical_project_id"]) == (
+                merged_run["id"], child["id"], desktop_node["id"],
+            )
+
+            assert cli_node["id"] == cli_node["db_project_id"] == standalone["id"]
+            assert cli_node["project_origin"] == "cli"
+            assert cli_node["client_kinds"] == ["cli"]
+            assert cli_node["is_git"] is True
+            cli_threads = {t["session_id"]: t for t in cli_node["threads"]}
+            assert set(cli_threads) == {"standalone-cli", "standalone-exec", "missing"}
+            assert cli_threads["standalone-exec"]["runs"][0]["id"] == cli_run["id"]
+            assert cli_threads["missing"]["runs"][0]["id"] == missing_run["id"]
+            assert (cli_threads["missing"]["title"], cli_threads["missing"]["codex_source"]) == (
+                "Missing SQLite row", "exec",
+            )
+            assert cli_node["active_run_count"] == cli_node["active_session_count"] == cli_node["total_run_count"] == 2
+            assert unregistered_node["id"].startswith("codex:cli:")
+            assert unregistered_node["db_project_id"] is None
+            assert unregistered_node["root_path"] == str(unregistered_repo)
+            assert unregistered_node["is_git"] is True
+            assert {r["id"] for r in catalog["global_active_runs"]} == {
+                cli_run["id"], missing_run["id"], merged_run["id"],
+            }
+            assert catalog["concurrent_risks"] == [{
+                "canonical_project_id": standalone["id"],
+                "concurrent_project_active_count": 2,
+                "concurrent_local_write_risk": True,
+            }]
+            snapshot = client.get(f"/api/runs/{cli_run['id']}/snapshot").json()["run"]
+            assert snapshot["project_id"] == cli_node["id"]
+            assert snapshot["codex_thread_name"] == "Exec Title"
+
+        # Without a readable Codex database the legacy state.db endpoints remain usable.
+        monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex"))
+        with TestClient(create_app(settings, db=db, start_watchdog=False)) as client:
+            assert client.get("/api/codex/catalog").json()["available"] is False
+            response = client.get("/api/projects").json()
+            assert "codex_catalog" not in response
+            assert standalone["id"] in {p["id"] for p in response["projects"]}
+            assert any(s["session_id"] == "missing" for s in client.get("/api/sessions").json()["sessions"])
+
+
+@pytest.mark.parametrize("with_thread", [True, False])
+def test_cli_only_state_without_desktop_tables(tmp_path, monkeypatch, with_thread):
+    codex_home = tmp_path / "codex_home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    db_path = _init_catalog_codex_home(codex_home)
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.executescript("""
+            DROP TABLE project_roots;
+            DROP TABLE projects;
+            DROP TABLE threads;
+            CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT, title TEXT, source TEXT, model TEXT);
+        """)
+        if with_thread:
+            conn.execute("INSERT INTO threads VALUES ('cli', ?, 'CLI Title', 'cli', 'model')", (str(tmp_path),))
+
+    settings = Settings(host="127.0.0.1", port=_free_port(), data_dir=tmp_path / "data")
+    with Database(settings=settings) as db:
+        project = db.ensure_project(tmp_path)
+        run = db.create_run(project_id=project["id"], mode="swarm", title="CLI run", session_id="cli")
+        with TestClient(create_app(settings, db=db, start_watchdog=False)) as client:
+            catalog = client.get("/api/codex/catalog").json()
+            assert catalog["available"] is True
+            [node] = catalog["projects"]
+            assert (node["id"], node["project_origin"], node["client_kinds"]) == (project["id"], "cli", ["cli"])
+            [thread] = node["threads"]
+            assert (thread["title"], thread["model"], thread["codex_source"]) == (
+                ("CLI Title", "model", "cli") if with_thread else ("CLI run", None, None)
+            )
+            assert [r["id"] for r in thread["runs"]] == [run["id"]]
+            if with_thread:
+                snapshot = client.get(f"/api/runs/{run['id']}/snapshot").json()["run"]
+                assert (snapshot["codex_thread_name"], snapshot["codex_model"]) == ("CLI Title", "model")
+
+
 def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
     run_dashboard(r'''(async()=>{
       const catalog = {

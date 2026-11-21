@@ -351,6 +351,57 @@ def _create_full_codex_db(home: Path) -> Path:
     return db
 
 
+def test_catalog_sources_and_bound_exec_are_request_scoped(tmp_path, monkeypatch):
+    bridge = _bridge()
+    home = tmp_path / "codex"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    db = _create_full_codex_db(home)
+    with closing(sqlite3.connect(db)) as conn, conn:
+        conn.executemany(
+            """INSERT INTO threads
+               (id, cwd, project_id, name, thread_source, source)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            [
+                ("desktop", "/repo", "p1", "Desktop", "user", "VSCODE"),
+                ("legacy", "/repo", "p1", "Legacy", "user", None),
+                ("cli", "/repo", "stale", "CLI", "user", "CLI"),
+                ("standalone", "/repo-other", None, "Standalone CLI", "user", "cli"),
+                ("bound", "/repo-other", None, "Bound Exec", "user", "EXEC"),
+                ("bound-local", "/repo", "p1", "Bound Local Exec", "user", "exec"),
+                ("bare", "/repo", "p1", "Read-only challenge", "user", "exec"),
+                ("guard", "/repo-other", None, "Guardian", "guardian_review", "exec"),
+            ],
+        )
+
+    before = _snapshot(home)
+    default = bridge.get_codex_catalog()
+    allowed_ids = ("bound", "bound-local", "guard", "missing")
+    allowed = bridge.get_codex_catalog(iter(allowed_ids))
+    assert default is not None and allowed is not None
+    [project] = default["projects"]
+    assert project["project_origin"] == "desktop"
+    assert project["client_kinds"] == ["cli", "desktop"]
+    assert {
+        t["session_id"]: (t["client_kind"], t["codex_source"]) for t in project["threads"]
+    } == {"desktop": ("desktop", "vscode"), "legacy": ("desktop", None), "cli": ("cli", "cli")}
+    assert [t["session_id"] for t in default["unmatched_cli_threads"]] == ["standalone"]
+    assert {t["session_id"] for t in allowed["projects"][0]["threads"]} == {
+        "desktop", "legacy", "cli", "bound-local",
+    }
+    assert {
+        t["session_id"]: (t["client_kind"], t["codex_source"]) for t in allowed["unmatched_cli_threads"]
+    } == {"standalone": ("cli", "cli"), "bound": ("cli", "exec")}
+    assert allowed["missing_session_ids"] == ["missing"]
+    allowed["unmatched_cli_threads"][0]["title"] = "Mutated by caller"
+    allowed["projects"][0]["client_kinds"].clear()
+    reread = bridge.get_codex_catalog(include_exec_session_ids=set(allowed_ids))
+    assert reread["unmatched_cli_threads"][0]["title"] != "Mutated by caller"
+    assert reread["projects"][0]["client_kinds"] == ["cli", "desktop"]
+    assert bridge.get_codex_catalog() == default
+    assert _snapshot(home) == before
+
+
 def test_thread_model_fields_and_subagent_tree_discovery(tmp_path, monkeypatch):
     bridge = _bridge()
     home = tmp_path / "full-codex"

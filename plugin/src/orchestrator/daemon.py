@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import hashlib
 import json
 import logging
 import math
@@ -16,6 +17,7 @@ import time
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from functools import cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -1089,12 +1091,18 @@ def create_app(
     def _build_codex_catalog_projection(
         database: Database, *, mode: str | None = None
     ) -> dict[str, Any] | None:
-        raw = codex_bridge.get_codex_catalog()
+        runs_by_session: dict[str, list[dict[str, Any]]] = {}
+        for run in database.list_runs(limit=None):
+            if run["session_id"]:
+                runs_by_session.setdefault(run["session_id"], []).append(run)
+
+        raw = codex_bridge.get_codex_catalog(include_exec_session_ids=runs_by_session.keys())
         if raw is None:
             return None
 
         effective_mode = None if mode in {None, "all"} else mode
         db_projects = database.list_projects()
+        db_by_id = {proj["id"]: proj for proj in db_projects}
         activity = database.dashboard_project_activity()
         db_by_root: dict[str, dict[str, Any]] = {}
         db_with_keys: list[tuple[str, dict[str, Any]]] = []
@@ -1108,23 +1116,137 @@ def create_app(
             ):
                 db_by_root[key] = proj
 
-        all_runs = database.list_runs(limit=None)
-        enriched_runs = _enrich_runs(database, all_runs, activity)
-        runs_by_session: dict[str, list[dict[str, Any]]] = {}
-        for run in enriched_runs:
-            sid = run.get("session_id")
-            if sid:
-                runs_by_session.setdefault(str(sid), []).append(run)
+        desktop_by_id = {p["codex_project_id"]: p for p in raw["projects"]}
+        desktop_roots = [
+            {"project_id": p["codex_project_id"], "name": p["name"], "root_path": root}
+            for p in raw["projects"]
+            for root in p["root_paths"]
+        ]
+        registered_roots = [
+            {"project_id": p["id"], "name": p["name"], "root_path": p["root_path"]}
+            for p in db_by_root.values()
+        ]
+        cli_by_root: dict[str, dict[str, Any]] = {}
+
+        def canonical_db_project(project: dict[str, Any]) -> dict[str, Any]:
+            return db_by_id[project["canonical_project_id"]] if project["canonical_project_id"] else project
+
+        def desktop_project_id(thread: codex_bridge._CodexCatalogThread) -> str | None:
+            codex_id = thread["codex_project_id"]
+            if codex_id in desktop_by_id:
+                return codex_id
+            match = codex_bridge._match_project(thread["cwd"], desktop_roots)
+            if match is not None:
+                return match["project_id"]
+            for run in runs_by_session.get(thread["session_id"], []):
+                project = db_by_id[run["project_id"]]
+                canonical = canonical_db_project(project)
+                for p in (project, canonical):
+                    if p["codex_project_id"] in desktop_by_id:
+                        return p["codex_project_id"]
+                for root in (run["execution_root"], project["root_path"], canonical["root_path"]):
+                    match = codex_bridge._match_project(root, desktop_roots)
+                    if match is not None:
+                        return match["project_id"]
+            return None
+
+        @cache
+        def cli_git_root(cwd: str, *, parents: bool) -> str | None:
+            path = Path(cwd)
+            if not path.is_absolute():
+                return None
+            for candidate in (path, *path.parents) if parents else (path,):
+                try:
+                    if (candidate / ".git").exists():
+                        return str(candidate)
+                except OSError:
+                    continue
+            return None
+
+        pending_threads = raw["unmatched_cli_threads"]
+        for sid in raw["missing_session_ids"]:
+            run = runs_by_session[sid][0]
+            root = db_by_id[run["project_id"]]["root_path"]
+            cwd = run["execution_root"] or root
+            if codex_bridge._is_internal_chatgpt_project_root(cwd):
+                continue
+            metadata = run["metadata"]
+            source = codex_bridge._clean_opt_str(metadata.get("codex_source")) if isinstance(metadata, dict) else None
+            if source is not None:
+                source = source.lower()
+            pending_threads.append({
+                "session_id": sid,
+                "title": run["title"],
+                "cwd": cwd,
+                "codex_project_id": None,
+                "codex_project_name": None,
+                "codex_project_root": None,
+                "is_pinned": False,
+                "created_at": run["created_at"],
+                "updated_at": run["updated_at"],
+                "model": run["trigger_model"],
+                "reasoning_effort": run["trigger_reasoning_effort"],
+                "model_provider": None,
+                "codex_source": source,
+                "client_kind": "cli" if source in {"cli", "exec"} else "desktop",
+            })
+
+        for thread in pending_threads:
+            desktop_id = desktop_project_id(thread)
+            if desktop_id is not None:
+                cp = desktop_by_id[desktop_id]
+            else:
+                bound_runs = runs_by_session.get(thread["session_id"])
+                if bound_runs:
+                    db_project = canonical_db_project(db_by_id[bound_runs[0]["project_id"]])
+                else:
+                    match = codex_bridge._match_project(thread["cwd"], registered_roots)
+                    db_project = canonical_db_project(db_by_id[match["project_id"]]) if match else None
+                cwd = thread["cwd"]
+                if db_project:
+                    root = db_project["root_path"]
+                    is_git = db_project["is_git"] or cli_git_root(root, parents=False) is not None
+                else:
+                    git_root = cli_git_root(cwd, parents=True)
+                    root = git_root or cwd
+                    is_git = git_root is not None
+                root_key = codex_bridge._path_key(root)
+                cp = cli_by_root.get(root_key)
+                if cp is None:
+                    cp = {
+                        "codex_project_id": None,
+                        "name": db_project["name"] if db_project else (Path(root).name or root or "CLI"),
+                        "root_path": root,
+                        "position": len(raw["projects"]) + len(cli_by_root),
+                        "is_git": is_git,
+                        "project_origin": "cli",
+                        "threads": [],
+                    }
+                    cli_by_root[root_key] = cp
+                if thread["codex_source"] is None:
+                    thread["client_kind"] = "cli"
+            thread.update(
+                codex_project_id=cp["codex_project_id"],
+                codex_project_name=cp["name"],
+                codex_project_root=cp["root_path"],
+            )
+            cp["threads"].append(thread)
 
         projected_projects: list[dict[str, Any]] = []
         global_active_runs: list[dict[str, Any]] = []
         concurrent_risks: list[dict[str, Any]] = []
 
-        for cp in raw["projects"]:
+        for cp in (*raw["projects"], *cli_by_root.values()):
             root_key = codex_bridge._path_key(cp["root_path"])
             root_prefix = root_key.rstrip("/") + "/"
             db_proj = db_by_root.get(root_key)
-            proj_id = db_proj["id"] if db_proj else f"codex:{cp['codex_project_id']}"
+            project_origin = cp["project_origin"]
+            if db_proj:
+                proj_id = db_proj["id"]
+            elif project_origin == "desktop":
+                proj_id = f"codex:{cp['codex_project_id']}"
+            else:
+                proj_id = "codex:cli:" + hashlib.sha256(root_key.encode("utf-8")).hexdigest()
             db_project_id = db_proj["id"] if db_proj else None
 
             matching_activity_ids: set[str] = {
@@ -1139,7 +1261,7 @@ def create_app(
             proj_active_sessions: set[str] = set()
             proj_total_runs = 0
 
-            for ct in cp["threads"]:
+            for ct in sorted(cp["threads"], key=codex_bridge._catalog_thread_sort_key):
                 raw_thread_runs = sorted(
                     runs_by_session.get(ct["session_id"], []),
                     key=lambda r: (r.get("session_seq") or 0, r.get("updated_at") or 0.0),
@@ -1147,9 +1269,8 @@ def create_app(
                 )
                 decorated_all: list[dict[str, Any]] = []
                 for r in raw_thread_runs:
-                    orig_canonical = r.get("canonical_project_id")
-                    if r.get("status") == "active" and orig_canonical:
-                        matching_activity_ids.add(str(orig_canonical))
+                    if r.get("status") == "active":
+                        matching_activity_ids.add(canonical_db_project(db_by_id[r["project_id"]])["id"])
                     copy_r = {
                         **r,
                         "canonical_project_id": proj_id,
@@ -1157,17 +1278,9 @@ def create_app(
                         "codex_project_name": cp["name"],
                         "codex_thread_name": ct["title"],
                         "session_display_name": ct["title"],
-                        "codex_model": ct["model"] if ct["model"] is not None else r.get("codex_model"),
-                        "codex_reasoning_effort": (
-                            ct["reasoning_effort"]
-                            if ct["reasoning_effort"] is not None
-                            else r.get("codex_reasoning_effort")
-                        ),
-                        "codex_model_provider": (
-                            ct["model_provider"]
-                            if ct["model_provider"] is not None
-                            else r.get("codex_model_provider")
-                        ),
+                        "codex_model": ct["model"],
+                        "codex_reasoning_effort": ct["reasoning_effort"],
+                        "codex_model_provider": ct["model_provider"],
                     }
                     decorated_all.append(copy_r)
 
@@ -1217,8 +1330,10 @@ def create_app(
                 "root_path": cp["root_path"],
                 "position": cp["position"],
                 "is_git": cp["is_git"],
-                "project_kind": "workspace",
+                "project_kind": db_proj["project_kind"] if project_origin == "cli" and db_proj else "workspace",
                 "canonical_project_id": None,
+                "project_origin": project_origin,
+                "client_kinds": sorted({t["client_kind"] for t in threads_out}) or [project_origin],
                 "active_run_count": proj_active_runs_all_modes,
                 "active_session_count": len(proj_active_sessions),
                 "total_run_count": proj_total_runs,
