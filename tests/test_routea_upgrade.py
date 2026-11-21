@@ -100,6 +100,22 @@ def test_apply_rejects_new_writes_since_prepare(fixture):
     assert not (fixture[3] / "applied.json").exists()
 
 
+def test_apply_rechecks_live_state_after_staged_migration(fixture, monkeypatch):
+    prepare(fixture)
+    require_old_rows = upgrade.require_old_rows
+
+    def check_then_write(candidate, before):
+        require_old_rows(candidate, before)
+        with closing(sqlite3.connect(fixture[2] / "state.db")) as db, db:
+            db.execute("INSERT INTO receipts VALUES('concurrent write')")
+
+    monkeypatch.setattr(upgrade, "require_old_rows", check_then_write)
+    with pytest.raises(upgrade.UpgradeError, match="changed during migration"):
+        upgrade.apply(fixture[3], database_only=True)
+    with closing(sqlite3.connect(fixture[2] / "state.db")) as db:
+        assert db.execute("SELECT id FROM receipts").fetchone() == ("concurrent write",)
+
+
 def test_rollback_rejects_new_production_writes(fixture):
     prepare(fixture)
     upgrade.apply(fixture[3])
@@ -136,6 +152,28 @@ def test_managed_cache_version_mismatch_not_silently_installed(fixture):
     upgrade.prepare(source, cached, data, backup, port=port)
     with pytest.raises(upgrade.UpgradeError, match="host"):
         upgrade.apply(backup)
+
+
+def test_database_only_upgrade_and_rollback_leave_managed_plugin_untouched(fixture):
+    source, target, data, backup, port = fixture
+    cached = target.parent / "plugins" / "cache" / "tri-orchestrator" / "tri-orchestrator" / "0.1.2"
+    cached.parent.mkdir(parents=True)
+    target.rename(cached)
+    prepared = upgrade.prepare(source, cached, data, backup, port=port)
+
+    report = upgrade.apply(backup, database_only=True)
+
+    assert report["status"] == "applied_service_stopped"
+    assert report["database_only"] is True
+    assert report["database_after"]["schema_version"] == 4
+    assert upgrade.package_files(cached) == prepared["target_files"]
+    assert upgrade.package_identity(cached)["version"] == "0.1.2"
+
+    # The host may remove the old cache when installing the new version.
+    cached.rename(cached.with_name("old-cache-moved-by-host"))
+    assert upgrade.rollback(backup)["status"] == "rolled_back_service_stopped"
+    assert upgrade.database_snapshot(data / "state.db") == prepared["database_before"]
+    assert not cached.exists()
 
 
 def test_prepare_refuses_overlapping_paths(fixture):
@@ -194,6 +232,8 @@ def test_migration_cannot_erase_preexisting_receipts(fixture):
     prepare(fixture)
     with pytest.raises(upgrade.UpgradeError, match="preexisting"):
         upgrade.apply(fixture[3])
+    with closing(sqlite3.connect(fixture[2] / "state.db")) as db:
+        assert db.execute("SELECT id FROM receipts").fetchone()[0] == "preserve"
     assert json.loads((fixture[3] / "apply-failed.json").read_text())["status"] == "reconciliation_required"
 
 

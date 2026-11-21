@@ -766,7 +766,7 @@ wheels = [
 
 [[package]]
 name = "tri-orchestrator"
-version = "0.6.6"
+version = "0.6.7"
 source = { editable = "plugin" }
 dependencies = [
     { name = "httpx" },

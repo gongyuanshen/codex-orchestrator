@@ -124,6 +124,30 @@ def daemon_env(tmp_path: Path) -> Iterator[tuple[Settings, _RunningServer, httpx
             yield settings, srv, client
 
 
+def test_collector_heartbeat_cannot_reopen_finished_worker(daemon_env, tmp_path, monkeypatch):
+    _, server, client = daemon_env
+    db = server.app.state.db
+    run = db.create_run(project_root=tmp_path, is_git=False, mode='swarm', title='Keepalive')
+    worker = db.upsert_worker(run['id'], 'verifier', role='verifier', status='working', heartbeat_at=1)
+    url = f"/api/runs/{run['id']}/workers/verifier/heartbeat"
+    response = client.post(url, json={'current_task': 'running check'})
+    assert response.status_code == 200
+    assert response.json()['worker']['current_task'] == 'running check'
+    assert response.json()['worker']['last_heartbeat_at'] > worker['last_heartbeat_at']
+    write_heartbeat = db.update_worker_heartbeat
+
+    def complete_before_heartbeat_write(**kwargs):
+        db.update_worker_status(worker_id=worker['id'], status='waiting', current_task='verified')
+        return write_heartbeat(**kwargs)
+
+    monkeypatch.setattr(db, 'update_worker_heartbeat', complete_before_heartbeat_write)
+    late = client.post(url, json={'current_task': 'late check'})
+    assert late.status_code == 409
+    after = db.get_worker_by_name(run['id'], 'verifier')
+    assert (after['status'], after['current_task']) == ('waiting', 'verified')
+    assert after['last_heartbeat_at'] == response.json()['worker']['last_heartbeat_at']
+
+
 @pytest.mark.parametrize("workspace_state", ["active", "merged", "cleaned"])
 def test_summary_snapshot_does_not_scan_disk(daemon_env, tmp_path, monkeypatch, workspace_state):
     _, server, client = daemon_env

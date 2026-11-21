@@ -29,6 +29,17 @@ def test_real_nonzero_separate_bytes(tmp_path):
         validate_receipt(m, tmp_path / 'output/receipt.json', require_success=True)
 
 
+def test_creates_receipt_parent_but_never_reuses_final_directory(tmp_path):
+    m, p = frozen(tmp_path)
+    output_dir = tmp_path / 'verification-receipts' / m['artifact_id']
+    collect(p, output_dir)
+    validate_receipt(m, output_dir / 'receipt.json', require_success=True)
+    original = (output_dir / 'receipt.json').read_bytes()
+    with pytest.raises(FileExistsError):
+        collect(p, output_dir)
+    assert (output_dir / 'receipt.json').read_bytes() == original
+
+
 def test_exact_argv_large_output_and_tamper(tmp_path):
     args = ['中文 空格', '', 'a"b', 'x\\', '&|>']
     m, p = frozen(tmp_path, "import sys,json,os;os.write(1,json.dumps(sys.argv[1:],ensure_ascii=False).encode('utf-8'));os.write(2,b'e'*3000000)", args)
@@ -169,6 +180,56 @@ def test_cli_bounded_real_summary(tmp_path, exit_code):
     assert summary['status'] == 'finished'
     assert summary['manifest_digest'] == digest(m)
     assert Path(summary['receipt_path']).is_file()
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Win32 console inheritance')
+def test_windows_native_ctrl_break_cancels_owned_commands_before_next_launch(tmp_path):
+    import subprocess
+
+    code = 'from pathlib import Path;import sys,time;Path(sys.argv[1]).touch();time.sleep(6)'
+    m, p = frozen(tmp_path, code, timeout=10)
+    m['max_parallel'] = 2
+    markers = [tmp_path / f'launched-{i}' for i in range(3)]
+    m['commands'] = [
+        dict(m['commands'][0], id=f'job-{i}', parallel_group='checks', argv=[sys.executable, '-c', code, str(marker)])
+        for i, marker in enumerate(markers)
+    ]
+    p.write_text(json.dumps(m), encoding='utf-8')
+    output_dir = tmp_path / 'output'
+    controller = tmp_path / 'console_controller.py'
+    controller.write_text('''
+import ctypes, subprocess, sys, time
+from pathlib import Path
+proc = subprocess.Popen(
+    [sys.executable, '-m', 'orchestrator.verify_runner', '--manifest', sys.argv[1], '--output-dir', sys.argv[2]],
+    creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+)
+try:
+    deadline = time.monotonic() + 5
+    while not all(Path(marker).is_file() for marker in sys.argv[3:]):
+        if proc.poll() is not None or time.monotonic() >= deadline:
+            raise RuntimeError('Collector did not start both owned processes')
+        time.sleep(0.01)
+    if not ctypes.windll.kernel32.GenerateConsoleCtrlEvent(1, proc.pid):
+        raise ctypes.WinError()
+    raise SystemExit(proc.wait(timeout=5))
+finally:
+    if proc.poll() is None:
+        proc.kill()
+        proc.wait(timeout=5)
+''', encoding='utf-8')
+    startup = subprocess.STARTUPINFO(dwFlags=subprocess.STARTF_USESHOWWINDOW, wShowWindow=subprocess.SW_HIDE)
+    child = subprocess.run(
+        [sys.executable, str(controller), str(p), str(output_dir), str(markers[0]), str(markers[1])],
+        startupinfo=startup, creationflags=subprocess.CREATE_NEW_CONSOLE,
+        capture_output=True, timeout=16, check=False,
+    )
+    assert child.returncode == 1, (child.stdout, child.stderr)
+    assert not markers[2].exists()
+    receipt = json.loads((output_dir / 'receipt.json').read_text(encoding='utf-8'))
+    assert receipt['status'] == 'cancelled'
+    assert [command['status'] for command in receipt['commands']] == ['cancelled', 'cancelled']
+    validate_receipt(m, output_dir / 'receipt.json', require_success=False)
 
 
 def test_case_insensitive_systemroot_and_env_profile_never_leak_or_serialize(tmp_path, monkeypatch):
@@ -321,3 +382,190 @@ def test_parallel_group_batches_barriers_and_heartbeat_keepalive(tmp_path):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_parallel_receipt_times_start_after_a_slot_opens(tmp_path):
+    m, p = frozen(tmp_path, "import time; time.sleep(0.25)")
+    m['max_parallel'] = 2
+    m['commands'] = [dict(m['commands'][0], id=f'job-{i}', parallel_group='checks') for i in range(3)]
+    p.write_text(json.dumps(m), encoding='utf-8')
+    output_dir = tmp_path / 'output'
+    receipt = collect(p, output_dir)
+    first, second, queued = receipt['commands']
+    assert second['started_at'] < first['ended_at']
+    assert queued['started_at'] >= min(first['ended_at'], second['ended_at'])
+    validate_receipt(m, output_dir / 'receipt.json', require_success=True)
+
+
+@pytest.mark.parametrize('use_ctrl_c', [True, False], ids=['ctrl-c', 'platform-stop'])
+def test_parallel_interrupt_cancels_running_processes_and_skips_queued_commands(tmp_path, monkeypatch, capsys, use_ctrl_c):
+    import _thread
+    import signal
+    import threading
+    from orchestrator.verify_runner import main
+
+    code = "from pathlib import Path;import sys,time;Path(sys.argv[1]).touch();time.sleep(1.25)"
+    m, p = frozen(tmp_path, code)
+    m['max_parallel'] = 2
+    markers = [tmp_path / f'launched-{i}' for i in range(3)]
+    m['commands'] = [
+        dict(m['commands'][0], id=f'job-{i}', parallel_group='checks', argv=[sys.executable, '-c', code, str(marker)])
+        for i, marker in enumerate(markers)
+    ]
+    p.write_text(json.dumps(m), encoding='utf-8')
+    output_dir = tmp_path / 'output'
+    monkeypatch.setattr(sys, 'argv', ['tri-orchestrator-verify', '--manifest', str(p), '--output-dir', str(output_dir)])
+    platform_stop = signal.SIGBREAK if sys.platform == 'win32' else signal.SIGTERM
+    signum = signal.SIGINT if use_ctrl_c else platform_stop
+    original_stop_handler = signal.getsignal(platform_stop)
+    stop = threading.Event()
+
+    def interrupt_running_children():
+        while not stop.wait(0.01):
+            if all(marker.exists() for marker in markers[:2]):
+                _thread.interrupt_main(signum)
+                return
+
+    interrupter = threading.Thread(target=interrupt_running_children)
+    interrupter.start()
+    try:
+        exit_code = main()
+    finally:
+        stop.set()
+        interrupter.join()
+        signal.signal(platform_stop, original_stop_handler)
+    assert exit_code == 1
+    assert json.loads(capsys.readouterr().out)['status'] == 'cancelled'
+    receipt = json.loads((output_dir / 'receipt.json').read_text(encoding='utf-8'))
+    assert receipt['status'] == 'cancelled'
+    assert not markers[2].exists()
+    assert [(c['command_id'], c['status']) for c in receipt['commands']] == [('job-0', 'cancelled'), ('job-1', 'cancelled')]
+    validate_receipt(m, output_dir / 'receipt.json', require_success=False)
+
+
+def test_parallel_interrupt_preserves_owned_process_cleanup_failure(tmp_path, monkeypatch):
+    import _thread
+    import threading
+    import time
+
+    from orchestrator import verify_runner as runner
+    from orchestrator.verify_process import ProcessFailure
+
+    active = threading.Event()
+    finish_cleanup = threading.Event()
+    m, p = frozen(tmp_path)
+    m['max_parallel'] = 2
+    m['commands'] = [dict(m['commands'][0], id=f'job-{i}', parallel_group='checks') for i in range(2)]
+    p.write_text(json.dumps(m), encoding='utf-8')
+
+    def fail_process_cleanup(*args, cancel=None):
+        active.set()
+        if cancel is not None:
+            assert cancel.wait(3)
+        assert finish_cleanup.wait(3)
+        raise ProcessFailure('cleanup_failed', 'injected owned-process cleanup failure')
+
+    def interrupt_twice():
+        if active.wait(3):
+            _thread.interrupt_main()
+            time.sleep(0.1)
+            _thread.interrupt_main()
+        finish_cleanup.set()
+
+    monkeypatch.setattr(runner, 'run_owned', fail_process_cleanup)
+    interrupter = threading.Thread(target=interrupt_twice)
+    interrupter.start()
+    output_dir = tmp_path / 'output'
+    receipt = collect(p, output_dir)
+    interrupter.join()
+    assert receipt['status'] == 'cleanup_failed'
+    assert 'injected owned-process cleanup failure' in receipt['error']
+    validate_receipt(m, output_dir / 'receipt.json', require_success=False)
+
+
+@pytest.mark.parametrize('timeout', [False, True], ids=['completed-command', 'preserve-command-timeout'])
+def test_interrupt_during_heartbeat_shutdown_keeps_terminal_receipt(tmp_path, monkeypatch, capsys, timeout):
+    import _thread
+    import signal
+    import threading
+    import time
+
+    from orchestrator import verify_runner as runner
+
+    m, path = frozen(tmp_path, 'import time;time.sleep(0.5)', timeout=0.25 if timeout else 5)
+    output_dir = tmp_path / 'output'
+    stop_requested = threading.Event()
+    release_request = threading.Event()
+    stopped = []
+    original_stop = runner._HeartbeatKeepalive.stop
+
+    def pending_request(self):
+        if self._active_provider():
+            assert release_request.wait(5)
+
+    def note_stop(self, *args, **kwargs):
+        stopped.append(self._thread)
+        stop_requested.set()
+        return original_stop(self, *args, **kwargs)
+
+    def interrupt_stop():
+        if stop_requested.wait(5):
+            _thread.interrupt_main()
+            time.sleep(0.1)
+        release_request.set()
+
+    monkeypatch.setattr(runner._HeartbeatKeepalive, '_send_once', pending_request)
+    monkeypatch.setattr(runner._HeartbeatKeepalive, 'stop', note_stop)
+    monkeypatch.setattr(sys, 'argv', [
+        'tri-orchestrator-verify', '--manifest', str(path), '--output-dir', str(output_dir),
+        '--heartbeat-url', 'http://127.0.0.1', '--heartbeat-interval-sec', '0.01',
+    ])
+    platform_stop = signal.SIGBREAK if sys.platform == 'win32' else signal.SIGTERM
+    handler = signal.getsignal(platform_stop)
+    interrupter = threading.Thread(target=interrupt_stop)
+    interrupter.start()
+    try:
+        try:
+            assert runner.main() == 1
+        except KeyboardInterrupt:
+            pytest.fail('heartbeat shutdown propagated Ctrl+C without a terminal CLI result')
+        assert stopped and not stopped[-1].is_alive()
+    finally:
+        release_request.set()
+        interrupter.join()
+        signal.signal(platform_stop, handler)
+
+    expected = 'timeout' if timeout else 'cancelled'
+    assert json.loads(capsys.readouterr().out)['status'] == expected
+    receipt_path = output_dir / 'receipt.json'
+    receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
+    assert receipt['status'] == expected and receipt['ended_at'] is None
+    validate_receipt(m, receipt_path, require_success=False)
+
+
+def test_slow_heartbeat_cannot_delay_terminal_receipt_past_shutdown_bound(tmp_path, monkeypatch, caplog):
+    import threading
+
+    from orchestrator import verify_runner as runner
+
+    m, path = frozen(tmp_path, 'import time;time.sleep(0.25)')
+    release_request = threading.Event()
+    request_finished = threading.Event()
+
+    def pending_request(self):
+        if self._active_provider():
+            release_request.wait(1.5)
+            request_finished.set()
+
+    monkeypatch.setattr(runner, '_KEEPALIVE_STOP_TIMEOUT_SEC', 0.1, raising=False)
+    monkeypatch.setattr(runner._HeartbeatKeepalive, '_send_once', pending_request)
+    output_dir = tmp_path / 'output'
+    try:
+        receipt = collect(path, output_dir, heartbeat_url='http://127.0.0.1', heartbeat_interval_sec=0.01)
+        assert receipt['status'] == 'finished'
+        assert not request_finished.is_set()
+        assert 'heartbeat request is still in flight' in caplog.text
+        validate_receipt(m, output_dir / 'receipt.json', require_success=True)
+    finally:
+        release_request.set()
+        assert request_finished.wait(2)

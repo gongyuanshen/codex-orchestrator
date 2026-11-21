@@ -47,6 +47,24 @@ function Read-Utf8Text {
     return [System.IO.File]::ReadAllText($Path, $Utf8NoBom)
 }
 
+function Get-RoleHash {
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($Path))).Replace("-", "") }
+    finally { $sha.Dispose() }
+}
+
+function Copy-RoleFile {
+    param([string]$Source, [string]$Target)
+    $tmp = "$Target.tmp.$([Guid]::NewGuid().ToString('N'))"
+    [System.IO.File]::Copy($Source, $tmp)
+    if ([System.IO.File]::Exists($Target)) {
+        [System.IO.File]::Replace($tmp, $Target, [NullString]::Value)
+    } else {
+        [System.IO.File]::Move($tmp, $Target)
+    }
+}
+
 function Format-Win32Arg {
     param([string]$Arg)
     if ($Arg -eq "") { return '""' }
@@ -539,8 +557,19 @@ try {
 }
 
 # Ensure CodexHome & backup directories exist (back up only config.toml + role TOMLs; never copy .venv into backups)
-New-Item -ItemType Directory -Path $CodexHome -Force | Out-Null
 $agentsDstDir = Join-Path $CodexHome "agents"
+if (Test-Path -LiteralPath $agentsDstDir) {
+    $agentsDir = Get-Item -LiteralPath $agentsDstDir -Force
+    if (-not $agentsDir.PSIsContainer -or ($agentsDir.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Expected a regular agents directory, not a file or reparse point: $agentsDstDir"
+    }
+    foreach ($role in (Get-ChildItem -LiteralPath $agentsDstDir -Force)) {
+        if ($RoleFiles -contains $role.Name -and ($role.PSIsContainer -or ($role.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+            throw "Expected a regular role file, not a directory or reparse point: $($role.FullName)"
+        }
+    }
+}
+New-Item -ItemType Directory -Path $CodexHome -Force | Out-Null
 New-Item -ItemType Directory -Path $agentsDstDir -Force | Out-Null
 
 $backupsRoot = Join-Path $CodexHome "backups"
@@ -555,6 +584,8 @@ New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
 
 $baselineDir = Join-Path $backupsRoot "tri-orchestrator-baseline"
 $baselineExists = Test-Path $baselineDir
+$ownershipPath = Join-Path $baselineDir "installed-roles.json"
+$priorRoles = if (Test-Path -LiteralPath $ownershipPath -PathType Leaf) { Read-Utf8Text $ownershipPath | ConvertFrom-Json }
 if (-not $baselineExists) {
     New-Item -ItemType Directory -Path $baselineDir -Force | Out-Null
 }
@@ -569,24 +600,38 @@ if ($configExisted) {
 
 $agentsBackupDir = Join-Path $backupDir "agents"
 $baselineAgentsDir = Join-Path $baselineDir "agents"
+$roleRestoreDir = Join-Path $baselineDir "roles-before-reinstall"
 $backedUpAgents = @()
 $baselinePreexistingAgents = @()
 $installedAgents = @()
+$installedRoles = [ordered]@{}
 
 foreach ($rf in $RoleFiles) {
     $srcFile = Join-Path $agentsSrcDir $rf
     $dstFile = Join-Path $agentsDstDir $rf
-    if (Test-Path $dstFile -PathType Leaf) {
+    $restoreFrom = ""
+    if (Test-Path -LiteralPath $dstFile -PathType Leaf) {
+        $priorRole = if ($priorRoles -and $priorRoles.PSObject.Properties[$rf]) { $priorRoles.$rf }
         New-Item -ItemType Directory -Path $agentsBackupDir -Force | Out-Null
-        Copy-Item -Path $dstFile -Destination (Join-Path $agentsBackupDir $rf) -Force
+        Copy-Item -LiteralPath $dstFile -Destination (Join-Path $agentsBackupDir $rf) -Force
         $backedUpAgents += $rf
         if (-not $baselineExists) {
             New-Item -ItemType Directory -Path $baselineAgentsDir -Force | Out-Null
-            Copy-Item -Path $dstFile -Destination (Join-Path $baselineAgentsDir $rf) -Force
+            Copy-Item -LiteralPath $dstFile -Destination (Join-Path $baselineAgentsDir $rf) -Force
             $baselinePreexistingAgents += $rf
+            $restoreFrom = "agents"
+        } elseif ($priorRole -and (Get-RoleHash $dstFile) -eq $priorRole.sha256) {
+            $restoreFrom = $priorRole.restore_from
+        } else {
+            New-Item -ItemType Directory -Path $roleRestoreDir -Force | Out-Null
+            $restorePath = Join-Path $roleRestoreDir $rf
+            Copy-RoleFile -Source $dstFile -Target $restorePath
+            Write-Warning "[install] Saved existing role $dstFile to non-rotating backup $restorePath before replacement."
+            $restoreFrom = "roles-before-reinstall"
         }
     }
-    Copy-Item -Path $srcFile -Destination $dstFile -Force
+    $installedRoles[$rf] = @{ sha256 = (Get-RoleHash $srcFile); restore_from = $restoreFrom }
+    Copy-RoleFile -Source $srcFile -Target $dstFile
     $installedAgents += $rf
 }
 
@@ -598,6 +643,7 @@ if (-not $baselineExists) {
     }
     Write-Utf8NoBom -Path (Join-Path $baselineDir "baseline.json") -Content (($baselineObj | ConvertTo-Json -Depth 4) + "`n")
 }
+Write-Utf8NoBom -Path $ownershipPath -Content (($installedRoles | ConvertTo-Json -Depth 4) + "`n")
 Write-Host "[install] Installed $($installedAgents.Count) agent role TOMLs into $agentsDstDir"
 
 Write-Utf8NoBom -Path $configPath -Content $candidateConfig

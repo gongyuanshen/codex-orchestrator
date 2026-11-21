@@ -171,7 +171,9 @@ def run_owned(argv, cwd, env, timeout, stdout, stderr, *, cancel=None):
             environment = C.create_unicode_buffer('\0'.join(f'{key}={value}' for key, value in sorted(env.items(), key=lambda item: item[0].upper())) + '\0\0')
             if cancel is not None and cancel.is_set():
                 raise ProcessFailure('cancelled', 'cancelled before creation')
-            checked(k.CreateProcessW(executable, commandline, None, None, True, 0x80000 | 0x400, environment, cwd, C.byref(startup), C.byref(process)), 'CreateProcessW')
+            # Route collector-group console cancellation through the owning Job.
+            flags = 0x80000 | 0x400 | subprocess.CREATE_NEW_PROCESS_GROUP
+            checked(k.CreateProcessW(executable, commandline, None, None, True, flags, environment, cwd, C.byref(startup), C.byref(process)), 'CreateProcessW')
             created = True
             handles.extend([process.process, process.thread])
         for handle in duplicates + [process.thread]:

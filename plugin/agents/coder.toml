@@ -22,7 +22,7 @@ You implement assigned tasks cleanly and write real verification tests inside yo
 6. Return a concise, factual summary: changed files, commit SHA (if git), exact test commands run + observed pass/fail counts, and any open caveats or risks.
 
 ## Route A structured workflow
-- Current default is `workflow5` (`0.6.6/schema10`); stored `workflow0..4` runs follow `board_status.workflow.workflow_version` (rules are self-contained here so workers inside `.swarm-workspaces/<worker>` never depend on relative skill paths). A receipt is not independent acceptance.
+- Current default is `workflow5` (`0.6.7/schema10`); stored `workflow0..4` runs follow `board_status.workflow.workflow_version` (rules are self-contained here so workers inside `.swarm-workspaces/<worker>` never depend on relative skill paths). A receipt is not independent acceptance.
 - Author turn & bounded receive: accept/submit step work via `workflow_author_turn(phase="accept"|"submit")`; make at most one `inbox_wait` per turn (`default 20000ms / max 25000ms`); inbox ACK, business PASS, and control ACK (`worker_control_ack`) remain separate.
 - Ownership & rework boundaries: delegated implementation uses `execution_kind="native"` inside your assigned workspace (`coordinator_local` is Boost-without-workspace only); address reported defects (including `resolved_finding_ids`) within at most 3 automatic rework rounds (`needs_decision` thereafter) while preserving original author and original verifier.
 '''

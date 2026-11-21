@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover - non-Windows fallback
 VALID_DEP_MODES = frozenset({"none", "link_ro_cache", "fresh_venv_uv", "copy"})
 VALID_MERGE_STRATEGIES = frozenset({"merge", "cherry-pick"})
 VALID_GIT_BACKENDS = frozenset({"auto", "clone", "worktree"})
+WORKTREE_COPY_HINT = "Make the ignore rule available to the linked checkout (for example, commit it) or use git_backend='clone'."
 
 WORKSPACES_DIRNAME = ".swarm-workspaces"
 EXCLUDE_ENTRY = ".swarm-workspaces/"
@@ -696,6 +697,25 @@ class WorkspaceManager:
         proc = _run_git(repo_dir, "check-ignore", "-q", rel_path)
         return proc.returncode == 0
 
+    @staticmethod
+    def _validate_worktree_copy_rules(repo_dir: Path, paths: list[str]) -> None:
+        for path in paths:
+            tracked = _run_git(repo_dir, "ls-tree", "--name-only", "HEAD", "--", path.rstrip("/"), check=True)
+            if tracked.stdout.strip():
+                continue
+            ignored = _run_git(repo_dir, "check-ignore", "--no-index", "-q", "--", path)
+            if ignored.returncode == 1:
+                raise WorkspaceError(f"Git worktree cannot copy unignored local path {path!r}. {WORKTREE_COPY_HINT}")
+            if ignored.returncode != 0:
+                raise WorkspaceGitError(f"Git could not check ignore rules for {path!r}: {ignored.stderr.strip()}")
+
+    @staticmethod
+    def _append_workspace_excludes(ws_dir: Path, entries: list[str]) -> None:
+        git_dir = ws_dir / ".git"
+        if git_dir.is_file():
+            raise WorkspaceError(f"Git worktree cannot copy unignored local paths {entries!r}. {WORKTREE_COPY_HINT}")
+        _append_git_exclude_entries(git_dir, entries)
+
     def _copy_env_files(
         self,
         source_roots: list[Path],
@@ -723,7 +743,7 @@ class WorkspaceManager:
             if is_git and not self._is_git_ignored(ws_dir, fname):
                 excludes_to_add.append(fname)
         if is_git and excludes_to_add:
-            _append_git_exclude_entries(ws_dir / ".git", excludes_to_add)
+            self._append_workspace_excludes(ws_dir, excludes_to_add)
         return copied
 
     def _apply_dep_mode(
@@ -797,7 +817,7 @@ class WorkspaceManager:
                     excludes_to_add.append(f"{dep_name}/")
 
         if is_git and excludes_to_add:
-            _append_git_exclude_entries(ws_dir / ".git", excludes_to_add)
+            self._append_workspace_excludes(ws_dir, excludes_to_add)
         return created_deps
 
     def _allocate_workspace_dir_and_branch(
@@ -826,6 +846,17 @@ class WorkspaceManager:
     # Public API
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _uses_git_worktree(ws: dict[str, Any]) -> bool:
+        if ws["mode"] != "git_clone":
+            return False
+        manifest = ws["snapshot_manifest"]
+        if isinstance(manifest, dict) and manifest.get("git_backend") == "worktree":
+            return True
+        if (Path(ws["path"]) / ".git").is_file():
+            raise WorkspaceCleanupGuardError(f"Linked worktree at {ws['path']} has missing or invalid backend metadata")
+        return False
+
     def _fetch_workspace_branch_to_ref(
         self,
         repo_root: Path,
@@ -834,8 +865,7 @@ class WorkspaceManager:
         ws_branch: str,
         target_ref: str,
     ) -> None:
-        manifest = ws.get("snapshot_manifest")
-        if isinstance(manifest, dict) and manifest.get("git_backend") == "worktree":
+        if self._uses_git_worktree(ws):
             _run_git(repo_root, "update-ref", target_ref, f"refs/heads/{ws_branch}", check=True)
         else:
             _run_git(
@@ -848,18 +878,53 @@ class WorkspaceManager:
                 check=True,
             )
 
-    def _detach_git_worktree_safe(
-        self,
-        repo_root: Path,
-        ws_path: Path,
-        branch_name: str | None,
-    ) -> None:
-        if ws_path.exists() or ws_path.is_symlink():
-            _run_git(repo_root, "worktree", "remove", "--force", str(ws_path))
+    @staticmethod
+    def _registered_worktree(repo_root: Path, ws_path: Path) -> list[str] | None:
+        proc = _run_git(repo_root, "worktree", "list", "--porcelain", "-z", check=True)
+        expected_path = os.path.normcase(os.path.normpath(ws_path))
+        for record in proc.stdout.split("\0\0"):
+            first, *fields = record.split("\0")
+            if first.startswith("worktree ") and os.path.normcase(os.path.normpath(first[9:])) == expected_path:
+                return fields
+        return None
+
+    @staticmethod
+    def _check_worktree_branch_tip(repo_root: Path, branch_name: str, expected_commit: str) -> bool:
+        tip = _run_git(repo_root, "branch", "--format=%(objectname)", "--list", branch_name, check=True).stdout.strip()
+        if tip and tip != expected_commit:
+            raise WorkspaceCleanupGuardError(
+                f"Refusing to remove worktree branch {branch_name!r}: tip {tip} differs from expected commit {expected_commit}"
+            )
+        return bool(tip)
+
+    def _worktree_cleanup_preflight(self, repo_root: Path, ws_path: Path, branch_name: str, expected_commit: str) -> bool:
+        registration = self._registered_worktree(repo_root, ws_path)
+        if registration is not None:
+            if f"branch refs/heads/{branch_name}" not in registration:
+                raise WorkspaceCleanupGuardError(f"Worktree at {ws_path} is not on expected branch {branch_name!r}")
+            if any(field == "locked" or field.startswith("locked ") for field in registration):
+                raise WorkspaceCleanupGuardError(f"Worktree at {ws_path} is locked")
+        elif ws_path.exists() or _is_reparse_or_symlink(ws_path):
+            raise WorkspaceCleanupGuardError(f"Directory at {ws_path} is not a registered worktree")
+        self._check_worktree_branch_tip(repo_root, branch_name, expected_commit)
+        return registration is not None
+
+    def _detach_git_worktree_safe(self, repo_root: Path, ws_path: Path, branch_name: str, expected_commit: str) -> None:
+        if self._worktree_cleanup_preflight(repo_root, ws_path, branch_name, expected_commit):
+            _run_git(repo_root, "worktree", "remove", "--force", str(ws_path), check=True)
+        if self._check_worktree_branch_tip(repo_root, branch_name, expected_commit):
+            # Keep Git's protections for checked-out branches and in-progress worktree operations.
+            _run_git(repo_root, "branch", "-D", branch_name, check=True)
+
+    def remove_workspace_checkout(self, ws: dict[str, Any]) -> None:
+        """Remove the physical checkout, including linked Git resources; caller owns authorization and DB state."""
+        ws_path = Path(ws["path"])
+        if self._uses_git_worktree(ws):
+            self._detach_git_worktree_safe(
+                self._get_workspace_project_root(ws), ws_path, ws["branch_name"], ws["merged_commit"] or ws["base_commit"]
+            )
+        else:
             _rmtree_safe(ws_path)
-        _run_git(repo_root, "worktree", "prune")
-        if branch_name:
-            _run_git(repo_root, "branch", "-D", branch_name)
 
     def workspace_create(
         self,
@@ -907,12 +972,23 @@ class WorkspaceManager:
                 resolved_root
             )
 
-            if is_git_worktree and git_common_dir is not None:
-                _append_git_exclude_entries(git_common_dir, [EXCLUDE_ENTRY])
-
             use_git_clone = is_git_worktree and has_head
+            use_linked_worktree = use_git_clone and effective_git_backend == "worktree"
             base_root = repo_root if use_git_clone else resolved_root
             triignore = _load_triignore(resolved_root) if not use_git_clone else _TriIgnoreMatcher()
+            source_roots = list(dict.fromkeys([execution_root or resolved_root, resolved_root, repo_root]))
+            copy_paths: list[str] = []
+            if use_linked_worktree:
+                if copy_env:
+                    copy_paths.extend(name for name in ENV_FILENAMES if any((root / name).is_file() for root in source_roots))
+                if dep_mode == "fresh_venv_uv":
+                    copy_paths.append(".venv/")
+                elif dep_mode in {"link_ro_cache", "copy"}:
+                    copy_paths.extend(f"{name}/" for name in DEP_DIRNAMES if (base_root / name).is_dir())
+                self._validate_worktree_copy_rules(repo_root, copy_paths)
+
+            if is_git_worktree and git_common_dir is not None:
+                _append_git_exclude_entries(git_common_dir, [EXCLUDE_ENTRY])
 
             if not use_git_clone:
                 estimated_bytes, estimated_files = _estimate_snapshot_size(
@@ -938,21 +1014,17 @@ class WorkspaceManager:
             ws_dir, branch_name = self._allocate_workspace_dir_and_branch(
                 execution_root or base_root, run_id, worker_name
             )
-            source_roots = list(dict.fromkeys([execution_root or resolved_root, resolved_root, repo_root]))
-
+            created_worktree_commit = None
             try:
                 if use_git_clone:
-                    if effective_git_backend == "worktree":
-                        _run_git(
-                            repo_root,
-                            "worktree",
-                            "add",
-                            "-b",
-                            branch_name,
-                            str(ws_dir),
-                            "HEAD",
-                            check=True,
-                        )
+                    if use_linked_worktree:
+                        if self._registered_worktree(repo_root, ws_dir) is not None:
+                            raise WorkspaceGitError(f"Git already has a registered worktree at {ws_dir}")
+                        start_commit = _run_git(repo_root, "rev-parse", "HEAD", check=True).stdout.strip()
+                        _run_git(repo_root, "branch", "--no-track", branch_name, start_commit, check=True)
+                        created_worktree_commit = start_commit
+                        _run_git(repo_root, "worktree", "add", str(ws_dir), branch_name, check=True)
+                        self._validate_worktree_copy_rules(ws_dir, copy_paths)
                         git_manifest: dict[str, Any] = {
                             "project_root": str(base_root),
                             "git_backend": "worktree",
@@ -1056,9 +1128,9 @@ class WorkspaceManager:
                     ws_record["copied_bytes"] = copied_bytes
                     ws_record["file_count"] = file_count
             except BaseException:
-                if use_git_clone and effective_git_backend == "worktree":
-                    self._detach_git_worktree_safe(repo_root, ws_dir, branch_name)
-                else:
+                if created_worktree_commit is not None:
+                    self._detach_git_worktree_safe(repo_root, ws_dir, branch_name, created_worktree_commit)
+                elif not use_linked_worktree:
                     _rmtree_safe(ws_dir)
                 raise
 
@@ -2144,32 +2216,13 @@ class WorkspaceManager:
                             f"Refusing cleanup for workspace {workspace_id}: missing .git metadata in non-empty directory"
                         )
 
-            is_worktree_backend = (
-                ws["mode"] == "git_clone"
-                and isinstance(ws.get("snapshot_manifest"), dict)
-                and ws["snapshot_manifest"].get("git_backend") == "worktree"
-            )
-            if ws_path.exists() or ws_path.is_symlink():
-                parent = ws_path.parent
-                if is_worktree_backend:
-                    self._detach_git_worktree_safe(
-                        self._get_workspace_project_root(ws),
-                        ws_path,
-                        ws.get("branch_name"),
-                    )
-                else:
-                    _rmtree_safe(ws_path)
-                if parent.name == WORKSPACES_DIRNAME and parent.exists():
-                    try:
-                        parent.rmdir()
-                    except OSError:
-                        pass
-            elif is_worktree_backend:
-                self._detach_git_worktree_safe(
-                    self._get_workspace_project_root(ws),
-                    ws_path,
-                    ws.get("branch_name"),
-                )
+            self.remove_workspace_checkout(ws)
+            parent = ws_path.parent
+            if parent.name == WORKSPACES_DIRNAME and parent.exists():
+                try:
+                    parent.rmdir()
+                except OSError:
+                    pass
 
             self.db.update_workspace(workspace_id, status="cleaned")
             return {
@@ -2223,14 +2276,26 @@ class WorkspaceManager:
                 "deleted_files": [],
             }
 
+        unsafe_reason = None
         if is_reparse:
+            unsafe_reason = "Workspace path is a symlink or junction; refusing automatic cleanup"
+        elif ws["status"] == "merged" and ws["merged_commit"]:
+            try:
+                if self._uses_git_worktree(ws):
+                    self._worktree_cleanup_preflight(
+                        self._get_workspace_project_root(ws), ws_path, ws["branch_name"], ws["merged_commit"]
+                    )
+            except WorkspaceCleanupGuardError as exc:
+                unsafe_reason = str(exc)
+
+        if unsafe_reason is not None:
             return {
                 "workspace_id": workspace_id,
                 "mode": ws["mode"],
                 "status": ws["status"],
-                "exists": True,
+                "exists": exists,
                 "safe_to_clean": False,
-                "reason": "Workspace path is a symlink or junction; refusing automatic cleanup",
+                "reason": unsafe_reason,
                 "added_count": 0,
                 "modified_count": 0,
                 "deleted_count": 0,
@@ -2530,32 +2595,13 @@ class WorkspaceManager:
                         f"Refusing GC cleanup for workspace {workspace_id}: {safety['reason']}"
                     )
 
-                is_worktree_backend = (
-                    ws["mode"] == "git_clone"
-                    and isinstance(ws.get("snapshot_manifest"), dict)
-                    and ws["snapshot_manifest"].get("git_backend") == "worktree"
-                )
-                if ws_path.exists() or _is_reparse_or_symlink(ws_path):
-                    parent = ws_path.parent
-                    if is_worktree_backend:
-                        self._detach_git_worktree_safe(
-                            self._get_workspace_project_root(ws),
-                            ws_path,
-                            ws.get("branch_name"),
-                        )
-                    else:
-                        _rmtree_safe(ws_path)
-                    if parent.name == WORKSPACES_DIRNAME and parent.exists():
-                        try:
-                            parent.rmdir()
-                        except OSError:
-                            pass
-                elif is_worktree_backend:
-                    self._detach_git_worktree_safe(
-                        self._get_workspace_project_root(ws),
-                        ws_path,
-                        ws.get("branch_name"),
-                    )
+                self.remove_workspace_checkout(ws)
+                parent = ws_path.parent
+                if parent.name == WORKSPACES_DIRNAME and parent.exists():
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        pass
 
                 self.db.update_workspace(workspace_id, status="cleaned")
                 return {

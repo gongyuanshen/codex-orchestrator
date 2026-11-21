@@ -1818,23 +1818,11 @@ def create_app(
         worker_name: str,
         current_task: str | None,
     ) -> dict[str, Any]:
-        worker = state.db.get_worker_by_name(run_id, worker_name)
-        if worker is None:
-            raise NotFoundError(f"Worker not found in run {run_id}: {worker_name}")
-        if worker["status"] != "working":
-            raise WorkflowConflictError(
-                f"Cannot record keepalive heartbeat for non-working worker {worker_name!r} (status={worker['status']!r})"
-            )
-        task_text = (
-            current_task.strip()
-            if isinstance(current_task, str) and current_task.strip()
-            else worker.get("current_task")
-        )
-        updated = state.board.worker_heartbeat(
-            run_id,
-            worker_name,
-            current_task=task_text,
-            status="working",
+        updated = state.db.update_worker_heartbeat(
+            run_id=run_id,
+            worker_name=worker_name,
+            current_task=(current_task.strip() or None) if current_task is not None else None,
+            require_working=True,
         )
         state.event_bus.publish(
             "worker_updated",

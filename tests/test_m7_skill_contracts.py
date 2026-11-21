@@ -29,7 +29,7 @@ def _inline_role_map(text: str) -> dict[str, str]:
 
 
 @pytest.mark.parametrize("mode", MODES)
-def test_zero_script_agent_type_omission_and_full_model_and_reasoning_effort_inheritance(mode: str) -> None:
+def test_zero_script_agent_type_omission_and_host_qualified_model_selection(mode: str) -> None:
     text = _skill_text(mode)
     assert 'agent_type: "default"' not in text
     assert 'agent_type="default"' not in text
@@ -38,9 +38,19 @@ def test_zero_script_agent_type_omission_and_full_model_and_reasoning_effort_inh
     assert "omit `agent_type`" in rules
     assert "additionalProperties: false" in rules
     assert "install.ps1" in rules
-    assert "reasoning_effort" in rules
-    assert "always omit `model`" in rules
-    assert "NEVER pass a hardcoded `model`" in rules
+    _assert_native_model_selection(rules)
+    assert "100%" not in text
+    for line in text.splitlines():
+        if 'fork_turns="all"' in line:
+            assert "choose `reasoning_effort`" not in line
+
+
+def _assert_native_model_selection(text: str) -> None:
+    assert "omit `model`" in text
+    assert "Codex role and session settings" in text
+    assert 'omit both `model` and `reasoning_effort` with `fork_turns="all"`' in text
+    assert 'Pass `reasoning_effort` only with `fork_turns="none"`' in text
+    assert "host schema and model support the requested tier" in text
 
 
 def test_zero_legacy_v1_or_stale_version_artifacts_across_all_skills_and_roles() -> None:
@@ -61,7 +71,7 @@ def test_zero_legacy_v1_or_stale_version_artifacts_across_all_skills_and_roles()
 
 
 @pytest.mark.parametrize("path", sorted((ROOT / "agents").glob("*.toml")), ids=lambda p: p.stem)
-def test_agent_tomls_omit_model_and_reasoning_effort_to_inherit_session(path: Path) -> None:
+def test_agent_tomls_omit_model_and_reasoning_effort_overrides(path: Path) -> None:
     assert path.stem in EXPECTED_AGENT_ROLES
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     assert "model" not in data
@@ -93,8 +103,16 @@ def test_shared_workflow_documents_nuanced_fork_turns_and_reasoning_effort() -> 
     assert "custom `agent_type` applies regardless of `fork_turns`" in shared
     assert 'fork_turns: "none"' in shared
     assert 'fork_turns: "all"' in shared
-    assert "NEVER pass a hardcoded `model` parameter on `spawn_agent`" in shared
-    assert "reasoning_effort" in shared
+    _assert_native_model_selection(shared)
+
+
+def test_shared_verification_contract_explains_group_boundaries_and_keepalive() -> None:
+    shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
+    assert "consecutive commands with the same `parallel_group`" in shared
+    assert "ungrouped commands run serially" in shared
+    assert "pass a positive `max_parallel`" in shared
+    assert "`verify_argv_template`" in shared
+    assert "--manifest ABS --output-dir NEW_ABS --heartbeat-url URL" in shared
 
 
 @pytest.mark.parametrize("role_name", STRICT_NO_SPAWN_ROLES)
@@ -161,7 +179,7 @@ def test_workflow5_macro_rpc_primary_path_and_reconciliation_fence(mode: str) ->
     text = _skill_text(mode)
     for required in (
         "workflow5",
-        "0.6.6/schema10",
+        "0.6.7/schema10",
         "workflow_prepare_dispatch",
         "task_name",
         "/root/<task_name>",
@@ -214,7 +232,7 @@ def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_role_focuse
         data = tomllib.loads(raw)
         instructions = data["developer_instructions"]
         assert "workflow5" in instructions, path
-        assert "0.6.6/schema10" in instructions, path
+        assert "0.6.7/schema10" in instructions, path
         assert "board_status.workflow.workflow_version" in instructions, path
         assert "skills/route-a-workflow.md" not in instructions, f"{path} must not require broken relative path"
         assert "self-contained" in instructions, path

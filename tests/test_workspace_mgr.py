@@ -15,6 +15,8 @@ from orchestrator.db import Database
 from orchestrator.workspace_mgr import (
     WorkspaceCleanupGuardError,
     WorkspaceConflictError,
+    WorkspaceError,
+    WorkspaceGitError,
     WorkspaceManager,
 )
 
@@ -637,5 +639,135 @@ def test_git_worktree_backend_create_preview_merge_and_cleanup(tmp_path: Path) -
         assert not ws_path.exists()
         branches = _git(repo, "branch", "--list", ws["branch_name"]).stdout.strip()
         assert branches == ""
+    finally:
+        db.close()
+
+
+def test_git_worktree_create_does_not_delete_an_existing_branch(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    db, mgr, run_id = _setup_mgr(tmp_path, repo)
+    try:
+        branch = f"swarm/{run_id[:12]}/worker"
+        _git(repo, "switch", "-c", branch)
+        _git(repo, "commit", "--allow-empty", "-m", "pre-existing work")
+        original = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        _git(repo, "switch", "main")
+
+        with pytest.raises(WorkspaceGitError, match="already exists"):
+            mgr.workspace_create(run_id, "worker", git_backend="worktree")
+
+        assert _git(repo, "branch", "--list", branch).stdout.strip() == branch
+        assert _git(repo, "rev-parse", branch).stdout.strip() == original
+        assert len(_git(repo, "worktree", "list").stdout.splitlines()) == 1
+        assert db.list_workspaces(run_id=run_id) == []
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("resource", [".env", "node_modules/"])
+def test_git_worktree_copy_requires_existing_ignore_without_changing_main(tmp_path: Path, resource: str) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    if resource == ".env":
+        relative_file = ".env"
+        kwargs = {}
+    else:
+        (repo / "node_modules").mkdir()
+        relative_file = "node_modules/package.txt"
+        kwargs = {"dep_mode": "copy"}
+    (repo / relative_file).write_text("fixture\n", encoding="utf-8")
+    db, mgr, run_id = _setup_mgr(tmp_path, repo)
+    try:
+        with pytest.raises(WorkspaceError, match="git_backend='clone'"):
+            mgr.workspace_create(run_id, "worker", git_backend="worktree", **kwargs)
+        assert not (repo / ".swarm-workspaces").exists()
+        assert "?? " in _git(repo, "status", "--porcelain", "--", resource).stdout
+        assert _git(repo, "branch", "--list", "swarm/*").stdout == ""
+        assert db.list_workspaces(run_id=run_id) == []
+
+        (repo / ".gitignore").write_text(f"{resource}\n", encoding="utf-8")
+        _git(repo, "add", ".gitignore")
+        _git(repo, "commit", "-m", "ignore generated local files")
+        ws = mgr.workspace_create(run_id, "worker", git_backend="worktree", **kwargs)
+        assert (Path(ws["path"]) / relative_file).read_text(encoding="utf-8") == "fixture\n"
+        assert not mgr.workspace_status(ws["id"])["dirty"]
+        assert resource not in (repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("cleanup_name", ["workspace_cleanup", "workspace_gc_cleanup"])
+def test_git_worktree_cleanup_preserves_a_locked_worktree(tmp_path: Path, cleanup_name: str) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    db, mgr, run_id = _setup_mgr(tmp_path, repo)
+    try:
+        ws = mgr.workspace_create(run_id, "worker", git_backend="worktree")
+        ws_path = Path(ws["path"])
+        assert mgr.workspace_merge(ws["id"])["merged"]
+        if cleanup_name == "workspace_gc_cleanup":
+            db.update_run(run_id, status="completed")
+        _git(repo, "worktree", "lock", str(ws_path))
+        if cleanup_name == "workspace_gc_cleanup":
+            safety = mgr.workspace_gc_safety(ws["id"])
+            assert not safety["safe_to_clean"]
+            assert "locked" in safety["reason"]
+
+        cleanup = getattr(mgr, cleanup_name)
+        with pytest.raises(WorkspaceError, match="locked"):
+            cleanup(ws["id"])
+        assert ws_path.is_dir()
+        assert ws["branch_name"] in _git(repo, "worktree", "list", "--porcelain").stdout
+        assert db.get_workspace(ws["id"])["status"] == "merged"
+
+        _git(repo, "worktree", "unlock", str(ws_path))
+        assert cleanup(ws["id"])["cleaned"]
+        assert not ws_path.exists()
+        assert ws["branch_name"] not in _git(repo, "worktree", "list", "--porcelain").stdout
+        assert _git(repo, "branch", "--list", ws["branch_name"]).stdout == ""
+    finally:
+        db.close()
+
+
+def test_git_worktree_cleanup_preserves_repurposed_branch_when_checkout_is_gone(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    db, mgr, run_id = _setup_mgr(tmp_path, repo)
+    try:
+        ws = mgr.workspace_create(run_id, "worker", git_backend="worktree")
+        branch = ws["branch_name"]
+        assert mgr.workspace_merge(ws["id"])["merged"]
+        _git(repo, "worktree", "remove", ws["path"])
+        _git(repo, "switch", branch)
+        _git(repo, "commit", "--allow-empty", "-m", "new work after removing the checkout")
+        new_tip = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        _git(repo, "switch", "main")
+
+        with pytest.raises(WorkspaceCleanupGuardError, match="differs from expected commit"):
+            mgr.workspace_cleanup(ws["id"])
+
+        assert _git(repo, "rev-parse", branch).stdout.strip() == new_tip
+        assert db.get_workspace(ws["id"])["status"] == "merged"
+        assert not mgr.workspace_gc_safety(ws["id"])["safe_to_clean"]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("backend", ["clone", "worktree"])
+def test_git_cleanup_with_non_object_legacy_manifest(tmp_path: Path, backend: str) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    db, mgr, run_id = _setup_mgr(tmp_path, repo)
+    try:
+        ws = mgr.workspace_create(run_id, "worker", git_backend=backend)
+        assert mgr.workspace_merge(ws["id"])["merged"]
+        db.update_workspace(ws["id"], snapshot_manifest=["legacy"])
+
+        if backend == "clone":
+            assert mgr.workspace_cleanup(ws["id"])["cleaned"]
+            assert not Path(ws["path"]).exists()
+        else:
+            assert not mgr.workspace_gc_safety(ws["id"])["safe_to_clean"]
+            with pytest.raises(WorkspaceCleanupGuardError, match="worktree.*metadata"):
+                mgr.workspace_cleanup(ws["id"])
+            assert Path(ws["path"]).is_dir()
+            assert ws["branch_name"] in _git(repo, "worktree", "list", "--porcelain").stdout
+            assert db.get_workspace(ws["id"])["status"] == "merged"
     finally:
         db.close()

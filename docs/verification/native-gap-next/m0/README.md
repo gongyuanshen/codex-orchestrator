@@ -1,12 +1,13 @@
 # M0 deterministic baseline
 
-Run from `C:/workspace/codex-orchestrator` with an unused external output directory:
+Run from the root of a Git checkout that contains the baseline commit below, with the development environment installed in `.venv`. These PowerShell commands use fresh directories outside the repository:
 
 ```powershell
 $env:PYTHONUTF8 = '1'
 $env:PYTHONIOENCODING = 'utf-8'
-.venv/Scripts/python.exe docs/verification/native-gap-next/m0/run_baseline.py --output C:/Users/user/AppData/Local/Temp/tri-native-gap-m0-reproduce
-.venv/Scripts/python.exe -m pytest -q -W error tests/test_native_gap_baseline.py --basetemp C:/Users/user/AppData/Local/Temp/tri-native-gap-m0-unit-reproduce -p no:cacheprovider
+$output = Join-Path ([IO.Path]::GetTempPath()) "tri-native-gap-m0-$([guid]::NewGuid())"
+.venv/Scripts/python.exe docs/verification/native-gap-next/m0/run_baseline.py --output "$output-reproduce"
+.venv/Scripts/python.exe -m pytest -q -W error tests/test_native_gap_baseline.py --basetemp "$output-unit" -p no:cacheprovider
 ```
 
 The runner archives commit `9c29cdb308a92cfdbdf259289bdc284f160abdfd`, imports only its `plugin/src`, and runs its existing workflow/inbox tests and two owned recovery extensions in isolated temporary databases. Contract pytest explicitly uses the archived pyproject config so absolute extension-test paths cannot select the mutable checkout package. It never starts a daemon, invokes a native model, installs a package, or touches port 18790. No new state machine is implemented.

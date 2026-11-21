@@ -37,7 +37,7 @@ def env(tmp_path, monkeypatch):
 
 
 def _git(path, *args):
-    subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)
+    return subprocess.run(["git", "-C", str(path), *args], check=True, capture_output=True)
 
 
 def _turn(rpc, session, turn, cwd, *, invoked=False):
@@ -182,6 +182,28 @@ def test_t3_uses_deepest_registered_workspace_without_codex_metadata(env, monkey
     assert run["execution_root"] == str(trial)
     assert db.get_project(project["id"])["name"] == "Previously linked"
     assert db_module.classify_project_kind("G:/repo/docs/verification/stage/fixture-project") == "fixture"
+
+
+def test_prepare_dispatch_rolls_back_registered_git_worktree(env):
+    root, db, rpc = env
+    _git(root, "init")
+    (root / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(root, "add", "seed.txt")
+    _git(root, "-c", "user.email=test@example.test", "-c", "user.name=Test", "commit", "-m", "seed")
+    run_id = _run(rpc, root, "worktree-rollback")["id"]
+
+    with pytest.raises(ValueError, match="workspace_base_mode"):
+        rpc(
+            "workflow_prepare_dispatch", run_id=run_id, create_workspace=True,
+            workspace_base_mode="snapshot", git_backend="worktree", copy_env=False,
+            owner="rollback", task_name="rollback", verifier="verifier",
+            step_key="rollback", instruction="Verify rollback",
+        )
+
+    assert db.list_workspaces(run_id=run_id) == []
+    assert not (root / WORKSPACES_DIRNAME).exists()
+    assert _git(root, "branch", "--list", "swarm/*").stdout == b""
+    assert len(_git(root, "worktree", "list").stdout.splitlines()) == 1
 
 
 @pytest.mark.parametrize("git", [False, True], ids=["snapshot", "git-clone"])

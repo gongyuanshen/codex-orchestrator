@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Cleanly removes the tri-orchestrator Codex plugin, local marketplace,
-    and agent role TOMLs, with optional restoration of the latest backup.
+    and unchanged installer-owned agent roles, with optional configuration restoration.
 #>
 [CmdletBinding()]
 param(
@@ -48,6 +48,24 @@ function Write-Utf8NoBom {
 function Read-Utf8Text {
     param([string]$Path)
     return [System.IO.File]::ReadAllText($Path, $Utf8NoBom)
+}
+
+function Get-RoleHash {
+    param([string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return [BitConverter]::ToString($sha.ComputeHash([System.IO.File]::ReadAllBytes($Path))).Replace("-", "") }
+    finally { $sha.Dispose() }
+}
+
+function Copy-RoleFile {
+    param([string]$Source, [string]$Target)
+    $tmp = "$Target.tmp.$([Guid]::NewGuid().ToString('N'))"
+    [System.IO.File]::Copy($Source, $tmp)
+    if ([System.IO.File]::Exists($Target)) {
+        [System.IO.File]::Replace($tmp, $Target, [NullString]::Value)
+    } else {
+        [System.IO.File]::Move($tmp, $Target)
+    }
 }
 
 function Format-Win32Arg {
@@ -232,28 +250,39 @@ if (Test-Path $backupsRoot) {
         Select-Object -First 1
 }
 
-# 4. Remove tri-orchestrator agent TOMLs & restore only pre-existing user agent TOMLs
+# 4. Remove or restore only unchanged role files owned by the installer.
+$ownershipPath = Join-Path $baselineDir "installed-roles.json"
 $agentsDstDir = Join-Path $CodexHome "agents"
-if (Test-Path $agentsDstDir) {
-    $preexistingAgents = if ($hasBaseline -and $baselineMeta.PSObject.Properties['preexisting_agents'] -and $baselineMeta.preexisting_agents) {
-        @($baselineMeta.preexisting_agents)
+if ((Test-Path -LiteralPath $ownershipPath -PathType Leaf) -and (Test-Path -LiteralPath $agentsDstDir -PathType Container)) {
+    $ownership = Read-Utf8Text $ownershipPath | ConvertFrom-Json
+    if ((Get-Item -LiteralPath $agentsDstDir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        Write-Warning "[uninstall] Preserved roles in linked agents directory: $agentsDstDir"
     } else {
-        @()
-    }
-    foreach ($rf in $RoleFiles) {
-        $target = Join-Path $agentsDstDir $rf
-        if (Test-Path $target -PathType Leaf) {
-            Remove-Item -Path $target -Force
-            Write-Host "[uninstall] Removed $target"
-        }
-        if ($preexistingAgents -contains $rf) {
-            $bakAgent = Join-Path $baselineDir "agents\$rf"
-            if (Test-Path $bakAgent -PathType Leaf) {
-                Copy-Item -Path $bakAgent -Destination $target -Force
-                Write-Host "[uninstall] Restored pre-existing agent role $target from baseline"
+        $currentRoles = @(Get-ChildItem -LiteralPath $agentsDstDir -Force)
+        foreach ($rf in $RoleFiles) {
+            if (-not $ownership.PSObject.Properties[$rf]) { continue }
+            $record = $ownership.$rf
+            $target = Join-Path $agentsDstDir $rf
+            $entry = $currentRoles | Where-Object { $_.Name -eq $rf } | Select-Object -First 1
+            if ($entry -and ($entry.PSIsContainer -or ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -or (Get-RoleHash $target) -ne $record.sha256)) {
+                Write-Warning "[uninstall] Preserved linked or modified role: $target"
+                continue
+            }
+            if ($record.restore_from -in @("agents", "roles-before-reinstall")) {
+                $backup = Join-Path (Join-Path $baselineDir $record.restore_from) $rf
+                Copy-RoleFile -Source $backup -Target $target
+                Write-Host "[uninstall] Restored pre-existing agent role $target from $backup"
+            } elseif ($record.restore_from -ne "") {
+                throw "Unknown restore source for role $rf in $ownershipPath"
+            } elseif ($entry) {
+                Remove-Item -LiteralPath $target -Force
+                Write-Host "[uninstall] Removed $target"
             }
         }
     }
+    Write-Utf8NoBom -Path $ownershipPath -Content ("{}" + "`n")
+} elseif ($hasBaseline -and -not (Test-Path -LiteralPath $ownershipPath -PathType Leaf)) {
+    Write-Warning "[uninstall] Kept existing roles because this legacy installation has no role ownership record."
 }
 
 # 5. Optional full config.toml restoration from baseline (or latest backup), plus clean removal of tri-orchestrator [hooks.state] keys
@@ -381,9 +410,6 @@ if ($RestoreConfigBackup) {
         $bakCfg = Read-Utf8Text $restoreCfgSrc
         Write-Utf8NoBom -Path $configPath -Content $bakCfg
         Write-Host "[uninstall] Restored config.toml from $restoreCfgSrc"
-        if ($hasBaseline) {
-            Remove-Item -Path $baselineDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
     } else {
         Write-Warning "[uninstall] -RestoreConfigBackup requested, but no backup config.toml was found."
     }

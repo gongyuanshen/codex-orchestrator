@@ -361,40 +361,58 @@ def load_prepared(backup: Path) -> dict:
     return json.loads((backup / "prepared.json").read_text(encoding="utf-8"))
 
 
-def apply(backup_dir: Path) -> dict:
+def apply(backup_dir: Path, *, database_only: bool = False) -> dict:
     backup = Path(backup_dir).resolve()
     manifest = load_prepared(backup)
     target, data = Path(manifest["target_plugin"]), Path(manifest["data_dir"])
     if (backup / "apply-started.json").exists():
         raise UpgradeError("Upgrade already started; inspect its checkpoint instead of replaying it")
-    if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+].+)?", target.name) and target.name != manifest["source_identity"]["version"]:
-        raise UpgradeError("Versioned managed cache target belongs to the old release; use supported host installation to activate the staged new version")
-    if package_files(backup / "staged") != manifest["source_files"]:
+    if (not database_only and re.fullmatch(r"\d+\.\d+\.\d+(?:[-+].+)?", target.name)
+            and target.name != manifest["source_identity"]["version"]):
+        raise UpgradeError("Versioned managed cache belongs to the old release; use apply --database-only, then install the new version through its host")
+    staged = backup / "staged"
+    state_before = backup / "state-before.db"
+    candidate = backup / "state-candidate.db"
+    before = manifest["database_before"]
+    if package_files(staged) != manifest["source_files"]:
         raise UpgradeError("The staged package changed after preparation")
+    if database_snapshot(state_before) != before:
+        raise UpgradeError("The database backup changed after preparation")
     with offline(data, manifest["port"]):
-        if package_files(target) != manifest["target_files"] or database_snapshot(data / "state.db") != manifest["database_before"]:
+        if package_files(target) != manifest["target_files"] or database_snapshot(data / "state.db") != before:
             raise UpgradeError("Package or database changed since preparation; prepare a new backup")
-        no_active(database_snapshot(data / "state.db"))
+        no_active(before)
         write_json(backup / "apply-started.json", {"started_at": time.time(), "status": "applying_service_stopped"})
         try:
-            copy_package(backup / "staged", target, manifest["source_files"])
-            for name, expected in manifest["source_files"].items():
-                if digest(checked_path(target, name).read_bytes()) != expected:
-                    raise UpgradeError(f"Package readback mismatch: {name}")
+            # Prove the migration preserves every old row before touching the runtime database.
+            atomic_copy(state_before, candidate)
             code = "import sys; sys.path.insert(0,sys.argv[1]); from orchestrator.db import Database; d=Database(sys.argv[2]); d.close()"
-            result = subprocess.run([sys.executable, "-B", "-c", code, str(target / "src"), str(data / "state.db")],
+            result = subprocess.run([sys.executable, "-B", "-c", code, str(staged / "src"), str(candidate)],
                                     capture_output=True, text=True, encoding="utf-8", timeout=60,
                                     env=dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8"),
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             write_json(backup / "migration.json", {"returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr})
             if result.returncode:
                 raise UpgradeError(f"Staged package migration failed: {result.stderr}")
-            after = database_snapshot(data / "state.db")
+            after = database_snapshot(candidate)
             if after["schema_version"] != manifest["supported_schema"]:
                 raise UpgradeError("Migration did not reach the staged schema version")
             no_active(after)
-            require_old_rows(data / "state.db", manifest["database_before"])
+            require_old_rows(candidate, before)
+            if database_snapshot(data / "state.db") != before or package_files(target) != manifest["target_files"]:
+                raise UpgradeError("Package or database changed during migration; retain the candidate and prepare a new backup")
+            if not database_only:
+                copy_package(staged, target, manifest["source_files"])
+                for name, expected in manifest["source_files"].items():
+                    if digest(checked_path(target, name).read_bytes()) != expected:
+                        raise UpgradeError(f"Package readback mismatch: {name}")
+            with closing(sqlite3.connect(candidate.as_uri() + "?mode=ro", uri=True)) as src, closing(sqlite3.connect(data / "state.db")) as dst:
+                src.backup(dst)
+            if database_snapshot(data / "state.db") != after:
+                raise UpgradeError("Migrated database readback mismatch")
+            candidate.unlink()
             report = {"status": "applied_service_stopped", "database_after": after, "package_after": package_files(target),
+                      "database_only": database_only,
                       "next": "Activate/refresh this package through its owning host, then run verify; no service was started"}
             write_json(backup / "applied.json", report)
             return report
@@ -408,21 +426,26 @@ def rollback(backup_dir: Path) -> dict:
     manifest = load_prepared(backup)
     applied = json.loads((backup / "applied.json").read_text(encoding="utf-8"))
     target, data = Path(manifest["target_plugin"]), Path(manifest["data_dir"])
+    # Older applied.json records always installed the staged package in place.
+    restore_package = not applied.get("database_only", False)
     if (backup / "rolled-back.json").exists():
         raise UpgradeError("Rollback already completed")
     with offline(data, manifest["port"]):
         if database_snapshot(data / "state.db") != applied["database_after"]:
             raise UpgradeError("Database has new writes; preserve them and repair forward instead of restoring an old snapshot")
-        if package_files(target) != applied["package_after"]:
+        if restore_package and package_files(target) != applied["package_after"]:
             raise UpgradeError("Package changed after apply; inspect before rollback")
-        if package_files(backup / "package-before") != manifest["target_files"] or database_snapshot(backup / "state-before.db") != manifest["database_before"]:
+        if (database_snapshot(backup / "state-before.db") != manifest["database_before"]
+                or (restore_package and package_files(backup / "package-before") != manifest["target_files"])):
             raise UpgradeError("Rollback backup changed")
-        copy_package(backup / "package-before", target, manifest["target_files"])
-        for name in manifest["source_files"].keys() - manifest["target_files"].keys():
-            checked_path(target, name).unlink()
+        if restore_package:
+            copy_package(backup / "package-before", target, manifest["target_files"])
+            for name in manifest["source_files"].keys() - manifest["target_files"].keys():
+                checked_path(target, name).unlink()
         with closing(sqlite3.connect(backup / "state-before.db")) as src, closing(sqlite3.connect(data / "state.db")) as dst:
             src.backup(dst)
-        if database_snapshot(data / "state.db") != manifest["database_before"] or package_files(target) != manifest["target_files"]:
+        if (database_snapshot(data / "state.db") != manifest["database_before"]
+                or (restore_package and package_files(target) != manifest["target_files"])):
             raise UpgradeError("Rollback readback failed; retain checkpoint and repair explicitly")
         report = {"status": "rolled_back_service_stopped", "next": "Restore host activation only after checking the restored package"}
         write_json(backup / "rolled-back.json", report)
@@ -671,6 +694,8 @@ def main() -> int:
     for action in ("apply", "rollback"):
         command = sub.add_parser(action)
         command.add_argument("--backup-dir", type=Path, required=True)
+        if action == "apply":
+            command.add_argument("--database-only", action="store_true", help="Migrate state.db without replacing files in the installed plugin cache")
     ver = sub.add_parser("verify", help="Verify running upgraded daemon and prune rotated backups")
     ver.add_argument("--backup-dir", type=Path, required=True)
     ver.add_argument("--keep-backups", type=int, default=3)

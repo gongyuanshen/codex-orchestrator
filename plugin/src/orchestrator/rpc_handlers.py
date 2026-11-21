@@ -41,7 +41,6 @@ from orchestrator.workspace_mgr import (
     WorkspaceCleanupGuardError,
     WorkspaceManager,
     _is_reparse_or_symlink,
-    _rmtree_safe,
 )
 
 
@@ -1675,7 +1674,7 @@ class RpcDispatcher:
         # Fence expired leases before entering the composite transaction so a rollback never erases fences.
         self.native_actions.expire()
 
-        created_ws_dir: Path | None = None
+        created_ws: dict[str, Any] | None = None
         created_ws_parent: Path | None = None
         ws_parent_existed_before = True
 
@@ -1774,8 +1773,8 @@ class RpcDispatcher:
                         dep_mode=str(args.get("dep_mode") or "none"),
                         git_backend=git_backend_arg,
                     )
+                    created_ws = ws
                     created_ws_stats = _extract_workspace_copy_stats(ws)
-                    created_ws_dir = Path(ws["path"])
                     expected_db_mode = "git_clone" if base_mode == "git_worktree" else base_mode
                     if base_mode != "auto" and ws["mode"] != expected_db_mode:
                         raise ValueError(
@@ -2085,8 +2084,8 @@ class RpcDispatcher:
                 if resolved_ws_id is not None:
                     ws = self.db.get_workspace(resolved_ws_id)
         except BaseException:
-            if created_ws_dir is not None:
-                _rmtree_safe(created_ws_dir)
+            if created_ws is not None:
+                self.workspace_mgr.remove_workspace_checkout(created_ws)
                 if (
                     not ws_parent_existed_before
                     and created_ws_parent is not None

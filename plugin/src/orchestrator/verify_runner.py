@@ -20,6 +20,7 @@ from orchestrator.artifacts import digest, recapture
 from orchestrator.verify_process import ProcessFailure, run_owned
 
 logger = logging.getLogger(__name__)
+_KEEPALIVE_STOP_TIMEOUT_SEC = 2.0
 
 ENV_PROFILE_KEYS: dict[str, tuple[str, ...]] = {
     'none': (),
@@ -237,15 +238,23 @@ class _HeartbeatKeepalive:
         self._interval_sec = float(interval_sec)
         self._active_provider = active_provider
         self._stop = threading.Event()
+        self._done = threading.Event()
         self._started_monotonic = time.monotonic()
         self._thread = threading.Thread(target=self._loop, name='verify-heartbeat', daemon=True)
 
     def start(self) -> None:
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, deadline: float) -> None:
         self._stop.set()
-        self._thread.join(timeout=2.0)
+        # Confirm the request has finished before interruptible Thread.join().
+        while not self._done.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning('verify heartbeat request is still in flight at the shutdown deadline (%s)', self._url)
+                return
+            self._done.wait(min(0.1, remaining))
+        self._thread.join(timeout=max(0, deadline - time.monotonic()))
 
     def _send_once(self) -> None:
         active = list(self._active_provider())
@@ -270,14 +279,16 @@ class _HeartbeatKeepalive:
             method='POST',
         )
         try:
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
-                resp.read()
+            urllib.request.urlopen(req, timeout=5.0).close()
         except Exception as exc:
             logger.warning('verify keepalive heartbeat failed (%s): %s', self._url, exc)
 
     def _loop(self) -> None:
-        while not self._stop.wait(self._interval_sec):
-            self._send_once()
+        try:
+            while not self._stop.wait(self._interval_sec):
+                self._send_once()
+        finally:
+            self._done.set()
 
 
 def _write(path, value):
@@ -324,40 +335,63 @@ def collect(
         for command in manifest['commands']
     ]
     max_parallel = int(manifest.get('max_parallel') or 1)
-    output_dir.mkdir()  # Existing directories are never reused.
+    output_dir.mkdir(parents=True)  # Existing evidence directories are never reused.
     receipt_path = output_dir / 'receipt.json'
     receipt = dict(schema_version=1, evidence_level='local_collector_v1', manifest_digest=digest(manifest), status='running', started_at=_now(), ended_at=None, artifact_before_digest=None, artifact_after_digest=None, commands=[], error=None)
     receipt_lock = threading.Lock()
+    start_order = threading.Condition(receipt_lock)
+    cancel = threading.Event()
     active_ids: set[str] = set()
+
+    def _active() -> list[str]:
+        with receipt_lock:
+            return sorted(active_ids)
+
     keepalive = _HeartbeatKeepalive(
         heartbeat_url,
         float(heartbeat_interval_sec),
-        lambda: sorted(active_ids),
+        _active,
     ) if heartbeat_url else None
 
     def _persist() -> None:
         with receipt_lock:
             _write(receipt_path, receipt)
 
-    def _run_one(index: int, command: dict, current: dict) -> None:
+    def _cancel_running_commands() -> None:
+        cancel.set()
+        with start_order:
+            start_order.notify_all()
+
+    def _run_one(index: int, command: dict) -> None:
         out = output_dir / f'{index:04d}.stdout'
         err = output_dir / f'{index:04d}.stderr'
         command_error = None
-        with receipt_lock:
-            active_ids.add(command['id'])
+        exit_code = ended_at = None
+        status = 'finished'
+        with start_order:
+            # Evidence is an ordered prefix, even when threads begin out of manifest order.
+            start_order.wait_for(lambda: cancel.is_set() or index == len(receipt['commands']))
+            if cancel.is_set():
+                return
+            current = dict(
+                command_id=command['id'], status='running', started_at=_now(), ended_at=None, exit_code=None,
+                stdout=dict(path=str(out), bytes=None, sha256=None),
+                stderr=dict(path=str(err), bytes=None, sha256=None),
+            )
+            receipt['commands'].append(current)
+            start_order.notify_all()
         try:
-            with out.open('xb') as stdout, err.open('xb') as stderr:
-                exit_code = run_owned(command['argv'], command['cwd'], command_envs[index], command['timeout_sec'], stdout, stderr)
             with receipt_lock:
-                current['exit_code'] = exit_code
-                current['status'] = 'finished'
-                current['ended_at'] = _now()
+                _write(receipt_path, receipt)
+                active_ids.add(command['id'])
+            with out.open('xb') as stdout, err.open('xb') as stderr:
+                exit_code = run_owned(command['argv'], command['cwd'], command_envs[index], command['timeout_sec'], stdout, stderr, cancel=cancel)
+            ended_at = _now()
         except BaseException as exc:
             command_error = exc
-            with receipt_lock:
-                current['status'] = exc.status if isinstance(exc, ProcessFailure) else ('cancelled' if isinstance(exc, KeyboardInterrupt) else 'collection_failed')
-                if isinstance(exc, ProcessFailure):
-                    current['exit_code'] = exc.exit_code
+            status = exc.status if isinstance(exc, ProcessFailure) else ('cancelled' if isinstance(exc, KeyboardInterrupt) else 'collection_failed')
+            if isinstance(exc, ProcessFailure):
+                exit_code = exc.exit_code
             raise
         finally:
             # Partial bytes remain evidence even when launch, wait, or collection fails.
@@ -369,11 +403,12 @@ def collect(
                     if path.is_file():
                         captured_logs[name] = _log(path)
                 with receipt_lock:
-                    for name, info in captured_logs.items():
-                        current[name] = info
+                    current.update(captured_logs, status=status, ended_at=ended_at, exit_code=exit_code)
                     _write(receipt_path, receipt)
             except BaseException as capture_error:
-                raise ProcessFailure('collection_failed', f'primary={command_error!r}; capture={capture_error!r}', current['exit_code']) from capture_error
+                with receipt_lock:
+                    current.update(status='collection_failed', ended_at=None, exit_code=exit_code)
+                raise ProcessFailure('collection_failed', f'primary={command_error!r}; capture={capture_error!r}', exit_code) from capture_error
 
     _persist()
     if keepalive is not None:
@@ -386,51 +421,49 @@ def collect(
         for group, batch in _command_batches(manifest['commands']):
             if group is None or max_parallel <= 1 or len(batch) <= 1:
                 for index, command in batch:
-                    out = output_dir / f'{index:04d}.stdout'
-                    err = output_dir / f'{index:04d}.stderr'
-                    rec = dict(
-                        command_id=command['id'],
-                        status='running',
-                        started_at=_now(),
-                        ended_at=None,
-                        exit_code=None,
-                        stdout=dict(path=str(out), bytes=None, sha256=None),
-                        stderr=dict(path=str(err), bytes=None, sha256=None),
-                    )
-                    with receipt_lock:
-                        receipt['commands'].append(rec)
-                        _write(receipt_path, receipt)
-                    _run_one(index, command, rec)
+                    _run_one(index, command)
             else:
-                records: list[tuple[int, dict, dict]] = []
-                with receipt_lock:
-                    for index, command in batch:
-                        out = output_dir / f'{index:04d}.stdout'
-                        err = output_dir / f'{index:04d}.stderr'
-                        rec = dict(
-                            command_id=command['id'],
-                            status='running',
-                            started_at=_now(),
-                            ended_at=None,
-                            exit_code=None,
-                            stdout=dict(path=str(out), bytes=None, sha256=None),
-                            stderr=dict(path=str(err), bytes=None, sha256=None),
-                        )
-                        receipt['commands'].append(rec)
-                        records.append((index, command, rec))
-                    _write(receipt_path, receipt)
-                workers = min(max_parallel, len(records))
-                first_error: BaseException | None = None
+                futures = []
+                interrupted = None
+                workers = min(max_parallel, len(batch))
+                jobs = iter(batch)
+                pending = set()
                 with ThreadPoolExecutor(max_workers=workers) as pool:
-                    futures = [pool.submit(_run_one, index, command, rec) for index, command, rec in records]
-                    for fut in futures:
+                    while True:
                         try:
-                            fut.result()
-                        except BaseException as exc:
-                            if first_error is None:
-                                first_error = exc
-                if first_error is not None:
-                    raise first_error
+                            if interrupted is None:
+                                for _ in range(workers - len(pending)):
+                                    job = next(jobs, None)
+                                    if job is None:
+                                        break
+                                    future = pool.submit(_run_one, *job)
+                                    futures.append(future)
+                                    pending.add(future)
+                            if not pending:
+                                break
+                            # Admit more work only on the main thread, where console interrupts arrive.
+                            time.sleep(0.02)
+                            pending = {future for future in pending if not future.done()}
+                        except KeyboardInterrupt as exc:
+                            if interrupted is None:
+                                interrupted = exc
+                                _cancel_running_commands()
+                if interrupted is not None:
+                    failures = []
+                    for future in futures:
+                        failure = future.exception()
+                        if isinstance(failure, ProcessFailure) and failure.status == 'cleanup_failed':
+                            raise failure from interrupted
+                        if failure is not None and not (
+                            isinstance(failure, KeyboardInterrupt) or
+                            isinstance(failure, ProcessFailure) and failure.status == 'cancelled'
+                        ):
+                            failures.append(failure)
+                    if failures:
+                        raise failures[0] from interrupted
+                    raise interrupted
+                for future in futures:
+                    future.result()
 
         receipt['artifact_after_digest'] = digest(recapture(manifest['artifact']))
         if receipt['artifact_after_digest'] != digest(manifest['artifact']):
@@ -440,10 +473,17 @@ def collect(
     except BaseException as exc:
         receipt['status'] = exc.status if isinstance(exc, ProcessFailure) else ('cancelled' if isinstance(exc, KeyboardInterrupt) else 'collection_failed')
         receipt['error'] = f'{type(exc).__name__}: {exc}'
-        # Incomplete records have no ended_at; never claim collection finished.
+        receipt['ended_at'] = None
     finally:
         if keepalive is not None:
-            keepalive.stop()
+            stop_deadline = time.monotonic() + _KEEPALIVE_STOP_TIMEOUT_SEC
+            while True:
+                try:
+                    keepalive.stop(stop_deadline)
+                    break
+                except KeyboardInterrupt as exc:
+                    if receipt['status'] == 'finished':
+                        receipt.update(status='cancelled', ended_at=None, error=f'{type(exc).__name__}: {exc}')
     _persist()
     return receipt
 
@@ -563,10 +603,11 @@ def validate_receipt(manifest: dict, receipt_path: Path, *, require_success: boo
 
 def main():
     import signal
-    if os.name != 'nt':
-        def cancel_signal(signum, frame):
-            raise KeyboardInterrupt(f'collector received signal {signum}')
-        signal.signal(signal.SIGTERM, cancel_signal)
+
+    def cancel_signal(signum, frame):
+        raise KeyboardInterrupt(f'collector received signal {signum}')
+
+    signal.signal(signal.SIGBREAK if os.name == 'nt' else signal.SIGTERM, cancel_signal)
     parser = argparse.ArgumentParser()
     parser.add_argument('--manifest', required=True, type=Path)
     parser.add_argument('--output-dir', required=True, type=Path)

@@ -119,7 +119,7 @@ def _query_appserver_hooks_list(codex_exe: Path, codex_home: Path, cwd: Path) ->
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "test-m9b-hooks-list", "version": "0.6.6"},
+                    "clientInfo": {"name": "test-m9b-hooks-list", "version": "0.6.7"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -192,7 +192,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     assert manifest_path.is_file()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["name"] == "tri-orchestrator"
-    assert manifest["version"] == "0.6.6"
+    assert manifest["version"] == "0.6.7"
     assert manifest["hooks"] == "./hooks/hooks.json"
     assert manifest["skills"] == "./skills/"
     assert manifest["mcpServers"] == "./.mcp.json"
@@ -246,7 +246,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     spec.loader.exec_module(upgrade_mod)
     assert upgrade_mod.package_identity(PLUGIN_DIR) == {
         "name": "tri-orchestrator",
-        "version": "0.6.6",
+        "version": "0.6.7",
     }
     assert "pipeline_runner_v1" not in UPGRADE_PY.read_text(encoding="utf-8")
 
@@ -266,7 +266,7 @@ def test_install_ps1_rejects_legacy_dual_manifest(tmp_path: Path) -> None:
     )
     shutil.copy2(PLUGIN_DIR / "hooks" / "hooks.json", fake_plugin / "hooks" / "hooks.json")
     # Re-introduce a stale root plugin.json to confirm fail-closed detection
-    (fake_plugin / "plugin.json").write_text('{"name": "tri-orchestrator", "version": "0.6.6"}\n', encoding="utf-8")
+    (fake_plugin / "plugin.json").write_text('{"name": "tri-orchestrator", "version": "0.6.7"}\n', encoding="utf-8")
 
     codex_home = tmp_path / "codex_home"
     env = dict(
@@ -376,7 +376,7 @@ def test_real_install_hooks_list_trust_and_uninstall_e2e(tmp_path: Path) -> None
         / "cache"
         / "tri-orchestrator"
         / "tri-orchestrator"
-        / "0.6.6"
+        / "0.6.7"
         / ".venv"
         / "Scripts"
     )
@@ -530,6 +530,152 @@ def test_install_sh_lf_line_endings_and_features_section() -> None:
     assert "--trust-plugin-hooks" in text, "install.sh must support --trust-plugin-hooks flag"
     # Must have hooks/list self-check
     assert "hooks/list" in text, "install.sh must have hooks/list self-check"
+
+
+@pytest.mark.parametrize("trust", [False, True])
+def test_install_sh_registers_plugin_and_verifies_hook_trust(tmp_path: Path, trust: bool) -> None:
+    codex = _resolve_codex_exe()
+    if os.name == "nt":
+        git = shutil.which("git")
+        bash = Path(git).resolve().parents[1] / "bin" / "bash.exe" if git else None
+    else:
+        bash = shutil.which("bash")
+    if not bash or not Path(bash).is_file() or codex is None or not shutil.which("uv"):
+        pytest.skip("Requires Bash, Codex CLI and uv")
+
+    repo = tmp_path / "source"
+    marketplace = Path(".agents/plugins/marketplace.json")
+    (repo / marketplace.parent).mkdir(parents=True)
+    shutil.copyfile(REPO_ROOT / marketplace, repo / marketplace)
+    shutil.copytree(PLUGIN_DIR, repo / "plugin", ignore=shutil.ignore_patterns(".venv", "__pycache__"))
+    codex_home = tmp_path / "codex"
+    isolated_home = tmp_path / "home"
+    isolated_home.mkdir()
+    data_dir = tmp_path / "data"
+    env = dict(
+        os.environ, CODEX_CLI_PATH=codex.as_posix(), CODEX_HOME=str(codex_home),
+        HOME=str(isolated_home), USERPROFILE=str(isolated_home), LOCALAPPDATA=str(isolated_home),
+        TRI_ORCH_DATA_DIR=str(data_dir), TRI_ORCH_PORT=str(_free_loopback_port()),
+    )
+    cmd = [str(bash), INSTALL_SH.as_posix(), "--repo-root", repo.as_posix(), "--skip-uv-sync"]
+    if trust:
+        cmd.append("--trust-plugin-hooks")
+    result = subprocess.run(cmd, env=env, cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=90)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Verified plugin: tri-orchestrator@tri-orchestrator" in result.stdout
+    assert "Verified MCP   : tri_orchestrator" in result.stdout
+    config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert len(config.get("hooks", {}).get("state", {})) == (4 if trust else 0)
+    assert not data_dir.exists(), "Registry and hooks/list checks must not start the daemon"
+
+
+@pytest.mark.parametrize("installation", [
+    "cli_only", "script_no_rotating_backups", "legacy_script", "symlink_replaced", "symlink_preexisting", "hardlinks",
+])
+def test_uninstaller_preserves_unowned_or_edited_role_files(tmp_path: Path, installation: str) -> None:
+    pwsh = _resolve_powershell()
+    codex = _resolve_codex_exe()
+    if not pwsh or codex is None or not shutil.which("uv"):
+        pytest.skip("Requires Windows PowerShell, Codex CLI and uv")
+    codex_home = tmp_path / "codex"
+    agents = codex_home / "agents"
+    agents.mkdir(parents=True)
+    coder = agents / "coder.toml"
+    coder.write_text('name = "user-coder"\n', encoding="utf-8")
+    investigator = agents / "investigator.toml"
+    investigator.write_text('name = "original-investigator"\n', encoding="utf-8")
+    config = codex_home / "config.toml"
+    if installation == "legacy_script":
+        config.write_bytes(b"[features]\nmulti_agent = false\n")
+    data_dir = tmp_path / "data"
+    env = dict(
+        os.environ, CODEX_HOME=str(codex_home), TRI_ORCH_DATA_DIR=str(data_dir),
+        TRI_ORCH_PORT=str(_free_loopback_port()), CODEX_CLI_PATH=str(codex),
+    )
+
+    def run(script: Path, *args: str, succeeds: bool = True) -> str:
+        result = subprocess.run(
+            [pwsh, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script),
+             "-CodexHome", str(codex_home), *args],
+            env=env, cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=45,
+        )
+        output = result.stdout + result.stderr
+        assert (result.returncode == 0) == succeeds, output
+        return output
+
+    if installation == "symlink_preexisting":
+        outside = tmp_path / "user-role.toml"
+        expected = coder.read_bytes()
+        outside.write_bytes(expected)
+        coder.unlink()
+        try:
+            coder.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"Cannot create the test symlink: {exc}")
+        output = run(INSTALL_PS1, "-SkipPluginInstall", "-SkipUvSync", succeeds=False)
+        assert "reparse point" in output
+        assert coder.is_symlink() and outside.read_bytes() == expected
+        assert not (codex_home / "config.toml").exists()
+        return
+
+    if installation == "hardlinks":
+        original_coder = coder.read_bytes()
+        linked_original = tmp_path / "original-user-role.toml"
+        coder.rename(linked_original)
+        try:
+            os.link(linked_original, coder)
+        except OSError as exc:
+            pytest.skip(f"Cannot create the test hard link: {exc}")
+
+    if installation != "cli_only":
+        keep = "3" if installation == "legacy_script" else "0"
+        run(INSTALL_PS1, "-SkipPluginInstall", "-SkipUvSync", "-KeepBackups", keep)
+        if installation == "legacy_script":
+            (codex_home / "backups" / "tri-orchestrator-baseline" / "installed-roles.json").unlink()
+        assert (agents / "planner.toml").is_file()
+        if installation != "hardlinks":
+            coder.write_text('name = "user-edited-coder"\n', encoding="utf-8")
+    if installation == "symlink_replaced":
+        outside = tmp_path / "user-role.toml"
+        outside.write_bytes((PLUGIN_DIR / "agents" / "coder.toml").read_bytes())
+        coder.unlink()
+        try:
+            coder.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"Cannot create the test symlink: {exc}")
+    if installation == "hardlinks":
+        assert linked_original.read_bytes() == original_coder
+        linked_stock = tmp_path / "other-stock-role.toml"
+        stock_role = coder.read_bytes()
+        linked_stock.write_bytes(stock_role)
+        coder.unlink()
+        os.link(linked_stock, coder)
+        expected_coder = original_coder
+    else:
+        expected_coder = coder.read_bytes()
+    expected_investigator = investigator.read_text(encoding="utf-8") if installation == "legacy_script" else 'name = "original-investigator"\n'
+
+    if installation == "legacy_script":
+        run(UNINSTALL_PS1, "-RestoreConfigBackup")
+        assert config.read_bytes() == b"[features]\nmulti_agent = false\n"
+        original = codex_home / "backups" / "tri-orchestrator-baseline" / "agents" / "investigator.toml"
+        assert original.read_text(encoding="utf-8") == 'name = "original-investigator"\n'
+    else:
+        run(UNINSTALL_PS1)
+    run(UNINSTALL_PS1)
+    assert coder.read_bytes() == expected_coder
+    assert investigator.read_text(encoding="utf-8") == expected_investigator
+    assert (agents / "planner.toml").exists() == (installation == "legacy_script")
+    assert not data_dir.exists(), "Installer and uninstaller tests must leave the daemon stopped"
+    if installation == "symlink_replaced":
+        assert coder.is_symlink() and outside.read_bytes() == expected_coder
+    if installation == "hardlinks":
+        assert linked_stock.read_bytes() == stock_role
+    if installation == "script_no_rotating_backups":
+        run(INSTALL_PS1, "-SkipPluginInstall", "-SkipUvSync", "-KeepBackups", "0")
+        run(UNINSTALL_PS1)
+        assert coder.read_bytes() == expected_coder
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell features section test on Windows")

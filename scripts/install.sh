@@ -531,12 +531,13 @@ PY
 CACHED_PLUGIN_DIR=""
 
 if [ "$SKIP_PLUGIN_INSTALL" -eq 0 ]; then
+  codex_json="$STAGE_DIR/codex.json"
   if [ "$HAS_MARKETPLACE_LAYOUT" -eq 1 ]; then
-    mp_list_json="$(CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin marketplace list --json)"
-    mp_action="$(printf '%s' "$mp_list_json" | run_py - "$REPO_ROOT" <<'PY'
+    CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin marketplace list --json > "$codex_json"
+    mp_action="$(run_py - "$codex_json" "$REPO_ROOT" <<'PY'
 import json, pathlib, sys
-data = json.load(sys.stdin)
-repo = str(pathlib.Path(sys.argv[1]).resolve())
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+repo = str(pathlib.Path(sys.argv[2]).resolve())
 for mp in data.get("marketplaces", []):
     if mp.get("name") == "tri-orchestrator":
         root = mp.get("root") or ""
@@ -548,7 +549,7 @@ PY
 )"
     if [ "$mp_action" = "repoint" ]; then
       echo "[install] Re-pointing marketplace 'tri-orchestrator' -> $REPO_ROOT"
-      CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin marketplace remove tri-orchestrator --json >/dev/null || true
+      CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin marketplace remove tri-orchestrator --json >/dev/null
       CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin marketplace add "$REPO_ROOT" --json >/dev/null
     elif [ "$mp_action" = "add" ]; then
       CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin marketplace add "$REPO_ROOT" --json >/dev/null
@@ -557,35 +558,12 @@ PY
       echo "[install] Marketplace 'tri-orchestrator' already points to $REPO_ROOT"
     fi
 
-    pl_list_json="$(CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin list --marketplace tri-orchestrator --json || true)"
-    is_installed="$(printf '%s' "$pl_list_json" | run_py - <<'PY'
-import json, sys
-raw = sys.stdin.read().strip()
-if not raw:
-    print("no")
-    sys.exit(0)
-data = json.loads(raw)
-for item in data.get("installed", []):
-    if item.get("pluginId") == "tri-orchestrator@tri-orchestrator":
-        print("yes")
-        sys.exit(0)
-print("no")
-PY
-)"
-    if [ "$is_installed" = "yes" ]; then
-      echo "[install] Removing existing plugin cache before fresh install..."
-      CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin remove tri-orchestrator@tri-orchestrator --json >/dev/null
-    fi
-    CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin add tri-orchestrator@tri-orchestrator --json >/dev/null
-  else
-    pl_list_json="$(CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin list --marketplace tri-orchestrator --json || true)"
-    is_installed="$(printf '%s' "$pl_list_json" | run_py - <<'PY'
-import json, sys
-raw = sys.stdin.read().strip()
-if not raw:
-    print("no")
-    sys.exit(0)
-data = json.loads(raw)
+  fi
+
+  CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin list --marketplace tri-orchestrator --json > "$codex_json"
+  is_installed="$(run_py - "$codex_json" <<'PY'
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 for item in data.get("installed", []):
     if item.get("pluginId") == "tri-orchestrator@tri-orchestrator" and item.get("installed"):
         print("yes")
@@ -593,27 +571,30 @@ for item in data.get("installed", []):
 print("no")
 PY
 )"
-    if [ "$is_installed" != "yes" ]; then
-      CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin add tri-orchestrator@tri-orchestrator --json >/dev/null
-    fi
+  if [ "$HAS_MARKETPLACE_LAYOUT" -eq 1 ] && [ "$is_installed" = "yes" ]; then
+    echo "[install] Removing existing plugin cache before fresh install..."
+    CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin remove tri-orchestrator@tri-orchestrator --json >/dev/null
+  fi
+  if [ "$HAS_MARKETPLACE_LAYOUT" -eq 1 ] || [ "$is_installed" != "yes" ]; then
+    CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin add tri-orchestrator@tri-orchestrator --json >/dev/null
   fi
 
-  verify_pl_json="$(CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin list --marketplace tri-orchestrator --json)"
-  PLUGIN_VERSION="$(printf '%s' "$verify_pl_json" | run_py - <<'PY'
-import json, sys
-data = json.load(sys.stdin)
+  CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" plugin list --marketplace tri-orchestrator --json > "$codex_json"
+  PLUGIN_VERSION="$(run_py - "$codex_json" <<'PY'
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 for item in data.get("installed", []):
     if item.get("pluginId") == "tri-orchestrator@tri-orchestrator" and item.get("installed") and item.get("enabled"):
-        print(item.get("version") or "0.1.0")
+        print(item["version"])
         sys.exit(0)
 raise SystemExit("tri-orchestrator@tri-orchestrator not reported installed+enabled")
 PY
 )"
 
-  verify_mcp_json="$(CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" mcp list --json)"
-  CACHED_PLUGIN_DIR="$(printf '%s' "$verify_mcp_json" | run_py - <<'PY'
-import json, sys
-items = json.load(sys.stdin)
+  CODEX_HOME="$CODEX_HOME_DIR" "$CODEX_BIN" mcp list --json > "$codex_json"
+  CACHED_PLUGIN_DIR="$(run_py - "$codex_json" <<'PY'
+import json, pathlib, sys
+items = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 for item in items:
     if item.get("name") == "tri_orchestrator" and item.get("enabled"):
         tr = item.get("transport") or {}
@@ -816,10 +797,11 @@ PY
 if [ "$SKIP_PLUGIN_INSTALL" -eq 0 ] || [ "$TRUST_PLUGIN_HOOKS" -eq 1 ]; then
   if [ -n "$CODEX_BIN" ] && [ -x "$CODEX_BIN" ]; then
     probe_cwd="${REPO_ROOT:-${TMPDIR:-/tmp}}"
-    hooks_list_json="$(probe_hooks_list_json "$probe_cwd")"
-    hooks_status="$(printf '%s' "$hooks_list_json" | run_py - <<'PY'
-import json, sys
-data = json.load(sys.stdin)
+    hooks_json="$STAGE_DIR/hooks.json"
+    probe_hooks_list_json "$probe_cwd" > "$hooks_json"
+    hooks_status="$(run_py - "$hooks_json" <<'PY'
+import json, pathlib, sys
+data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 hooks = data.get("hooks", [])
 events = {h.get("eventName") for h in hooks if isinstance(h, dict)}
 required = {"sessionStart", "postCompact", "userPromptSubmit", "stop"}
@@ -838,13 +820,13 @@ PY
 
     if [ "$TRUST_PLUGIN_HOOKS" -eq 1 ]; then
       tmp_trusted="$STAGE_DIR/trusted_config.toml"
-      printf '%s' "$hooks_list_json" | run_py - "$CONFIG_PATH" "$tmp_trusted" <<'PY'
+      run_py - "$hooks_json" "$CONFIG_PATH" "$tmp_trusted" <<'PY'
 import json, pathlib, re, sys, tomllib
 
-hooks_data = json.load(sys.stdin)
+hooks_data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 hooks = hooks_data.get("hooks", [])
-config_path = pathlib.Path(sys.argv[1])
-out_path = pathlib.Path(sys.argv[2])
+config_path = pathlib.Path(sys.argv[2])
+out_path = pathlib.Path(sys.argv[3])
 toml_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
 
 entries = []
@@ -943,10 +925,10 @@ PY
       cp -f "$tmp_trusted" "$tmp_dest"
       mv -f "$tmp_dest" "$CONFIG_PATH"
 
-      recheck_json="$(probe_hooks_list_json "$probe_cwd")"
-      printf '%s' "$recheck_json" | run_py - <<'PY'
-import json, sys
-hooks = json.load(sys.stdin).get("hooks", [])
+      probe_hooks_list_json "$probe_cwd" > "$hooks_json"
+      run_py - "$hooks_json" <<'PY'
+import json, pathlib, sys
+hooks = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")).get("hooks", [])
 still_untrusted = [h for h in hooks if isinstance(h, dict) and h.get("trustStatus") != "trusted"]
 if len(hooks) < 4 or still_untrusted:
     raise SystemExit(f"--trust-plugin-hooks failed to transition all 4 hooks to trustStatus='trusted': {hooks}")

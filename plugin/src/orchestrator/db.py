@@ -1886,6 +1886,7 @@ class Database:
         current_task: str | None = None,
         status: str | None = None,
         heartbeat_at: float | None = None,
+        require_working: bool = False,
     ) -> dict[str, Any]:
         if status is not None and status not in VALID_WORKER_STATUSES:
             raise ValueError(
@@ -1896,6 +1897,12 @@ class Database:
             existing = self._resolve_worker_in_tx(
                 conn, worker_id=worker_id, run_id=run_id, worker_name=worker_name
             )
+            if require_working and existing["status"] != "working":
+                from orchestrator.workflow import WorkflowConflictError
+                raise WorkflowConflictError(
+                    f"Cannot record keepalive heartbeat for non-working worker {existing['name']!r} "
+                    f"(status={existing['status']!r})"
+                )
             self._reject_pending(conn, existing["id"])
             if existing["status"] in {"stopped", "killed"}:
                 raise ValueError(

@@ -5,7 +5,7 @@
 ## 核心特性
 
 - **三种编排工作流**：按任务规模选择 `$boost`（单目标极速执行）、`$teamwork`（澄清规划 + 分模块协同）或 `$swarm`（多成员并行 + 频道交接）。
-- **物理工作区隔离**：Git 仓库使用 `git clone --local` 隔离分支，非 Git 目录使用三方快照隔离；合入前执行非破坏性冲突预检（`workspace_merge_preview`）。
+- **物理工作区隔离**：Git 仓库默认使用 `git clone --local` 隔离分支，也可显式选择 Git worktree；非 Git 目录使用三方快照隔离。合入前执行非破坏性冲突预检（`workspace_merge_preview`）。
 - **硬验收与并发盲审**：通过 `tri-orchestrator-verify` 冻结产物清单与命令输出生成 SHA-256 验收回执，并支持 `tri-orchestrator-challenge` 只读并发盲审。
 - **Codex 本地目录与实时同步**：只读镜像本地 Codex 项目排序、置顶状态与非归档对话（含尚无编排的纯 Codex 对话），按「项目 → Codex 对话 → 编排轮次」三层展示，并通过文件指纹监听实时推送 `codex_catalog_updated` SSE 更新，隔离多会话并发与 `Stop` 钩子检查。侧栏可在「全部来源」「桌面端」「CLI」之间切换。
 - **模型追踪与辅助子代理观测**：`schema 10` 全链路记录主会话、轮次与子代理的 `model` / `reasoning_effort` / `model_provider`（含触发快照与会话切模对比），并只读解析 Codex `thread_spawn_edges` 派生树以追踪 L2+ 只读辅助子代理与主会话未登记原生子代理。
@@ -25,7 +25,7 @@
 
 ### 方式一：通过 Codex CLI 直接安装（零脚本）
 
-适用于首次安装，无需本地克隆仓库或运行额外脚本：
+适用于首次安装，无需本地克隆仓库或运行额外脚本。下列命令跟踪仓库默认分支；要固定在某个已发布版本，使用对应 GitHub Release 中带标签的命令：
 
 ```bash
 codex plugin marketplace add gongyuanshen/codex-orchestrator
@@ -35,11 +35,11 @@ codex plugin add tri-orchestrator@tri-orchestrator
 安装完成后：
 - Codex 会将 `./plugin/` 缓存到本地插件目录（`~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/<version>/`）。
 - 首次触发 MCP 工具时，Codex 自动执行 `uv run --quiet --project . python -m orchestrator.mcp_shim` 初始化依赖并拉起后台单例守护进程。
-- 若未安装专用角色 TOML，`$boost`、`$teamwork` 与 `$swarm` 调用 `spawn_agent` 时会省略 `agent_type`、`model` 与 `reasoning_effort`，直接继承当前主会话配置并在提示词中内联角色契约。
+- 若未安装专用角色 TOML，技能省略 `agent_type` 并在提示词中内联角色契约。模型按 Codex 宿主配置解析；只有宿主明确支持，且不复制完整历史时，才显式传入任务需要的 `reasoning_effort`。
 
 ### 方式二：运行仓库安装脚本（完整角色与钩子配置）
 
-克隆仓库后运行平台脚本，可额外完成 6 个角色 TOML（`~/.codex/agents/`）安装、安全启用 `multi_agent` 与 `multi_agent_v2`、缓存依赖预热以及 `hooks/list` 四钩子自检：
+检出要安装的对应版本源码后再运行平台脚本（Release 的插件 ZIP 和 Python wheel 不含这些脚本）。完整安装会备份并替换 6 个同名角色 TOML（`~/.codex/agents/`），启用 `multi_agent`、`multi_agent_v2`，预热缓存并用 `hooks/list` 检查四个钩子。要保留现有同名角色不变，使用方式一：
 
 **Windows（PowerShell）：**
 
@@ -57,19 +57,35 @@ bash scripts/install.sh
 # 默认保留永久基线 tri-orchestrator-baseline + 最近 3 个配置备份，可通过 --keep-backups N 调整
 ```
 
-### 旧版本运行库升级
+### 从旧版升级
 
-如果本地已存在旧版 Schema 运行库（例如从 `schema <= 9` 升级至 `0.6.6` / `schema 10`），需先结束全部活跃任务并停止守护进程，再使用 `scripts/upgrade.py` 执行受控备份与离线升级，最后通过 Codex 重新安装插件：
+先结束全部活跃任务，关闭使用此插件的 Codex 会话并停止旧版本守护进程。插件进程与后台版本不匹配时会直接报错，不会替你停止旧后台。默认数据路径见下文；如配置过 `TRI_ORCH_DATA_DIR` 或 `TRI_ORCH_PORT`，以下步骤沿用相同设置。
+
+关闭 Codex 不会结束已分离的守护进程。若后台仍在运行，从对应数据目录的 `daemon.pid.json` 读取 URL 和 PID，与该 URL 的 `/api/health` 返回的 `pid`、`data_dir` 核对后，只停止这一进程（Windows `Stop-Process -Id`，macOS/Linux `kill -TERM`）。迁移期间不要用其他程序写入运行库。
+
+**版本之间数据库结构相同**（例如 `0.6.6 → 0.6.7`，均为 schema 10）时，不必运行迁移脚本，直接按下面的方式更新插件。
+
+**数据库结构较旧**（例如 `0.6.0 / 0.6.1 → schema 10`）时，先检出**目标版本**的源码，从仓库根目录用该版本的 Python 环境准备备份并离线迁移。将命令中的目录替换为实际路径；`<old-plugin-dir>` 是旧版已安装缓存，`<backup-dir>` 是一个新目录。使用非默认端口时为 `prepare` 加上 `--port`：
 
 ```bash
-python scripts/upgrade.py prepare --source-plugin ./plugin --target-plugin <old-plugin-dir> --data-dir <data-dir> --backup-dir <backup-dir>
-python scripts/upgrade.py apply --backup-dir <backup-dir>
-python scripts/upgrade.py verify --backup-dir <backup-dir> --keep-backups 3
-# 如需单独轮转清理旧版升级备份或残留的 plugin-backup-* staging 目录：
-python scripts/upgrade.py prune --backup-root <backups-dir> --plugin-cache-dir ~/.codex/plugins/cache/tri-orchestrator --keep-backups 3
+uv run --locked --project ./plugin python scripts/upgrade.py prepare --source-plugin ./plugin --target-plugin "<old-plugin-dir>" --data-dir "<data-dir>" --backup-dir "<backup-dir>"
+uv run --locked --project ./plugin python scripts/upgrade.py apply --database-only --backup-dir "<backup-dir>"
 ```
 
-> 守护进程冷启动不会自动迁移旧版 Schema，也不要直接覆盖旧版托管缓存目录；升级遇到新数据写入后拒绝用旧备份回滚，保留数据进行前向修复。
+`--database-only` 在备份目录内迁移并核对历史数据，通过后才更新 `state.db`；不会复制文件到旧版托管缓存。冷启动不会自动做这一步。
+
+**更新 Codex 安装：**
+
+- **跟踪默认分支**：先运行 `codex plugin marketplace upgrade tri-orchestrator`，再运行 `codex plugin add tri-orchestrator@tri-orchestrator`。
+- **固定在 Release 标签**：刷新只会拉取同一标签。运行 `codex plugin marketplace remove tri-orchestrator` 移除旧来源，用新 Release 的 `codex plugin marketplace add gongyuanshen/codex-orchestrator@<新标签>` 登记新来源，再运行 `codex plugin add tri-orchestrator@tri-orchestrator`。这里换的是插件来源，不需要运行 Windows 卸载脚本或删除运行库。
+
+用 `codex plugin list --marketplace tri-orchestrator` 确认版本，开一个新会话触发 MCP 并启动新后台。若做过离线迁移，在新后台启动**之后**再运行：
+
+```bash
+uv run --locked --project ./plugin python scripts/upgrade.py verify --backup-dir "<backup-dir>" --keep-backups 3
+```
+
+> 需要回滚时，先停止新后台，再用目标版本源码执行 `uv run --locked --project ./plugin python scripts/upgrade.py rollback --backup-dir "<backup-dir>"`。回滚通过后按上述换标签步骤安装旧插件，再启动后台。若新版本已有数据写入，脚本会拒绝覆盖，保留当前数据供修复。
 
 ---
 
@@ -199,6 +215,7 @@ flowchart LR
 
 - **工作区隔离模式**：
   - `mode="git_clone"` 需要在分配分支提交真实 commit SHA，并在验收/合入前保持工作树干净。
+  - 使用 [Git 2.36 或更新版本](https://git-scm.com/docs/git-worktree/2.36.0) 时，可在 `workspace_create` 或 `workflow_prepare_dispatch` 显式传入 `git_backend="worktree"`，与原仓库共享 Git 对象和引用。复制未受版本管理的 `.env` 或依赖前，链接工作区的 Git 忽略规则须已覆盖这些路径；否则保持默认 clone。清理期间不要手动切换或移动工作区分支。
   - `mode="snapshot"` 下 `branch_name=None` 属正常状态；合入前 `dirty=true` 表示相对基线存在改动，合入与清理按三方目录快照基线核验。
   - 两种模式均应先执行 `workspace_merge_preview`，再执行 `workspace_merge(strategy="merge")` 与 `workspace_cleanup`。
 - **依赖目录策略（`dep_mode`）**：
@@ -226,7 +243,7 @@ flowchart LR
 | 存储路径 | 内容组成 | 生命周期与清理边界 |
 | :--- | :--- | :--- |
 | **`%LOCALAPPDATA%\tri-orchestrator`**（Windows）<br>`~/.local/share/tri-orchestrator`（POSIX）<br>（`TRI_ORCH_DATA_DIR`） | - `state.db`：SQLite WAL 状态机库<br>- `daemon.log` / `shim.log`：运行日志（`RotatingFileHandler` 自动轮转）<br>- `results/`：超大 MCP 返回体缓存 JSON<br>- `receipts/`：派发与验收 SHA-256 回执 | `state.db` 与 `receipts/` 长期留存以保留审计轨迹；`results/` 下缓存文件超过 `TRI_ORCH_RESULT_TTL_SEC`（默认 `86400` 秒）或超出最近 `TRI_ORCH_RESULT_MAX_FILES`（默认 `50` 份）时自动清理。 |
-| **`<project_root>/.swarm-workspaces/`** | 每个隔离写入子代理一个子目录（`git_clone` 或 `snapshot` 复制目录） | 任务结束调用 `workflow_closeout_run` / `workspace_cleanup` 时自动回收；已合入且无未提交改动的过期工作区超过 `TRI_ORCH_WORKSPACE_RETENTION_SEC`（默认 `86400` 秒）由 GC 安全删除。**凡存在未合入新增/修改文件的工作区绝不自动删除**，需人工核查合入或手动处置。 |
+| **`<project_root>/.swarm-workspaces/`** | 每个隔离写入子代理一个子目录（`git_clone` 或 `snapshot` 复制目录） | 任务结束调用 `workflow_closeout_run` / `workspace_cleanup` 时回收；已合入且无未提交改动的过期工作区超过 `TRI_ORCH_WORKSPACE_RETENTION_SEC`（默认 `86400` 秒）由 GC 清理。可检测到的未合入改动会阻止清理；被 Git 或快照规则忽略的文件不算改动，不要把它们的唯一副本放在临时工作区。 |
 | **`~/.codex/backups/`** 与<br>`~/.codex/plugins/cache/tri-orchestrator/` | - `tri-orchestrator-baseline`：首次安装前配置基线<br>- `tri-orchestrator-2*`：历次安装配置与角色备份<br>- `plugin-backup-*`：插件重装/升级残留 staging 目录 | 安装脚本仅备份 `config.toml` 与必要角色 TOML（绝不拷贝 `.venv`），永久保留唯一 `tri-orchestrator-baseline` 与最近 `N=3` 个时间戳备份（`-KeepBackups` / `--keep-backups` 可覆盖）；`scripts/upgrade.py verify` / `prune` 轮转清理已验证完成的旧升级备份与过期 `plugin-backup-*` staging 目录。 |
 
 ### 3. 三种存储清理与 GC 触发方式
@@ -351,6 +368,8 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
 uv run pytest -v
 ```
 
+版本修复的验证范围见 [v0.6.7 发布验收](docs/verification/v0.6.6-release-regressions.md)。
+
 ### 卸载
 
 **零脚本卸载：**
@@ -366,6 +385,8 @@ codex plugin marketplace remove tri-orchestrator
 powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1
 # 可选参数：-RestoreConfigBackup -RemoveDataDir
 ```
+
+脚本只移除能核实由安装器写入且未被编辑的角色。若安装前有同名角色，符合移除条件时会恢复备份；自行编辑过或无法确认来源的角色会保留。
 
 **macOS / Linux**：执行上述 `codex plugin ...` 移除命令后，按需清理 `~/.codex/agents/` 下对应角色文件，停止 `daemon.pid.json` 进程并清理 `~/.local/share/tri-orchestrator`。
 
