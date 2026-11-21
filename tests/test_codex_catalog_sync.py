@@ -505,6 +505,39 @@ def test_cli_only_state_without_desktop_tables(tmp_path, monkeypatch, with_threa
                 assert (snapshot["codex_thread_name"], snapshot["codex_model"]) == ("CLI Title", "model")
 
 
+@pytest.mark.parametrize("source", ["cli", "exec", None])
+def test_filtered_only_cli_catalog_is_not_an_unavailable_legacy_catalog(tmp_path, monkeypatch, source):
+    codex_home = tmp_path / "codex_home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    db_path = _init_catalog_codex_home(codex_home)
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.executescript("DROP TABLE project_roots; DROP TABLE projects;")
+        conn.executemany(
+            "INSERT INTO threads (id, cwd, title, thread_source, source, archived) VALUES (?, ?, ?, ?, ?, ?)",
+            [
+                ("archived", str(tmp_path), "Archived", "user", source, 1),
+                ("challenge", str(tmp_path), "Read-only challenge", "user", "exec", 0),
+            ],
+        )
+
+    settings = Settings(host="127.0.0.1", port=_free_port(), data_dir=tmp_path / "data")
+    with Database(settings=settings) as db:
+        project = db.ensure_project(tmp_path)
+        db.create_run(project_id=project["id"], mode="swarm", title="Archived run", session_id="archived")
+        with TestClient(create_app(settings, db=db, start_watchdog=False)) as client:
+            catalog = client.get("/api/codex/catalog").json()
+            assert catalog == {
+                "available": source is not None, "projects": [], "global_active_runs": [], "concurrent_risks": [],
+            }
+            projects = client.get("/api/projects").json()
+            sessions = client.get("/api/sessions").json()
+            if source is not None:
+                assert projects["codex_catalog"] == sessions["codex_catalog"] == catalog
+            else:
+                assert "codex_catalog" not in projects and "codex_catalog" not in sessions
+                assert [group["session_id"] for group in sessions["sessions"]] == ["archived"]
+
+
 def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
     run_dashboard(r'''(async()=>{
       const catalog = {

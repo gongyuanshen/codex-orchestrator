@@ -693,6 +693,7 @@ def get_codex_catalog(include_exec_session_ids: Iterable[str] | None = None) -> 
                     """
                     unmatched: list[_CodexCatalogThread] = []
                     missing_ids = set(bound_ids)
+                    has_bound_cli = False
                     for (
                         tid,
                         raw_cwd,
@@ -716,6 +717,7 @@ def get_codex_catalog(include_exec_session_ids: Iterable[str] | None = None) -> 
                         if source == "exec" and tid not in bound_ids:
                             continue
                         is_cli = source in {"cli", "exec"}
+                        has_bound_cli |= is_cli and tid in bound_ids
                         cwd = _strip_win_extended_prefix(raw_cwd or "")
                         resolved_title = (
                             names.get(tid)
@@ -773,10 +775,13 @@ def get_codex_catalog(include_exec_session_ids: Iterable[str] | None = None) -> 
                     for start in range(0, len(candidate_ids), batch_size):
                         batch = candidate_ids[start:start + batch_size]
                         placeholders = ",".join("?" for _ in batch)
-                        missing_ids.difference_update(row[0] for row in conn.execute(
-                            f"SELECT id FROM threads WHERE id IN ({placeholders})", batch,
-                        ))
-                    if not has_desktop and not unmatched and not missing_ids:
+                        for tid, raw_source in conn.execute(
+                            f"SELECT id, {source_expr} FROM threads WHERE id IN ({placeholders})", batch,
+                        ):
+                            missing_ids.discard(tid)
+                            has_bound_cli |= (_clean_opt_str(raw_source) or "").lower() in {"cli", "exec"}
+                    # Falling back to the legacy run list would expose filtered CLI sessions.
+                    if not (has_desktop or unmatched or missing_ids or has_bound_cli):
                         return None
                     catalog: _CodexCatalog = {
                         "projects": visible_projects,
