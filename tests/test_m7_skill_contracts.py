@@ -39,8 +39,8 @@ def test_zero_script_agent_type_omission_and_full_model_and_reasoning_effort_inh
     assert "additionalProperties: false" in rules
     assert "install.ps1" in rules
     assert "reasoning_effort" in rules
-    assert "Omit both `model` and `reasoning_effort`" in rules
-    assert "NEVER pass a hardcoded `model` or `reasoning_effort` parameter" in rules
+    assert "always omit `model`" in rules
+    assert "NEVER pass a hardcoded `model`" in rules
 
 
 def test_zero_legacy_v1_or_stale_version_artifacts_across_all_skills_and_roles() -> None:
@@ -93,7 +93,7 @@ def test_shared_workflow_documents_nuanced_fork_turns_and_reasoning_effort() -> 
     assert "custom `agent_type` applies regardless of `fork_turns`" in shared
     assert 'fork_turns: "none"' in shared
     assert 'fork_turns: "all"' in shared
-    assert "Omit both `model` and `reasoning_effort` on `spawn_agent`" in shared
+    assert "NEVER pass a hardcoded `model` parameter on `spawn_agent`" in shared
     assert "reasoning_effort" in shared
 
 
@@ -161,7 +161,7 @@ def test_workflow5_macro_rpc_primary_path_and_reconciliation_fence(mode: str) ->
     text = _skill_text(mode)
     for required in (
         "workflow5",
-        "0.6.5/schema10",
+        "0.6.6/schema10",
         "workflow_prepare_dispatch",
         "task_name",
         "/root/<task_name>",
@@ -214,7 +214,7 @@ def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_role_focuse
         data = tomllib.loads(raw)
         instructions = data["developer_instructions"]
         assert "workflow5" in instructions, path
-        assert "0.6.5/schema10" in instructions, path
+        assert "0.6.6/schema10" in instructions, path
         assert "board_status.workflow.workflow_version" in instructions, path
         assert "skills/route-a-workflow.md" not in instructions, f"{path} must not require broken relative path"
         assert "self-contained" in instructions, path

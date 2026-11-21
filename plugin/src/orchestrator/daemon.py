@@ -1812,6 +1812,56 @@ def create_app(
         except Exception as exc:
             return _map_exception_to_response(exc)
 
+    def _record_worker_heartbeat_sync(
+        state: Any,
+        run_id: str,
+        worker_name: str,
+        current_task: str | None,
+    ) -> dict[str, Any]:
+        worker = state.db.get_worker_by_name(run_id, worker_name)
+        if worker is None:
+            raise NotFoundError(f"Worker not found in run {run_id}: {worker_name}")
+        if worker["status"] != "working":
+            raise WorkflowConflictError(
+                f"Cannot record keepalive heartbeat for non-working worker {worker_name!r} (status={worker['status']!r})"
+            )
+        task_text = (
+            current_task.strip()
+            if isinstance(current_task, str) and current_task.strip()
+            else worker.get("current_task")
+        )
+        updated = state.board.worker_heartbeat(
+            run_id,
+            worker_name,
+            current_task=task_text,
+            status="working",
+        )
+        state.event_bus.publish(
+            "worker_updated",
+            {"run_id": run_id, "worker": updated},
+            run_id=run_id,
+        )
+        return {"ok": True, "worker": updated}
+
+    async def api_worker_heartbeat(request: Request) -> JSONResponse:
+        run_id = request.path_params["run_id"]
+        worker_name = request.path_params["worker_name"]
+        try:
+            body = await _parse_json_body(request, allow_empty=True)
+            raw_task = body.get("current_task")
+            if raw_task is not None and not isinstance(raw_task, str):
+                raise ValueError("current_task must be a string")
+            res = await asyncio.to_thread(
+                _record_worker_heartbeat_sync,
+                request.app.state,
+                run_id,
+                worker_name,
+                raw_task,
+            )
+            return JSONResponse(res)
+        except Exception as exc:
+            return _map_exception_to_response(exc)
+
     def _cleanup_workspace_guarded_sync(state: Any, workspace_id: str) -> dict[str, Any]:
         database: Database = state.db
         workspace_mgr: WorkspaceManager = state.workspace_mgr
@@ -1999,6 +2049,7 @@ def create_app(
         Route("/api/runs/{run_id}/snapshot", api_run_snapshot, methods=["GET"]),
         Route("/api/runs/{run_id}/export", api_run_export, methods=["GET"]),
         Route("/api/runs/{run_id}/human-message", api_human_message, methods=["POST"]),
+        Route("/api/runs/{run_id}/workers/{worker_name}/heartbeat", api_worker_heartbeat, methods=["POST"]),
         Route("/api/events", api_events, methods=["GET"]),
         Route("/api/workspaces/{workspace_id}/diff", api_workspace_diff, methods=["GET"]),
         Route("/api/workspaces/{workspace_id}/merge-preview", api_workspace_merge_preview, methods=["POST"]),

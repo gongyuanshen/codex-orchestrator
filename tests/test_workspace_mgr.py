@@ -607,3 +607,35 @@ def test_repeat_cherry_pick_proof_is_scoped_to_target_history(tmp_path: Path) ->
         assert mgr.workspace_cleanup(ws["id"])["cleaned"] is True
     finally:
         db.close()
+
+
+def test_git_worktree_backend_create_preview_merge_and_cleanup(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "repo")
+    db, mgr, run_id = _setup_mgr(tmp_path, repo)
+    try:
+        ws = mgr.workspace_create(run_id, "wt-worker", git_backend="worktree")
+        assert ws["mode"] == "git_clone"
+        assert ws["snapshot_manifest"]["git_backend"] == "worktree"
+        ws_path = Path(ws["path"])
+        assert ws_path.is_dir()
+        assert (ws_path / ".git").is_file()
+
+        (ws_path / "wt.txt").write_text("from worktree\n", encoding="utf-8")
+        _git(ws_path, "add", "wt.txt")
+        _git(ws_path, "commit", "-m", "worktree commit")
+
+        preview = mgr.workspace_merge_preview(ws["id"])
+        assert preview["has_conflicts"] is False
+        assert "wt.txt" in preview["files_changed"]
+
+        merged = mgr.workspace_merge(ws["id"], strategy="merge")
+        assert merged["merged"] is True
+        assert (repo / "wt.txt").read_text(encoding="utf-8") == "from worktree\n"
+
+        cleaned = mgr.workspace_cleanup(ws["id"])
+        assert cleaned["cleaned"] is True
+        assert not ws_path.exists()
+        branches = _git(repo, "branch", "--list", ws["branch_name"]).stdout.strip()
+        assert branches == ""
+    finally:
+        db.close()

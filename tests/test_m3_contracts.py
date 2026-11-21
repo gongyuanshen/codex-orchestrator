@@ -1,4 +1,4 @@
-"""Workflow5 (0.6.5/schema10) static instruction agreement and public schema parity."""
+"""Workflow5 (0.6.6/schema10) static instruction agreement and public schema parity."""
 from pathlib import Path
 import re
 import tomllib
@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1] / "plugin"
 
 def test_shared_workflow5_preserves_legacy_and_admission_proof_boundaries():
     text = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
-    assert "New runs default to `workflow5` (`0.6.5/schema10`" in text
+    assert "New runs default to `workflow5` (`0.6.6/schema10`" in text
     assert "New runs use workflow4" not in text
     assert "software 0.5.0/schema7" not in text
     for term in (
@@ -63,7 +63,7 @@ def test_modes_and_inline_roles_use_current_workflow5(mode):
     text = (ROOT / f"skills/{mode}/SKILL.md").read_text(encoding="utf-8")
     for term in (
         "workflow5",
-        "0.6.5/schema10",
+        "0.6.6/schema10",
         "workflow0..4",
         "plan_readiness",
         "resume_context",
@@ -91,7 +91,7 @@ def test_all_installed_roles_load_workflow5_without_permission_or_model_expansio
     text = role["developer_instructions"]
     assert "software 0.5.0/schema7" not in text
     assert "New runs use workflow4" not in text
-    for term in ("workflow5", "0.6.5/schema10", "workflow0..4", "board_status.workflow.workflow_version"):
+    for term in ("workflow5", "0.6.6/schema10", "workflow0..4", "board_status.workflow.workflow_version"):
         assert term in text, (path, term)
     assert "model" not in role
     assert "model_reasoning_effort" not in role

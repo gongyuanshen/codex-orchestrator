@@ -3,16 +3,23 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import math
 import os
 from pathlib import Path
 import sys
+import threading
+import time
+import urllib.request
 
 from orchestrator.artifacts import digest, recapture
 from orchestrator.verify_process import ProcessFailure, run_owned
+
+logger = logging.getLogger(__name__)
 
 ENV_PROFILE_KEYS: dict[str, tuple[str, ...]] = {
     'none': (),
@@ -175,14 +182,24 @@ def validate_manifest(manifest):
     commands = manifest['commands']
     if not isinstance(commands, list) or not commands:
         raise ValueError('commands must be nonempty')
+    if 'max_parallel' in manifest and manifest['max_parallel'] is not None:
+        max_parallel = manifest['max_parallel']
+        if type(max_parallel) is not int or max_parallel < 1:
+            raise ValueError('max_parallel must be a positive integer')
+    required_cmd_keys = {'id', 'argv', 'cwd', 'timeout_sec', 'env_keys', 'criteria'}
+    allowed_cmd_keys = required_cmd_keys | {'parallel_group'}
     ids = set()
     for command in commands:
-        if not isinstance(command, dict) or set(command) != {'id', 'argv', 'cwd', 'timeout_sec', 'env_keys', 'criteria'}:
+        if not isinstance(command, dict) or not required_cmd_keys.issubset(command) or not set(command).issubset(allowed_cmd_keys):
             raise ValueError('command fields differ from frozen schema')
         identity = command['id']
         if not isinstance(identity, str) or not identity.strip() or identity in ids:
             raise ValueError('command ids must be unique nonempty strings')
         ids.add(identity)
+        if 'parallel_group' in command and command['parallel_group'] is not None:
+            group = command['parallel_group']
+            if not isinstance(group, str) or not group.strip() or '\0' in group:
+                raise ValueError(f'{identity}: parallel_group must be a nonempty string or null')
         argv = command['argv']
         if not isinstance(argv, list) or not argv or not argv[0] or any(not isinstance(a, str) or '\0' in a for a in argv):
             raise ValueError(f'{identity}: argv must be nonempty string array without NUL')
@@ -198,6 +215,69 @@ def validate_manifest(manifest):
                 raise ValueError(f'{identity}: invalid {field}')
         if any('=' in key for key in command['env_keys']):
             raise ValueError(f'{identity}: invalid environment key')
+
+
+def _command_batches(commands: Sequence[dict]) -> list[tuple[str | None, list[tuple[int, dict]]]]:
+    """Group consecutive commands sharing a non-empty parallel_group; ungrouped commands act as serial barriers."""
+    batches: list[tuple[str | None, list[tuple[int, dict]]]] = []
+    for index, command in enumerate(commands):
+        group = command.get('parallel_group')
+        if group is not None and batches and batches[-1][0] == group:
+            batches[-1][1].append((index, command))
+        else:
+            batches.append((group, [(index, command)]))
+    return batches
+
+
+class _HeartbeatKeepalive:
+    """Periodic daemon-side worker heartbeat sender active only while collector commands are running."""
+
+    def __init__(self, url: str, interval_sec: float, active_provider) -> None:
+        self._url = url
+        self._interval_sec = float(interval_sec)
+        self._active_provider = active_provider
+        self._stop = threading.Event()
+        self._started_monotonic = time.monotonic()
+        self._thread = threading.Thread(target=self._loop, name='verify-heartbeat', daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+    def _send_once(self) -> None:
+        active = list(self._active_provider())
+        if not active:
+            return
+        elapsed = round(max(0.0, time.monotonic() - self._started_monotonic), 1)
+        summary = f"verify running ({len(active)}): {', '.join(active[:4])}"
+        if len(active) > 4:
+            summary += f" +{len(active) - 4} more"
+        payload = json.dumps(
+            {
+                'current_task': summary[:200],
+                'active_commands': active,
+                'elapsed_sec': elapsed,
+            },
+            ensure_ascii=False,
+        ).encode('utf-8')
+        req = urllib.request.Request(
+            self._url,
+            data=payload,
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5.0) as resp:
+                resp.read()
+        except Exception as exc:
+            logger.warning('verify keepalive heartbeat failed (%s): %s', self._url, exc)
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self._interval_sec):
+            self._send_once()
 
 
 def _write(path, value):
@@ -219,10 +299,21 @@ def _log(path):
     return dict(path=str(path), bytes=size, sha256=sha.hexdigest())
 
 
-def collect(manifest_path: Path, output_dir: Path):
+def collect(
+    manifest_path: Path,
+    output_dir: Path,
+    *,
+    heartbeat_url: str | None = None,
+    heartbeat_interval_sec: float = 60.0,
+):
     manifest_path, output_dir = Path(manifest_path), Path(output_dir)
     if not manifest_path.is_absolute() or not output_dir.is_absolute():
         raise ValueError('manifest and output-dir must be absolute')
+    if heartbeat_url is not None:
+        if not isinstance(heartbeat_url, str) or not heartbeat_url.startswith(('http://', 'https://')):
+            raise ValueError('heartbeat_url must be an http:// or https:// URL')
+        if isinstance(heartbeat_interval_sec, bool) or not math.isfinite(float(heartbeat_interval_sec)) or float(heartbeat_interval_sec) <= 0:
+            raise ValueError('heartbeat_interval_sec must be finite and positive')
     manifest_path, output_dir = manifest_path.resolve(strict=True), output_dir.resolve()
     manifest = json.loads(manifest_path.read_text('utf-8'))
     validate_manifest(manifest)
@@ -232,43 +323,115 @@ def collect(manifest_path: Path, output_dir: Path):
         build_isolated_env(command['env_keys'], os.environ, command_id=command['id'])
         for command in manifest['commands']
     ]
+    max_parallel = int(manifest.get('max_parallel') or 1)
     output_dir.mkdir()  # Existing directories are never reused.
     receipt_path = output_dir / 'receipt.json'
     receipt = dict(schema_version=1, evidence_level='local_collector_v1', manifest_digest=digest(manifest), status='running', started_at=_now(), ended_at=None, artifact_before_digest=None, artifact_after_digest=None, commands=[], error=None)
-    _write(receipt_path, receipt)
-    current = None
+    receipt_lock = threading.Lock()
+    active_ids: set[str] = set()
+    keepalive = _HeartbeatKeepalive(
+        heartbeat_url,
+        float(heartbeat_interval_sec),
+        lambda: sorted(active_ids),
+    ) if heartbeat_url else None
+
+    def _persist() -> None:
+        with receipt_lock:
+            _write(receipt_path, receipt)
+
+    def _run_one(index: int, command: dict, current: dict) -> None:
+        out = output_dir / f'{index:04d}.stdout'
+        err = output_dir / f'{index:04d}.stderr'
+        command_error = None
+        with receipt_lock:
+            active_ids.add(command['id'])
+        try:
+            with out.open('xb') as stdout, err.open('xb') as stderr:
+                exit_code = run_owned(command['argv'], command['cwd'], command_envs[index], command['timeout_sec'], stdout, stderr)
+            with receipt_lock:
+                current['exit_code'] = exit_code
+                current['status'] = 'finished'
+                current['ended_at'] = _now()
+        except BaseException as exc:
+            command_error = exc
+            with receipt_lock:
+                current['status'] = exc.status if isinstance(exc, ProcessFailure) else ('cancelled' if isinstance(exc, KeyboardInterrupt) else 'collection_failed')
+                if isinstance(exc, ProcessFailure):
+                    current['exit_code'] = exc.exit_code
+            raise
+        finally:
+            # Partial bytes remain evidence even when launch, wait, or collection fails.
+            with receipt_lock:
+                active_ids.discard(command['id'])
+            try:
+                captured_logs = {}
+                for name, path in (('stdout', out), ('stderr', err)):
+                    if path.is_file():
+                        captured_logs[name] = _log(path)
+                with receipt_lock:
+                    for name, info in captured_logs.items():
+                        current[name] = info
+                    _write(receipt_path, receipt)
+            except BaseException as capture_error:
+                raise ProcessFailure('collection_failed', f'primary={command_error!r}; capture={capture_error!r}', current['exit_code']) from capture_error
+
+    _persist()
+    if keepalive is not None:
+        keepalive.start()
     try:
         receipt['artifact_before_digest'] = digest(recapture(manifest['artifact']))
         if receipt['artifact_before_digest'] != digest(manifest['artifact']):
             raise ProcessFailure('artifact_changed', 'source checkpoint differs before execution')
-        _write(receipt_path, receipt)
-        for index, command in enumerate(manifest['commands']):
-            out = output_dir / f'{index:04d}.stdout'
-            err = output_dir / f'{index:04d}.stderr'
-            current = dict(command_id=command['id'], status='running', started_at=_now(), ended_at=None, exit_code=None, stdout=dict(path=str(out), bytes=None, sha256=None), stderr=dict(path=str(err), bytes=None, sha256=None))
-            receipt['commands'].append(current)
-            _write(receipt_path, receipt)
-            command_error = None
-            try:
-                with out.open('xb') as stdout, err.open('xb') as stderr:
-                    current['exit_code'] = run_owned(command['argv'], command['cwd'], command_envs[index], command['timeout_sec'], stdout, stderr)
-                current['status'] = 'finished'
-                current['ended_at'] = _now()
-            except BaseException as exc:
-                command_error = exc
-                current['status'] = exc.status if isinstance(exc, ProcessFailure) else ('cancelled' if isinstance(exc, KeyboardInterrupt) else 'collection_failed')
-                if isinstance(exc, ProcessFailure):
-                    current['exit_code'] = exc.exit_code
-                raise
-            finally:
-                # Partial bytes remain evidence even when launch, wait, or collection fails.
-                try:
-                    for name, path in (('stdout', out), ('stderr', err)):
-                        if path.is_file():
-                            current[name] = _log(path)
+        _persist()
+        for group, batch in _command_batches(manifest['commands']):
+            if group is None or max_parallel <= 1 or len(batch) <= 1:
+                for index, command in batch:
+                    out = output_dir / f'{index:04d}.stdout'
+                    err = output_dir / f'{index:04d}.stderr'
+                    rec = dict(
+                        command_id=command['id'],
+                        status='running',
+                        started_at=_now(),
+                        ended_at=None,
+                        exit_code=None,
+                        stdout=dict(path=str(out), bytes=None, sha256=None),
+                        stderr=dict(path=str(err), bytes=None, sha256=None),
+                    )
+                    with receipt_lock:
+                        receipt['commands'].append(rec)
+                        _write(receipt_path, receipt)
+                    _run_one(index, command, rec)
+            else:
+                records: list[tuple[int, dict, dict]] = []
+                with receipt_lock:
+                    for index, command in batch:
+                        out = output_dir / f'{index:04d}.stdout'
+                        err = output_dir / f'{index:04d}.stderr'
+                        rec = dict(
+                            command_id=command['id'],
+                            status='running',
+                            started_at=_now(),
+                            ended_at=None,
+                            exit_code=None,
+                            stdout=dict(path=str(out), bytes=None, sha256=None),
+                            stderr=dict(path=str(err), bytes=None, sha256=None),
+                        )
+                        receipt['commands'].append(rec)
+                        records.append((index, command, rec))
                     _write(receipt_path, receipt)
-                except BaseException as capture_error:
-                    raise ProcessFailure('collection_failed', f'primary={command_error!r}; capture={capture_error!r}', current['exit_code']) from capture_error
+                workers = min(max_parallel, len(records))
+                first_error: BaseException | None = None
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [pool.submit(_run_one, index, command, rec) for index, command, rec in records]
+                    for fut in futures:
+                        try:
+                            fut.result()
+                        except BaseException as exc:
+                            if first_error is None:
+                                first_error = exc
+                if first_error is not None:
+                    raise first_error
+
         receipt['artifact_after_digest'] = digest(recapture(manifest['artifact']))
         if receipt['artifact_after_digest'] != digest(manifest['artifact']):
             raise ProcessFailure('artifact_changed', 'source checkpoint differs after execution')
@@ -278,7 +441,10 @@ def collect(manifest_path: Path, output_dir: Path):
         receipt['status'] = exc.status if isinstance(exc, ProcessFailure) else ('cancelled' if isinstance(exc, KeyboardInterrupt) else 'collection_failed')
         receipt['error'] = f'{type(exc).__name__}: {exc}'
         # Incomplete records have no ended_at; never claim collection finished.
-    _write(receipt_path, receipt)
+    finally:
+        if keepalive is not None:
+            keepalive.stop()
+    _persist()
     return receipt
 
 
@@ -324,12 +490,31 @@ def validate_receipt(manifest: dict, receipt_path: Path, *, require_success: boo
         raise ValueError('receipt commands differ from manifest')
     evidence = [path]
     all_success = True
-    previous_end = start
+    previous_batch_end = start
+    batches = _command_batches(manifest['commands'])
+    batch_cursor = 0
+    current_batch_index = -1
+    current_batch_ends: list[datetime | None] = []
+    batch_index_by_cmd: list[int] = []
+    for b_idx, (_group, items) in enumerate(batches):
+        for _cmd_idx, _cmd in items:
+            batch_index_by_cmd.append(b_idx)
+
     for index, record in enumerate(commands):
+        b_idx = batch_index_by_cmd[index]
+        if b_idx != current_batch_index:
+            if current_batch_index >= 0:
+                if any(item is None for item in current_batch_ends):
+                    previous_batch_end = None
+                else:
+                    previous_batch_end = max(current_batch_ends)  # type: ignore[type-var]
+            current_batch_index = b_idx
+            current_batch_ends = []
+            batch_cursor = b_idx
         if not isinstance(record, dict) or record.get('command_id') != manifest['commands'][index]['id']:
             raise ValueError('receipt command order/identity mismatch')
         command_start = _timestamp(record.get('started_at'), 'command.started_at')
-        if previous_end is None or command_start < previous_end or (end is not None and command_start > end) or record.get('status') not in allowed:
+        if previous_batch_end is None or command_start < previous_batch_end or (end is not None and command_start > end) or record.get('status') not in allowed:
             raise ValueError('invalid command timing/status')
         command_finished = record['status'] == 'finished'
         code = record.get('exit_code')
@@ -339,9 +524,11 @@ def validate_receipt(manifest: dict, receipt_path: Path, *, require_success: boo
             command_end = _timestamp(record.get('ended_at'), 'command.ended_at')
             if code is None or command_end < command_start or (end is not None and command_end > end):
                 raise ValueError('finished command lacks real exit/timestamps')
+            current_batch_ends.append(command_end)
         elif record.get('ended_at') is not None:
             raise ValueError('incomplete command has completion timestamp')
-        previous_end = command_end if command_finished else None
+        else:
+            current_batch_ends.append(None)
         all_success = all_success and command_finished and code == 0
         for name in ('stdout', 'stderr'):
             log = record.get(name)
@@ -360,6 +547,7 @@ def validate_receipt(manifest: dict, receipt_path: Path, *, require_success: boo
                 evidence.append(output)
             elif log['bytes'] is not None or log['sha256'] is not None or command_finished:
                 raise ValueError('recorded output is missing')
+    del batch_cursor
     if finished and (len(commands) != len(manifest['commands']) or any(c['status'] != 'finished' for c in commands)):
         raise ValueError('finished receipt has incomplete commands')
     expected = digest(manifest['artifact'])
@@ -382,9 +570,16 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--manifest', required=True, type=Path)
     parser.add_argument('--output-dir', required=True, type=Path)
+    parser.add_argument('--heartbeat-url', default=None, type=str)
+    parser.add_argument('--heartbeat-interval-sec', default=60.0, type=float)
     args = parser.parse_args()
     try:
-        receipt = collect(args.manifest, args.output_dir)
+        receipt = collect(
+            args.manifest,
+            args.output_dir,
+            heartbeat_url=args.heartbeat_url,
+            heartbeat_interval_sec=args.heartbeat_interval_sec,
+        )
     except (OSError, ValueError) as exc:
         print(json.dumps(dict(status='collection_failed', error=str(exc)[:1000]), ensure_ascii=True))
         return 1
