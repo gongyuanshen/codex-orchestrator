@@ -230,7 +230,7 @@ flowchart LR
 
 - **工作区隔离模式**：
   - `mode="git_clone"` 需要在分配分支提交真实 commit SHA，并在验收/合入前保持工作树干净。
-  - 使用 [Git 2.36 或更新版本](https://git-scm.com/docs/git-worktree/2.36.0) 时，可在 `workspace_create` 或 `workflow_prepare_dispatch` 显式传入 `git_backend="worktree"`（或 `workflow_prepare_dispatch` 的 `workspace_base_mode="git_worktree"`），也可在直接启动守护进程时设置 `TRI_ORCH_GIT_BACKEND=worktree`，与原仓库共享 Git 对象和引用。复制未受版本管理的 `.env` 或依赖前，链接工作区的 Git 忽略规则须已覆盖这些路径；否则保持默认 clone。清理期间不要手动切换或移动工作区分支。
+  - 使用 [Git 2.36 或更新版本](https://git-scm.com/docs/git-worktree/2.36.0) 时，可在 `workspace_create` 或 `workflow_prepare_dispatch` 显式传入 `git_backend="worktree"`（或 `workflow_prepare_dispatch` 的 `workspace_base_mode="git_worktree"`），也可通过 `TRI_ORCH_GIT_BACKEND=worktree` 设为默认，与原仓库共享 Git 对象和引用。复制未受版本管理的 `.env` 或依赖前，链接工作区的 Git 忽略规则须已覆盖这些路径；否则保持默认 clone。清理期间不要手动切换或移动工作区分支。
   - `mode="snapshot"` 下 `branch_name=None` 属正常状态；合入前 `dirty=true` 表示相对基线存在改动，合入与清理按三方目录快照基线核验。
   - 两种模式均应先执行 `workspace_merge_preview`，再执行 `workspace_merge(strategy="merge")` 与 `workspace_cleanup`。
 - **本地环境文件**：不需要补拷 `.env` / `.env.local` 时传入 JSON 布尔值 `copy_env: false`，不是字符串 `"false"`。Git 模式已提交的文件仍按提交检出；快照里其他目录的文件按 `.triignore` 过滤。
@@ -362,7 +362,7 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
 
 ## 运行时环境变量
 
-> `plugin/.mcp.json` 的 `env_vars` 白名单会将 `CODEX_HOME`、`LOCALAPPDATA`、`USERPROFILE`、`HOME`、`PATH` 以及下表中对应 MCP/守护进程配置变量（`TRI_ORCH_HOST`、`TRI_ORCH_PORT`、`TRI_ORCH_DATA_DIR`、`TRI_ORCH_STALL_SEC`、`TRI_ORCH_WATCHDOG_INTERVAL_SEC`、`TRI_ORCH_PORT_RANGE`、`TRI_ORCH_MAX_SNAPSHOT_MB`、`TRI_ORCH_GC_INTERVAL_SEC`、`TRI_ORCH_RESULT_TTL_SEC`、`TRI_ORCH_RESULT_MAX_FILES`、`TRI_ORCH_WORKSPACE_RETENTION_SEC`）透传给 `mcp_shim` 与守护进程；`TRI_ORCH_HOOK_TIMEOUT_SEC` 与 `TRI_ORCH_BASE_URL` 仅作用于 `hooks.json` 拉起的 `tri-orchestrator-hook`；`TRI_ORCH_GIT_BACKEND` 与 `CODEX_BIN` 未列入 `.mcp.json` 白名单，分别作用于守护进程进程环境与宿主侧 `tri-orchestrator-challenge` CLI。
+> `plugin/.mcp.json` 的 `env_vars` 白名单会将 `CODEX_HOME`、`LOCALAPPDATA`、`USERPROFILE`、`HOME`、`PATH` 以及下表中所有 MCP/守护进程配置变量（`TRI_ORCH_HOST`、`TRI_ORCH_PORT`、`TRI_ORCH_DATA_DIR`、`TRI_ORCH_STALL_SEC`、`TRI_ORCH_WATCHDOG_INTERVAL_SEC`、`TRI_ORCH_PORT_RANGE`、`TRI_ORCH_MAX_SNAPSHOT_MB`、`TRI_ORCH_GC_INTERVAL_SEC`、`TRI_ORCH_RESULT_TTL_SEC`、`TRI_ORCH_RESULT_MAX_FILES`、`TRI_ORCH_WORKSPACE_RETENTION_SEC`、`TRI_ORCH_GIT_BACKEND`）透传给 `mcp_shim` 与守护进程；`TRI_ORCH_HOOK_TIMEOUT_SEC` 与 `TRI_ORCH_BASE_URL` 仅作用于 `hooks.json` 拉起的 `tri-orchestrator-hook`；`CODEX_BIN` 作用于宿主侧 `tri-orchestrator-challenge` CLI。
 
 | 变量名 | 默认值 | 说明 |
 | :--- | :--- | :--- |
@@ -377,7 +377,7 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
 | `TRI_ORCH_RESULT_TTL_SEC` | `86400` | `results/` 下 MCP 大结果缓存文件的保留时长（秒）。 |
 | `TRI_ORCH_RESULT_MAX_FILES` | `50` | `results/` 目录下最多保留的近期缓存文件数量。 |
 | `TRI_ORCH_WORKSPACE_RETENTION_SEC` | `86400` | 已完结轮次中已合入且无脏改动的 `.swarm-workspaces` 工作区保留时长（秒）。 |
-| `TRI_ORCH_GIT_BACKEND` | `clone` | 当 `git_backend="auto"` 时默认使用的 Git 工作区后端（`clone` 或 `worktree`；未列入 `.mcp.json` 白名单，仅在直接启动守护进程等继承该变量的环境中生效，经 Codex MCP 调起时请显式传参）。 |
+| `TRI_ORCH_GIT_BACKEND` | `clone` | 当 `git_backend="auto"` 时默认使用的 Git 工作区后端（`clone` 或 `worktree`）。 |
 | `TRI_ORCH_HOOK_TIMEOUT_SEC` | `1.2` | `tri-orchestrator-hook` 本地 RPC 默认超时（秒，硬上限 `1.5`）。 |
 | `TRI_ORCH_BASE_URL` | 空（按 `HOST`/`PORT` 拼装） | 可选显式覆盖 `tri-orchestrator-hook` 请求的守护进程基础 URL。 |
 | `CODEX_HOME` | `~/.codex` | Codex 本地目录路径；只读目录/模型桥接及安装卸载脚本据此定位状态库与 `agents/`。 |

@@ -905,3 +905,43 @@ def test_failed_control_keeps_actual_state(daemon_env, tmp_path):
     assert snapshot["workers"][0]["status"] == "working"
     assert snapshot["control_requests"][0]["status"] == "failed"
     assert snapshot["control_requests"][0]["result"] == "Native interrupt: target not found"
+
+
+@pytest.mark.parametrize(
+    ("os_name", "platform", "expected_cmd", "expect_new_session"),
+    [
+        ("nt", "win32", "explorer.exe", False),
+        ("posix", "darwin", "open", True),
+        ("posix", "linux", "xdg-open", True),
+    ],
+)
+def test_launch_explorer_cross_platform(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    os_name: str,
+    platform: str,
+    expected_cmd: str,
+    expect_new_session: bool,
+) -> None:
+    import orchestrator.daemon as daemon_mod
+
+    launched: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_popen(cmd, **kwargs):
+        launched.append((list(cmd), dict(kwargs)))
+        return object()
+
+    monkeypatch.setattr(daemon_mod.os, "name", os_name)
+    monkeypatch.setattr(daemon_mod.sys, "platform", platform)
+    monkeypatch.setattr(daemon_mod.shutil, "which", lambda name: f"/bin/{name}" if name == expected_cmd else None)
+    monkeypatch.setattr(daemon_mod.subprocess, "Popen", fake_popen)
+
+    target = tmp_path / "ws-dir"
+    target.mkdir()
+    daemon_mod._launch_explorer(target)
+
+    assert len(launched) == 1
+    cmd, kwargs = launched[0]
+    assert cmd == [f"/bin/{expected_cmd}", str(target)]
+    assert kwargs.get("close_fds") is True
+    assert kwargs.get("start_new_session", False) is expect_new_session

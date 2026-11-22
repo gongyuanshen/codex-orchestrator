@@ -46,3 +46,6 @@ def test_local_verification_collector_console_entry():
         'tri-orchestrator-hook': 'orchestrator.hook_runner:main',
         'tri-orchestrator-challenge': 'orchestrator.challenge_runner:main',
     }
+    mcp_cfg = json.loads((plugin / '.mcp.json').read_text(encoding='utf-8'))
+    env_vars = set(mcp_cfg['mcpServers']['tri_orchestrator']['env_vars'])
+    assert 'TRI_ORCH_GIT_BACKEND' in env_vars

@@ -13,6 +13,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -161,14 +162,26 @@ def _safe_filename_segment(raw: str) -> str:
 
 
 def _launch_explorer(target_dir: Path) -> None:
-    """Launch Windows Explorer on a validated directory without shell interpolation."""
-    explorer_bin = shutil.which("explorer.exe") or "explorer.exe"
+    """Open a validated directory in the platform file manager without shell interpolation."""
+    if os.name == "nt":
+        explorer_bin = shutil.which("explorer.exe") or "explorer.exe"
+        subprocess.Popen(
+            [explorer_bin, str(target_dir)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return
+    cmd_name = "open" if sys.platform == "darwin" else "xdg-open"
+    opener_bin = shutil.which(cmd_name) or cmd_name
     subprocess.Popen(
-        [explorer_bin, str(target_dir)],
+        [opener_bin, str(target_dir)],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=True,
+        start_new_session=True,
     )
 
 

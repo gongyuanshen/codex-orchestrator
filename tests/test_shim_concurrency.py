@@ -334,3 +334,25 @@ def test_wrong_daemon_identity_rejected(tmp_path):
         server.shutdown()
         thread.join()
         server.server_close()
+
+
+def test_posix_detached_daemon_starts_new_session(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    import orchestrator.mcp_shim as shim
+
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_popen(cmd, **kwargs):
+        calls.append((list(cmd), dict(kwargs)))
+        return object()
+
+    cfg = Settings(host="127.0.0.1", port=18790, data_dir=tmp_path / "posix-data")
+    monkeypatch.setattr(shim, "os", SimpleNamespace(name="posix", environ=os.environ))
+    monkeypatch.setattr(shim.subprocess, "Popen", fake_popen)
+
+    shim._spawn_detached_daemon(cfg)
+
+    assert len(calls) == 1
+    _, kwargs = calls[0]
+    assert kwargs.get("start_new_session") is True
+    assert kwargs.get("close_fds") is True

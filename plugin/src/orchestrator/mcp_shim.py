@@ -318,6 +318,7 @@ def _spawn_detached_daemon(settings: Settings):
     with settings.daemon_log_path.open("ab") as log_fh:
         return subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log_fh,
                                 stderr=log_fh, env=env, close_fds=True,
+                                start_new_session=True,
                                 cwd=str(settings.data_dir))
 
 
