@@ -72,7 +72,7 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
     assert {path.parent.name for path in skill_paths} == {"boost", "teamwork", "swarm"}
     for path in list((ROOT / "agents").glob("*.toml")) + skill_paths:
         text = path.read_text(encoding="utf-8")
-        assert "workflow5" in text and "0.6.8/schema10" in text, path
+        assert "workflow5" in text and "0.6.9/schema10" in text, path
         assert "workflow0..4" in text, path
         assert "board_status.workflow.workflow_version" in text, path
     for path in skill_paths:
@@ -81,7 +81,7 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
         assert f"name: {path.parent.name}" in text, path
         assert "../route-a-workflow.md" in text, path
     shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
-    assert "workflow5" in shared and "0.6.8/schema10" in shared
+    assert "workflow5" in shared and "0.6.9/schema10" in shared
     assert 'artifact_id=candidate["id"]' in shared
     assert 'recipient_agent_id=next_coordinator_agent_id' in shared
     assert "admission precedes native implementation dispatch" in shared

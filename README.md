@@ -75,7 +75,7 @@ bash scripts/install.sh
 
 关闭 Codex 不会结束已分离的守护进程。若后台仍在运行，从对应数据目录的 `daemon.pid.json` 读取 URL 和 PID，与该 URL 的 `/api/health` 返回的 `pid`、`data_dir` 核对后，只停止这一进程（Windows `Stop-Process -Id`，macOS/Linux `kill -TERM`）。迁移期间不要用其他程序写入运行库。
 
-**版本之间数据库结构相同**（例如 `0.6.7 → 0.6.8`，均为 schema 10）时，不必运行迁移脚本，直接按下面的方式更新插件。
+**版本之间数据库结构相同**（例如 `0.6.7 / 0.6.8 → 0.6.9`，均为 schema 10）时，不必运行迁移脚本，直接按下面的方式更新插件。
 
 **数据库结构较旧**（例如 `0.6.0 / 0.6.1 → schema 10`）时，先检出**目标版本**的源码，从仓库根目录用该版本的 Python 环境准备备份并离线迁移。将命令中的目录替换为实际路径；`<old-plugin-dir>` 是旧版已安装缓存，`<backup-dir>` 是一个新目录。使用非默认端口时为 `prepare` 加上 `--port`：
 

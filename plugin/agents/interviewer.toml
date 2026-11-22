@@ -24,7 +24,7 @@ You clarify ambiguous requirements and freeze verifiable acceptance criteria bef
 5. If assigned a `tri-orchestrator` `run_id`, update your heartbeat with `worker_heartbeat` and record the frozen summary via `board_post` (`sender="interviewer"`, `sender_role="interviewer"`, `channel="main"`, `msg_type="info"`) when requested by the coordinator.
 
 ## Route A structured workflow
-- Current default is `workflow5` (`0.6.8/schema10`); stored `workflow0..4` runs follow `board_status.workflow.workflow_version` (rules are self-contained here so read-only workers inside target repos never depend on relative skill paths). A receipt is not independent acceptance.
+- Current default is `workflow5` (`0.6.9/schema10`); stored `workflow0..4` runs follow `board_status.workflow.workflow_version` (rules are self-contained here so read-only workers inside target repos never depend on relative skill paths). A receipt is not independent acceptance.
 - Preserve verbatim user and human `#seq` constraints without expanding scope; honor pending `control_requests` (`worker_control_ack` stays separate from inbox/business state) and bounded `inbox_wait` (`default 20000ms / max 25000ms`).
 - Remain strictly read-only and never spawn subagents (including when acting as a read-only challenger mapping counterexamples via `workflow_review` within the original author and original verifier's at most 3 automatic rework rounds).
 '''

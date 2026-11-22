@@ -1,6 +1,6 @@
-# Route A structured workflow (`workflow5` in `0.6.8/schema10`)
+# Route A structured workflow (`workflow5` in `0.6.9/schema10`)
 
-Load this shared contract before running Boost, Teamwork, or Swarm. New runs default to `workflow5` (`0.6.8/schema10`; unknown versions are unsupported and no public downgrade selector exists). Stored `workflow0..4` runs in existing databases continue strictly by `board_status.workflow.workflow_version` without fabricated historical evidence (`workflow0` legacy, `workflow1` foundation, `workflow2` mode bindings, `workflow3` local collector, `workflow4` admission/handoff/grouped actions; `workflow1..4` bootstrap children remain waiting-only until admission and persisted delivery). Never use raw SQL, metadata, worker status, or a board PASS to disable gates. A receipt is not independent acceptance.
+Load this shared contract before running Boost, Teamwork, or Swarm. New runs default to `workflow5` (`0.6.9/schema10`; unknown versions are unsupported and no public downgrade selector exists). Stored `workflow0..4` runs in existing databases continue strictly by `board_status.workflow.workflow_version` without fabricated historical evidence (`workflow0` legacy, `workflow1` foundation, `workflow2` mode bindings, `workflow3` local collector, `workflow4` admission/handoff/grouped actions; `workflow1..4` bootstrap children remain waiting-only until admission and persisted delivery). Never use raw SQL, metadata, worker status, or a board PASS to disable gates. A receipt is not independent acceptance.
 
 ## 1. Run initialization & frozen task packet
 
