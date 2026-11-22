@@ -145,6 +145,10 @@ run_py() {
   fi
 }
 
+replace_file() {
+  run_py -c 'from pathlib import Path; import sys; Path(sys.argv[1]).replace(sys.argv[2])' "$1" "$2"
+}
+
 # Resolve repo vs direct/cached plugin layout
 HAS_MARKETPLACE_LAYOUT=0
 if [ -n "$PLUGIN_DIR" ]; then
@@ -224,6 +228,7 @@ PY
 ROLE_FILES="interviewer.toml planner.toml investigator.toml coder.toml verifier.toml swarm_worker.toml"
 AGENTS_SRC_DIR="$PLUGIN_DIR/agents"
 AGENTS_DST_DIR="$CODEX_HOME_DIR/agents"
+CONFIG_PATH="$CODEX_HOME_DIR/config.toml"
 if [ ! -d "$AGENTS_SRC_DIR" ]; then
   echo "Missing plugin agents directory: $AGENTS_SRC_DIR" >&2
   exit 1
@@ -246,11 +251,12 @@ assert d.get("name") and d.get("description") and d.get("developer_instructions"
 PY
 done
 
-run_py - "$AGENTS_DST_DIR" $ROLE_FILES <<'PY'
+CONFIG_EXISTED="$(run_py - "$CONFIG_PATH" "$AGENTS_DST_DIR" $ROLE_FILES <<'PY'
 import pathlib, stat, sys
 
-agents = pathlib.Path(sys.argv[1])
-destinations = [(agents, stat.S_ISDIR), *((agents / name, stat.S_ISREG) for name in sys.argv[2:])]
+config, agents = map(pathlib.Path, sys.argv[1:3])
+destinations = [(config, stat.S_ISREG), (agents, stat.S_ISDIR), *((agents / name, stat.S_ISREG) for name in sys.argv[3:])]
+config_existed = False
 for path, is_expected_type in destinations:
     try:
         metadata = path.lstat()
@@ -258,17 +264,15 @@ for path, is_expected_type in destinations:
         continue
     reparse = getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     if reparse or not is_expected_type(metadata.st_mode):
-        raise SystemExit(f"Expected a regular agents directory or role file, not a link or another file type: {path}")
+        raise SystemExit(f"Expected a regular file or agents directory, not a link or another file type: {path}")
+    if path == config:
+        config_existed = True
+print(int(config_existed))
 PY
+)"
 
 CODEX_BIN="$(resolve_codex "$CODEX_HOME_DIR")"
 echo "[install] Using codex: $CODEX_BIN"
-
-CONFIG_PATH="$CODEX_HOME_DIR/config.toml"
-CONFIG_EXISTED=0
-if [ -f "$CONFIG_PATH" ]; then
-  CONFIG_EXISTED=1
-fi
 
 STAGE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/tri-orch-cfg.XXXXXX")"
 cleanup_stage() {
@@ -280,14 +284,14 @@ CANDIDATE_CONFIG="$STAGE_DIR/config.toml"
 AGENTS_META_JSON="$STAGE_DIR/agents_meta.json"
 
 # Safely merge [agents] and [features] in config.toml and validate with tomllib
-run_py - "$CONFIG_PATH" "$CANDIDATE_CONFIG" "$AGENTS_META_JSON" <<'PY'
+run_py - "$CONFIG_PATH" "$CANDIDATE_CONFIG" "$AGENTS_META_JSON" "$CONFIG_EXISTED" <<'PY'
 import json, pathlib, re, sys, tomllib
 
 cfg_path = pathlib.Path(sys.argv[1])
 out_path = pathlib.Path(sys.argv[2])
 meta_path = pathlib.Path(sys.argv[3])
 
-text = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
+text = cfg_path.read_text(encoding="utf-8") if sys.argv[4] == "1" else ""
 nl = "\r\n" if "\r\n" in text else "\n"
 lines = text.splitlines() if text else []
 
@@ -436,7 +440,7 @@ for rf in $ROLE_FILES; do
   # Replace the directory entry so a hard-linked copy elsewhere keeps its original bytes.
   tmp_role="$(mktemp "$AGENTS_DST_DIR/.$rf.XXXXXX")"
   cp -f "$src_file" "$tmp_role"
-  run_py -c 'from pathlib import Path; import sys; Path(sys.argv[1]).replace(sys.argv[2])' "$tmp_role" "$dst_file"
+  replace_file "$tmp_role" "$dst_file"
   INSTALLED_AGENTS_LIST="${INSTALLED_AGENTS_LIST}${INSTALLED_AGENTS_LIST:+,}$rf"
 done
 
@@ -453,10 +457,10 @@ PY
 fi
 echo "[install] Installed 6 agent role TOMLs into $AGENTS_DST_DIR"
 
-# Atomically install merged config.toml
-tmp_cfg="$CONFIG_PATH.tmp.$$"
+# Replace the exact config path; mv can treat a directory there as a container.
+tmp_cfg="$(mktemp "$CONFIG_PATH.tmp.XXXXXX")"
 cp -f "$CANDIDATE_CONFIG" "$tmp_cfg"
-mv -f "$tmp_cfg" "$CONFIG_PATH"
+replace_file "$tmp_cfg" "$CONFIG_PATH"
 echo "[install] Updated [agents] in $CONFIG_PATH (strict-config verified)"
 
 run_py - "$BACKUP_DIR/manifest.json" "$TIMESTAMP" "$REPO_ROOT" "$PLUGIN_DIR" "$CODEX_HOME_DIR" "$CONFIG_EXISTED" "$BACKED_UP_AGENTS_LIST" "$INSTALLED_AGENTS_LIST" "$AGENTS_META_JSON" <<'PY'
@@ -845,7 +849,7 @@ hooks_data = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 hooks = hooks_data.get("hooks", [])
 config_path = pathlib.Path(sys.argv[2])
 out_path = pathlib.Path(sys.argv[3])
-toml_text = config_path.read_text(encoding="utf-8") if config_path.is_file() else ""
+toml_text = config_path.read_text(encoding="utf-8")
 
 entries = []
 for h in sorted(hooks, key=lambda item: (item.get("displayOrder", 999), item.get("key", ""))):
@@ -939,9 +943,9 @@ PY
         echo "$strict_hooks_out" >&2
         exit 1
       fi
-      tmp_dest="$CONFIG_PATH.tmp.$$"
+      tmp_dest="$(mktemp "$CONFIG_PATH.tmp.XXXXXX")"
       cp -f "$tmp_trusted" "$tmp_dest"
-      mv -f "$tmp_dest" "$CONFIG_PATH"
+      replace_file "$tmp_dest" "$CONFIG_PATH"
 
       probe_hooks_list_json "$probe_cwd" > "$hooks_json"
       run_py - "$hooks_json" <<'PY'

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 import httpx
@@ -462,10 +465,11 @@ def test_rpc_full_workflow_snapshot_diff_safe_actions_and_export(
 
     # Open Explorer validation & mocked launch
     launched_paths: list[Path] = []
-    monkeypatch.setattr(
-        "orchestrator.daemon._launch_explorer",
-        lambda p: launched_paths.append(p),
-    )
+    async def launch_explorer(path, _opener_tasks):
+        launched_paths.append(path)
+        return True
+
+    monkeypatch.setattr("orchestrator.daemon._launch_explorer", launch_explorer)
     exp_resp = client.post(f"/api/workspaces/{ws_id}/open-explorer", json={})
     assert exp_resp.status_code == 200
     assert launched_paths == [ws_path.resolve(strict=False)]
@@ -907,41 +911,185 @@ def test_failed_control_keeps_actual_state(daemon_env, tmp_path):
     assert snapshot["control_requests"][0]["result"] == "Native interrupt: target not found"
 
 
+@pytest.fixture
+def explorer_route(daemon_env, tmp_path):
+    _, server, client = daemon_env
+    target = tmp_path / ".swarm-workspaces" / "workspace with spaces"
+    target.mkdir(parents=True)
+    db = server.app.state.db
+    run = db.create_run(project_root=tmp_path, is_git=False, mode="swarm", title="Opener")
+    workspace = db.create_workspace(run["id"], "coder", path=target, mode="snapshot")
+    return client, f"/api/workspaces/{workspace['id']}/open-explorer", target.resolve()
+
+
 @pytest.mark.parametrize(
-    ("os_name", "platform", "expected_cmd", "expect_new_session"),
+    ("platform", "expected_command", "code", "expected_status"),
     [
-        ("nt", "win32", "explorer.exe", False),
-        ("posix", "darwin", "open", True),
-        ("posix", "linux", "xdg-open", True),
+        ("linux", "xdg-open", 4, 500),
+        ("linux", "xdg-open", None, 500),
+        ("linux", "xdg-open", 0, 200),
+        ("darwin", "open", 0, 200),
     ],
 )
-def test_launch_explorer_cross_platform(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    os_name: str,
-    platform: str,
-    expected_cmd: str,
-    expect_new_session: bool,
-) -> None:
+def test_open_explorer_reports_child_result(explorer_route, monkeypatch, platform, expected_command, code, expected_status):
     import orchestrator.daemon as daemon_mod
 
-    launched: list[tuple[list[str], dict[str, object]]] = []
+    client, url, target = explorer_route
+    monkeypatch.setattr(daemon_mod, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(daemon_mod, "sys", SimpleNamespace(platform=platform))
+    def spawn(args, **kwargs):
+        assert args == [expected_command, str(target)]
+        assert kwargs.get("shell", False) is False
+        assert kwargs["start_new_session"] is True
+        assert kwargs["close_fds"] is True
+        if code is None:
+            raise FileNotFoundError("test opener not on PATH")
+        return subprocess.Popen([sys.executable, "-c", f"raise SystemExit({code})", args[1]], **kwargs)
 
-    def fake_popen(cmd, **kwargs):
-        launched.append((list(cmd), dict(kwargs)))
-        return object()
+    monkeypatch.setattr(daemon_mod, "subprocess", SimpleNamespace(Popen=spawn, DEVNULL=subprocess.DEVNULL))
+    response = client.post(url, json={})
+    assert response.status_code == expected_status, response.text
+    payload = response.json()
+    assert payload["ok"] is (code == 0)
+    if code == 0:
+        assert payload["status"] == "accepted"
+        assert payload["path"] == str(target)
+    elif code is None:
+        assert "Failed to start xdg-open" in payload["detail"]
+        assert "test opener not on PATH" in payload["detail"]
+    else:
+        assert "xdg-open exited with status 4" in payload["detail"]
 
-    monkeypatch.setattr(daemon_mod.os, "name", os_name)
-    monkeypatch.setattr(daemon_mod.sys, "platform", platform)
-    monkeypatch.setattr(daemon_mod.shutil, "which", lambda name: f"/bin/{name}" if name == expected_cmd else None)
-    monkeypatch.setattr(daemon_mod.subprocess, "Popen", fake_popen)
 
-    target = tmp_path / "ws-dir"
-    target.mkdir()
-    daemon_mod._launch_explorer(target)
+@pytest.mark.parametrize("shell_error", [False, True])
+def test_open_explorer_uses_windows_shell_result(explorer_route, monkeypatch, shell_error):
+    import orchestrator.daemon as daemon_mod
 
-    assert len(launched) == 1
-    cmd, kwargs = launched[0]
-    assert cmd == [f"/bin/{expected_cmd}", str(target)]
-    assert kwargs.get("close_fds") is True
-    assert kwargs.get("start_new_session", False) is expect_new_session
+    client, url, target = explorer_route
+    calls = []
+
+    def startfile(path, operation):
+        calls.append((path, operation))
+        if shell_error:
+            raise PermissionError("Explorer refused test directory")
+
+    monkeypatch.setattr(daemon_mod, "os", SimpleNamespace(name="nt", startfile=startfile))
+    response = client.post(url, json={})
+    assert calls == [(str(target), "explore")]
+    assert response.status_code == (500 if shell_error else 200), response.text
+    assert response.json()["ok"] is not shell_error
+    if shell_error:
+        assert "Explorer refused test directory" in response.json()["detail"]
+    else:
+        assert response.json()["status"] == "accepted"
+
+
+def test_open_explorer_checks_exit_at_wait_deadline(explorer_route, monkeypatch):
+    import orchestrator.daemon as daemon_mod
+
+    client, url, _ = explorer_route
+    monkeypatch.setattr(daemon_mod, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(daemon_mod, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(daemon_mod, "_DIRECTORY_OPENER_WAIT_SECONDS", 0.01)
+    polls = iter([None])
+    process = SimpleNamespace(poll=lambda: next(polls, 4))
+    monkeypatch.setattr(daemon_mod, "subprocess", SimpleNamespace(Popen=lambda *a, **kw: process, DEVNULL=subprocess.DEVNULL))
+
+    response = client.post(url, json={})
+
+    assert response.status_code == 500, response.text
+    assert "xdg-open exited with status 4" in response.json()["detail"]
+
+
+def test_open_explorer_returns_pending_without_killing_the_child(explorer_route, tmp_path, monkeypatch, caplog, capfd):
+    import orchestrator.daemon as daemon_mod
+
+    client, url, target = explorer_route
+    monkeypatch.setattr(daemon_mod, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(daemon_mod, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(daemon_mod, "_DIRECTORY_OPENER_WAIT_SECONDS", 0.05)
+    release = tmp_path / "release-opener"
+    script = (
+        "from pathlib import Path\nimport sys, time\n"
+        "release = Path(sys.argv[1])\ndeadline = time.monotonic() + 5\n"
+        "while not release.exists() and time.monotonic() < deadline:\n    time.sleep(0.01)\n"
+        "print('test opener diagnostics', file=sys.stderr)\n"
+        "raise SystemExit(7 if release.exists() else 9)\n"
+    )
+    processes = []
+
+    def spawn(args, **kwargs):
+        assert args == ["xdg-open", str(target)]
+        process = subprocess.Popen([sys.executable, "-c", script, str(release)], **kwargs)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(daemon_mod, "subprocess", SimpleNamespace(Popen=spawn, DEVNULL=subprocess.DEVNULL))
+    try:
+        response = client.post(url, json={})
+        assert response.status_code == 202, response.text
+        assert response.json() == {
+            "ok": False, "status": "pending", "workspace_id": url.split("/")[-2], "path": str(target),
+        }
+        assert processes[0].returncode is None
+    finally:
+        release.touch()
+    deadline = time.monotonic() + 5
+    while "xdg-open exited with status 7" not in caplog.text and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert processes[0].returncode == 7
+    assert "xdg-open exited with status 7" in caplog.text
+    assert "test opener diagnostics" in capfd.readouterr().err
+
+
+def test_detached_directory_opener_survives_daemon_shutdown(tmp_path):
+    release = tmp_path / "release"
+    receipt = tmp_path / "finished"
+    child = tmp_path / "file_manager.py"
+    child.write_text(
+        "from pathlib import Path\nimport sys, time\n"
+        "release, receipt = map(Path, sys.argv[1:])\ndeadline = time.monotonic() + 8\n"
+        "while not release.exists() and time.monotonic() < deadline:\n    time.sleep(0.01)\n"
+        "if release.exists():\n    receipt.write_text('survived', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    runner = """
+import asyncio, gc, subprocess, sys
+from pathlib import Path
+from types import SimpleNamespace
+from orchestrator import daemon
+
+daemon.os = SimpleNamespace(name="posix")
+daemon.sys = SimpleNamespace(platform="linux")
+daemon._DIRECTORY_OPENER_WAIT_SECONDS = 0.05
+child_args = [sys.executable, *sys.argv[1:]]
+real_create = asyncio.create_subprocess_exec
+async def create_async(*args, **kwargs):
+    return await real_create(*child_args, **kwargs)
+asyncio.create_subprocess_exec = create_async
+daemon.subprocess = SimpleNamespace(
+    Popen=lambda args, **kwargs: subprocess.Popen(child_args, **kwargs),
+    DEVNULL=subprocess.DEVNULL,
+)
+
+async def main():
+    assert not await daemon._launch_explorer(Path(sys.argv[1]).parent, set())
+
+asyncio.run(main(), debug=True)
+gc.collect()
+"""
+    env = os.environ | {"PYTHONPATH": str(Path(__file__).resolve().parents[1] / "plugin" / "src")}
+    with (tmp_path / "daemon.log").open("wb") as log, subprocess.Popen(
+        [sys.executable, "-c", runner, str(child), str(release), str(receipt)],
+        env=env,
+        stdout=log,
+        stderr=log,
+    ) as daemon_process:
+        try:
+            assert daemon_process.wait(timeout=5) == 0
+        finally:
+            release.touch()
+    deadline = time.monotonic() + 2
+    while not receipt.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert receipt.exists(), (tmp_path / "daemon.log").read_text(encoding="utf-8")

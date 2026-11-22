@@ -63,6 +63,8 @@ powershell -ExecutionPolicy Bypass -File scripts/install.ps1
 
 **macOS / Linux（Bash）：**
 
+脚本要求 `config.toml` 不存在或为普通文件。符号链接、目录和其他非普通文件会在写入配置、角色或备份前报错。
+
 ```bash
 bash scripts/install.sh
 # 如需在 CLI 中直接写入钩子信任哈希，可附加 --trust-plugin-hooks
@@ -75,7 +77,7 @@ bash scripts/install.sh
 
 关闭 Codex 不会结束已分离的守护进程。若后台仍在运行，从对应数据目录的 `daemon.pid.json` 读取 URL 和 PID，与该 URL 的 `/api/health` 返回的 `pid`、`data_dir` 核对后，只停止这一进程（Windows `Stop-Process -Id`，macOS/Linux `kill -TERM`）。迁移期间不要用其他程序写入运行库。
 
-**版本之间数据库结构相同**（例如 `0.6.7 / 0.6.8 → 0.6.9`，均为 schema 10）时，不必运行迁移脚本，直接按下面的方式更新插件。
+**版本之间数据库结构相同**（例如 `0.6.7 / 0.6.8 / 0.6.9 → 0.6.10`，均为 schema 10）时，不必运行迁移脚本，直接按下面的方式更新插件。
 
 **数据库结构较旧**（例如 `0.6.0 / 0.6.1 → schema 10`）时，先检出**目标版本**的源码，从仓库根目录用该版本的 Python 环境准备备份并离线迁移。将命令中的目录替换为实际路径；`<old-plugin-dir>` 是旧版已安装缓存，`<backup-dir>` 是一个新目录。使用非默认端口时为 `prepare` 加上 `--port`：
 
@@ -230,7 +232,7 @@ flowchart LR
 
 - **工作区隔离模式**：
   - `mode="git_clone"` 需要在分配分支提交真实 commit SHA，并在验收/合入前保持工作树干净。
-  - 使用 [Git 2.36 或更新版本](https://git-scm.com/docs/git-worktree/2.36.0) 时，可在 `workspace_create` 或 `workflow_prepare_dispatch` 显式传入 `git_backend="worktree"`（或 `workflow_prepare_dispatch` 的 `workspace_base_mode="git_worktree"`），也可通过 `TRI_ORCH_GIT_BACKEND=worktree` 设为默认，与原仓库共享 Git 对象和引用。复制未受版本管理的 `.env` 或依赖前，链接工作区的 Git 忽略规则须已覆盖这些路径；否则保持默认 clone。清理期间不要手动切换或移动工作区分支。
+  - 使用 [Git 2.36 或更新版本](https://git-scm.com/docs/git-worktree/2.36.0) 时，可在 `workspace_create` 或 `workflow_prepare_dispatch` 显式传入 `git_backend="worktree"`，与原仓库共享 Git 对象和引用。`workflow_prepare_dispatch` 的 `workspace_base_mode="git_worktree"` 也可为 `auto` 选择 worktree；要改后台默认值，见[运行时环境变量](#运行时环境变量)。复制未受版本管理的 `.env` 或依赖前，链接工作区的 Git 忽略规则须已覆盖这些路径；否则保持默认 clone。清理期间不要手动切换或移动工作区分支。
   - `mode="snapshot"` 下 `branch_name=None` 属正常状态；合入前 `dirty=true` 表示相对基线存在改动，合入与清理按三方目录快照基线核验。
   - 两种模式均应先执行 `workspace_merge_preview`，再执行 `workspace_merge(strategy="merge")` 与 `workspace_cleanup`。
 - **本地环境文件**：不需要补拷 `.env` / `.env.local` 时传入 JSON 布尔值 `copy_env: false`，不是字符串 `"false"`。Git 模式已提交的文件仍按提交检出；快照里其他目录的文件按 `.triignore` 过滤。
@@ -377,11 +379,13 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
 | `TRI_ORCH_RESULT_TTL_SEC` | `86400` | `results/` 下 MCP 大结果缓存文件的保留时长（秒）。 |
 | `TRI_ORCH_RESULT_MAX_FILES` | `50` | `results/` 目录下最多保留的近期缓存文件数量。 |
 | `TRI_ORCH_WORKSPACE_RETENTION_SEC` | `86400` | 已完结轮次中已合入且无脏改动的 `.swarm-workspaces` 工作区保留时长（秒）。 |
-| `TRI_ORCH_GIT_BACKEND` | `clone` | 当 `git_backend="auto"` 时默认使用的 Git 工作区后端（`clone` 或 `worktree`）。 |
+| `TRI_ORCH_GIT_BACKEND` | `clone` | 新启动的守护进程为 `git_backend="auto"` 使用的 Git 工作区后端（`clone` 或 `worktree`）。 |
 | `TRI_ORCH_HOOK_TIMEOUT_SEC` | `1.2` | `tri-orchestrator-hook` 本地 RPC 默认超时（秒，硬上限 `1.5`）。 |
 | `TRI_ORCH_BASE_URL` | 空（按 `HOST`/`PORT` 拼装） | 可选显式覆盖 `tri-orchestrator-hook` 请求的守护进程基础 URL。 |
 | `CODEX_HOME` | `~/.codex` | Codex 本地目录路径；只读目录/模型桥接及安装卸载脚本据此定位状态库与 `agents/`。 |
 | `CODEX_BIN` | `codex`（Windows 优先自动探测 `codex.exe`） | `tri-orchestrator-challenge` 宿主侧盲审使用的 Codex CLI 路径（也可通过 `--codex-bin` 覆盖）。 |
+
+**切换 Git 工作区的默认后端：** 在启动承载插件的 Codex 进程前设置变量，例如 Bash 中运行 `TRI_ORCH_GIT_BACKEND=worktree codex`，PowerShell 中运行 `$env:TRI_ORCH_GIT_BACKEND = 'worktree'; codex`。从桌面启动时，变量也须由桌面 Codex 进程继承；安装脚本不会持久化该设置。已有健康守护进程会被复用，仅重开 Codex 或切换会话不会更新它的环境。等活跃任务结束后，按[升级步骤](#从旧版升级)核对并停止旧后台，再从带有新变量的环境启动 Codex。无需重启就想覆盖单次请求时，显式传入 `git_backend="clone"` 或 `git_backend="worktree"`。
 
 ---
 

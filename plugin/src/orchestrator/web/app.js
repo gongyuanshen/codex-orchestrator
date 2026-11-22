@@ -5347,7 +5347,13 @@
           body: JSON.stringify({}),
         });
         if (version !== state.contextVersion) return;
-        showToast('已打开本地目录', resp?.path || '已在资源管理器中打开隔离工作区目录。', 'success', 3000);
+        if (resp.status === 'accepted') {
+          showToast('已提交打开请求', resp.path, 'success', 3000);
+        } else if (resp.status === 'pending') {
+          showToast('尚未确认目录打开结果', '本地文件管理器尚未返回结果，请在桌面查看。', 'info');
+        } else {
+          throw new Error('服务端未返回打开请求的处理状态。');
+        }
       }
     } catch (err) {
       if (version !== state.contextVersion) return;

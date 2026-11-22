@@ -126,7 +126,7 @@ def _query_appserver_hooks_list(codex_exe: Path, codex_home: Path, cwd: Path) ->
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "test-m9b-hooks-list", "version": "0.6.9"},
+                    "clientInfo": {"name": "test-m9b-hooks-list", "version": "0.6.10"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -199,7 +199,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     assert manifest_path.is_file()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["name"] == "tri-orchestrator"
-    assert manifest["version"] == "0.6.9"
+    assert manifest["version"] == "0.6.10"
     assert manifest["hooks"] == "./hooks/hooks.json"
     assert manifest["skills"] == "./skills/"
     assert manifest["mcpServers"] == "./.mcp.json"
@@ -253,7 +253,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     spec.loader.exec_module(upgrade_mod)
     assert upgrade_mod.package_identity(PLUGIN_DIR) == {
         "name": "tri-orchestrator",
-        "version": "0.6.9",
+        "version": "0.6.10",
     }
     assert "pipeline_runner_v1" not in UPGRADE_PY.read_text(encoding="utf-8")
 
@@ -273,7 +273,7 @@ def test_install_ps1_rejects_legacy_dual_manifest(tmp_path: Path) -> None:
     )
     shutil.copy2(PLUGIN_DIR / "hooks" / "hooks.json", fake_plugin / "hooks" / "hooks.json")
     # Re-introduce a stale root plugin.json to confirm fail-closed detection
-    (fake_plugin / "plugin.json").write_text('{"name": "tri-orchestrator", "version": "0.6.9"}\n', encoding="utf-8")
+    (fake_plugin / "plugin.json").write_text('{"name": "tri-orchestrator", "version": "0.6.10"}\n', encoding="utf-8")
 
     codex_home = tmp_path / "codex_home"
     env = dict(
@@ -383,7 +383,7 @@ def test_real_install_hooks_list_trust_and_uninstall_e2e(tmp_path: Path) -> None
         / "cache"
         / "tri-orchestrator"
         / "tri-orchestrator"
-        / "0.6.9"
+        / "0.6.10"
         / ".venv"
         / "Scripts"
     )
@@ -552,6 +552,11 @@ def test_install_sh_registers_plugin_and_verifies_hook_trust(tmp_path: Path, tru
     shutil.copyfile(REPO_ROOT / marketplace, repo / marketplace)
     shutil.copytree(PLUGIN_DIR, repo / "plugin", ignore=shutil.ignore_patterns(".venv", "__pycache__"))
     codex_home = tmp_path / "codex"
+    config_path = codex_home / "config.toml"
+    original_config = b'model = "gpt-5.2"\n'
+    if trust:
+        codex_home.mkdir()
+        config_path.write_bytes(original_config)
     isolated_home = tmp_path / "home"
     isolated_home.mkdir()
     data_dir = tmp_path / "data"
@@ -568,8 +573,20 @@ def test_install_sh_registers_plugin_and_verifies_hook_trust(tmp_path: Path, tru
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Verified plugin: tri-orchestrator@tri-orchestrator" in result.stdout
     assert "Verified MCP   : tri_orchestrator" in result.stdout
-    config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    installed_config = config_path.read_bytes()
+    config = tomllib.loads(installed_config.decode("utf-8"))
     assert len(config.get("hooks", {}).get("state", {})) == (4 if trust else 0)
+    if trust:
+        assert config["model"] == "gpt-5.2"
+        baseline = codex_home / "backups" / "tri-orchestrator-baseline" / "config.toml"
+        assert baseline.read_bytes() == original_config
+        reinstall = subprocess.run(
+            [*cmd, "--skip-plugin-install"],
+            env=env, cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=90,
+        )
+        assert reinstall.returncode == 0, reinstall.stdout + reinstall.stderr
+        assert config_path.read_bytes() == installed_config
+        assert baseline.read_bytes() == original_config
     assert not data_dir.exists(), "Registry and hooks/list checks must not start the daemon"
 
 
@@ -614,6 +631,60 @@ def test_install_sh_does_not_write_through_role_links(tmp_path: Path, layout: st
         assert result.returncode != 0, result.stdout + result.stderr
         assert not (codex_home / "config.toml").exists()
         assert not (codex_home / "backups").exists()
+
+
+@pytest.mark.parametrize("layout", ["directory", "symlink", "dangling-link", "junction", "fifo"])
+def test_install_sh_rejects_nonregular_config_before_writing(tmp_path: Path, layout: str) -> None:
+    bash = _resolve_bash()
+    if not bash or not Path(bash).is_file() or not shutil.which("uv"):
+        pytest.skip("Requires Bash and uv")
+
+    codex = tmp_path / "codex-stub"
+    codex.write_bytes(b"#!/usr/bin/env bash\nexit 0\n")
+    codex.chmod(0o755)
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    config = codex_home / "config.toml"
+    target = tmp_path / "original"
+    if layout == "directory":
+        config.mkdir()
+    elif layout in {"symlink", "dangling-link"}:
+        if layout == "symlink":
+            target.write_bytes(b'model = "user-model"\n')
+        try:
+            config.symlink_to(target)
+        except OSError as exc:
+            pytest.skip(f"Cannot create symlink: {exc}")
+    elif layout == "junction":
+        if os.name != "nt":
+            pytest.skip("Junctions require Windows")
+        target.mkdir()
+        subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(config), str(target)], check=True, capture_output=True)
+    else:
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("Named pipes require POSIX")
+        os.mkfifo(config)
+
+    initial_config = config.lstat()
+    result = subprocess.run(
+        [str(bash), INSTALL_SH.as_posix(), "--skip-plugin-install", "--skip-uv-sync"],
+        env=dict(os.environ, CODEX_CLI_PATH=codex.as_posix(), CODEX_HOME=codex_home.as_posix()),
+        cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=45,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "config.toml" in result.stderr and "regular" in result.stderr, result.stderr
+    assert "Completed successfully" not in result.stdout
+    assert list(codex_home.iterdir()) == [config]
+    assert config.lstat() == initial_config
+    if layout == "directory":
+        assert not list(config.iterdir())
+    elif layout == "symlink":
+        assert target.read_bytes() == b'model = "user-model"\n'
+    elif layout == "dangling-link":
+        assert not target.exists()
+    elif layout == "junction":
+        assert not list(target.iterdir())
 
 
 @pytest.mark.parametrize("installation", [

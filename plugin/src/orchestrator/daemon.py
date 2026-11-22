@@ -10,7 +10,6 @@ import json
 import logging
 import math
 import os
-import shutil
 import socket
 import subprocess
 import sys
@@ -49,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 ALLOWED_MANUAL_WORKER_STATUSES = frozenset({"stopped", "killed"})
+_DIRECTORY_OPENER_WAIT_SECONDS = 3.0
 
 
 def _configure_daemon_logging(settings: Settings) -> None:
@@ -161,28 +161,47 @@ def _safe_filename_segment(raw: str) -> str:
     return cleaned.strip("-") or "run"
 
 
-def _launch_explorer(target_dir: Path) -> None:
-    """Open a validated directory in the platform file manager without shell interpolation."""
+async def _launch_explorer(target_dir: Path, opener_tasks: set[asyncio.Task[int]]) -> bool:
+    """Report whether the platform accepted the validated directory open request."""
     if os.name == "nt":
-        explorer_bin = shutil.which("explorer.exe") or "explorer.exe"
-        subprocess.Popen(
-            [explorer_bin, str(target_dir)],
+        try:
+            await asyncio.to_thread(os.startfile, str(target_dir), "explore")
+        except OSError as exc:
+            raise RuntimeError(f"Windows Explorer could not open {target_dir}: {exc}") from exc
+        return True
+
+    command = "open" if sys.platform == "darwin" else "xdg-open"
+    try:
+        process = await asyncio.to_thread(
+            subprocess.Popen,
+            [command, str(target_dir)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
             close_fds=True,
+            start_new_session=True,
         )
-        return
-    cmd_name = "open" if sys.platform == "darwin" else "xdg-open"
-    opener_bin = shutil.which(cmd_name) or cmd_name
-    subprocess.Popen(
-        [opener_bin, str(target_dir)],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        close_fds=True,
-        start_new_session=True,
-    )
+    except OSError as exc:
+        raise RuntimeError(f"Failed to start {command} for {target_dir}: {exc}") from exc
+
+    async def wait_for_exit() -> int:
+        # asyncio's subprocess transport can kill the detached file manager on shutdown.
+        while (code := process.poll()) is None:
+            await asyncio.sleep(0.1)
+        if code != 0:
+            logger.error("%s exited with status %d while opening %s", command, code, target_dir)
+        return code
+
+    # xdg-open can wait for the file manager to close; do not cancel it on HTTP timeout.
+    task = asyncio.create_task(wait_for_exit())
+    opener_tasks.add(task)
+    task.add_done_callback(opener_tasks.discard)
+    done, _ = await asyncio.wait({task}, timeout=_DIRECTORY_OPENER_WAIT_SECONDS)
+    code = task.result() if done else process.poll()
+    if code is None:
+        return False
+    if code != 0:
+        raise WorkspaceError(f"{command} exited with status {code} while opening {target_dir}")
+    return True
 
 
 _RUN_MODE_LABELS: dict[str, str] = {
@@ -862,6 +881,7 @@ def create_app(
         app.state.inbox = dispatcher.inbox
         app.state.workflow = dispatcher.workflow
         app.state.inbox_wait_tasks = set()
+        app.state.directory_opener_tasks = set()
         app.state.watchdog = watchdog
         app.state.shutdown_event = shutdown_event
 
@@ -942,7 +962,7 @@ def create_app(
             yield
         finally:
             shutdown_event.set()
-            waiting = tuple(app.state.inbox_wait_tasks)
+            waiting = (*app.state.inbox_wait_tasks, *app.state.directory_opener_tasks)
             for task in waiting:
                 task.cancel()
             # A cancelled short DB read must finish before its connection is closed.
@@ -1908,7 +1928,7 @@ def create_app(
         except Exception as exc:
             return _map_exception_to_response(exc)
 
-    def _validate_and_open_explorer_sync(state: Any, workspace_id: str) -> dict[str, Any]:
+    def _validate_explorer_target(state: Any, workspace_id: str) -> Path:
         database: Database = state.db
         ws = database.get_workspace(workspace_id)
         if ws is None:
@@ -1936,21 +1956,24 @@ def create_app(
                 f"Refusing to open non-workspace directory outside {WORKSPACES_DIRNAME}: {ws_path}"
             )
 
-        _launch_explorer(ws_path)
-        return {
-            "ok": True,
-            "workspace_id": workspace_id,
-            "path": str(ws_path),
-        }
+        return ws_path
 
     async def api_workspace_open_explorer(request: Request) -> JSONResponse:
         workspace_id = request.path_params["workspace_id"]
+        state = request.app.state
         try:
             await _parse_json_body(request, allow_empty=True)
-            res = await asyncio.to_thread(
-                _validate_and_open_explorer_sync, request.app.state, workspace_id
+            target_dir = await asyncio.to_thread(_validate_explorer_target, state, workspace_id)
+            accepted = await _launch_explorer(target_dir, state.directory_opener_tasks)
+            return JSONResponse(
+                {
+                    "ok": accepted,
+                    "status": "accepted" if accepted else "pending",
+                    "workspace_id": workspace_id,
+                    "path": str(target_dir),
+                },
+                status_code=200 if accepted else 202,
             )
-            return JSONResponse(res)
         except PermissionError as exc:
             return _json_error(403, str(exc), error_type="PermissionError")
         except Exception as exc:

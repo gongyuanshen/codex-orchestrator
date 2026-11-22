@@ -83,7 +83,7 @@ document.getElementById('exportMenu').classList.add('hidden');
 class EventSource {static CONNECTING=0;constructor(url){this.url=url;this.events={};streams.push(this)}addEventListener(n,f){this.events[n]=f}close(){this.closed=true}}
 const ctx={document,URLSearchParams,EventSource,console,Map,Set,Date,encodeURIComponent,setImmediate,requestAnimationFrame:(f)=>f(),setTimeout:()=>0,clearTimeout(){},setInterval:(f)=>{intervals.set(++nextInterval,f);return nextInterval},clearInterval:(id)=>intervals.delete(id),CSS:{escape:String},
  window:Object.assign(node(),{location:{search:process.argv[3]||'',pathname:process.argv[2]||'/swarm',replace(url){this.redirected=url}},history:{replaceState(_a,_b,url){ctx.window.location.pathname=url.split('?')[0];ctx.window.location.search=url.includes('?')?'?'+url.split('?')[1]:''}},matchMedia:()=>({matches:ctx.window.reducedMotion===true}),innerWidth:1200}),
- fetch:(url)=>new Promise((resolve,reject)=>requests.push({url,resolve:(data)=>resolve({ok:true,headers:{get:()=> 'application/json'},json:async()=>data}),reject}))};
+ fetch:(url)=>new Promise((resolve,reject)=>requests.push({url,resolve:(data,status=200)=>resolve({ok:status>=200&&status<300,status,headers:{get:()=> 'application/json'},json:async()=>data}),reject}))};
 vm.createContext(ctx);
 vm.runInContext(source.replace('  init();','  globalThis.runTest = (code) => eval(code);'),ctx);
 ctx.assert=assert;ctx.requests=requests;ctx.streams=streams;ctx.nodes=nodes;ctx.intervals=intervals;ctx.testNode=node;ctx.background=background;
@@ -97,6 +97,28 @@ def run_dashboard(code, path='/swarm', search=''):
         capture_output=True, text=True, encoding='utf-8',
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_open_explorer_toasts_distinguish_acceptance_pending_and_failure():
+    run_dashboard(r'''(async()=>{
+      const button=testNode(), toasts=[];
+      button.setAttribute('data-workspace-id','ws a');
+      el.toastContainer.appendChild=node=>toasts.push(node);
+      for (const [data,status,variant,message] of [
+        [{ok:false,status:'pending',path:'/test'},202,'info','尚未确认目录打开结果'],
+        [{ok:true,status:'accepted',path:'/test'},200,'success','已提交打开请求'],
+        [{ok:false,detail:'xdg-open exited with status 4'},500,'error','xdg-open exited with status 4'],
+      ]) {
+        const opening=runInspectorAction('open-explorer',button);
+        const request=requests.at(-1);
+        assert.equal(request.url,'/api/workspaces/ws%20a/open-explorer');
+        request.resolve(data,status);
+        await opening;
+        assert.equal(toasts.at(-1).className,'toast toast-'+variant);
+        assert.ok(toasts.at(-1).innerHTML.includes(message));
+        assert.ok(!toasts.at(-1).innerHTML.includes('已打开本地目录'));
+      }
+    })()''')
 
 
 def test_selection_clears_old_details_and_owns_aba_responses():

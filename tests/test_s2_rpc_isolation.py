@@ -294,7 +294,12 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
     assert explicit["snapshot_manifest"]["project_root"] == str(explicit_source)
     assert (Path(explicit["path"]) / "only.txt").read_text(encoding="utf-8") == "override"
     opens = []
-    monkeypatch.setattr("orchestrator.daemon._launch_explorer", opens.append)
+
+    async def launch_explorer(path, _opener_tasks):
+        opens.append(path)
+        return True
+
+    monkeypatch.setattr("orchestrator.daemon._launch_explorer", launch_explorer)
     app = create_app(db.settings, db=db, start_watchdog=False, manage_pid_file=False)
     with TestClient(app) as client:
         assert client.post(f"/api/workspaces/{workspace['id']}/open-explorer", json={}).status_code == 200
