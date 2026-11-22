@@ -209,7 +209,8 @@ def test_schema9_project_and_run_serializers_and_turn_upserts(tmp_path, monkeypa
     ("G:/repos/main", "workspace"),
     (r"C:\USERS\Example\APPDATA\LOCAL\TEMP\run", "temp"),
     (r"G:\tools\.codex\backups\trial", "temp"),
-    ("G:/docs/verification/native-gap/s1/fixture/repo", "fixture"),
+    ("G:/repos/docs/verification/integration/fixture/repo", "workspace"),
+    ("G:/repos/docs/verification/integration/fixture-project", "workspace"),
     ("G:/docs/verification/native-gap/fixture-not-a-marker", "workspace"),
     (Path(tempfile.gettempdir()) / "swarm-s1", "temp"),
 ])

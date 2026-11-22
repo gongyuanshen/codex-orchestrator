@@ -16,7 +16,7 @@ def _bridge():
 
 @pytest.fixture
 def codex_home(tmp_path, monkeypatch):
-    home = tmp_path / "Codex #1 星河"
+    home = tmp_path / "Codex #1 笔记"
     home.mkdir()
     monkeypatch.setenv("CODEX_HOME", str(home))
     with closing(sqlite3.connect(home / "state_5.sqlite")) as conn, conn:

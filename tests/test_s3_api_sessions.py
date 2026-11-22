@@ -31,6 +31,8 @@ def dashboard(tmp_path, monkeypatch):
     with Database(settings=settings) as db:
         # Preserve a run that was originally registered against the child.
         child = db.ensure_project(slice_root, name="Fixture")
+        with db.transaction() as conn:
+            conn.execute("UPDATE projects SET project_kind = 'fixture' WHERE id = ?", (child["id"],))
         old = db.create_run(project_id=child["id"], mode="swarm", title="Old slice", session_id="thread-1")
         parent = db.ensure_project(root, name="Local label", codex_project_name="Codex Main", is_git=True)
         direct = db.create_run(

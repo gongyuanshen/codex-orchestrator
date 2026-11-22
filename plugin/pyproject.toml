@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tri-orchestrator"
-version = "0.6.7"
+version = "0.6.8"
 description = "Multi-agent orchestrator daemon, SQLite WAL message board, isolated workspace manager, and stdio MCP shim for Codex"
 requires-python = ">=3.12"
 dependencies = [

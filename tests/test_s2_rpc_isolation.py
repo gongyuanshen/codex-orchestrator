@@ -181,7 +181,27 @@ def test_t3_uses_deepest_registered_workspace_without_codex_metadata(env, monkey
     assert run["project_id"] == project["id"]
     assert run["execution_root"] == str(trial)
     assert db.get_project(project["id"])["name"] == "Previously linked"
-    assert db_module.classify_project_kind("G:/repo/docs/verification/stage/fixture-project") == "fixture"
+
+
+@pytest.mark.parametrize("tool", ["workspace_create", "workflow_prepare_dispatch"])
+def test_workspace_rpc_rejects_non_boolean_copy_env_before_creating_files(env, tool):
+    root, db, rpc = env
+    (root / ".env").write_text("DEMO=example\n", encoding="utf-8")
+    run_id = _run(rpc, root, "copy-env-type")["id"]
+    kwargs = {"worker_name": "author"}
+    if tool == "workflow_prepare_dispatch":
+        rpc(
+            "task_packet_save", run_id=run_id, title="Fixture", goal="Verify argument rejection",
+            file_ownership={"author": ["app.py"]}, acceptance_criteria=["reject invalid flag"],
+        )
+        kwargs = dict(create_workspace=True, owner="author", task_name="author", verifier="verifier",
+                      step_key="dispatch", instruction="Verify argument rejection")
+
+    with pytest.raises(ValueError, match="copy_env must be a boolean"):
+        rpc(tool, run_id=run_id, copy_env="false", **kwargs)
+
+    assert db.list_workspaces(run_id=run_id) == []
+    assert not (root / WORKSPACES_DIRNAME).exists()
 
 
 def test_prepare_dispatch_rolls_back_registered_git_worktree(env):

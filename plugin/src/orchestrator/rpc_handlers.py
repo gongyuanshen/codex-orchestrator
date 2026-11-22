@@ -996,12 +996,16 @@ class RpcDispatcher:
         else:
             raise ValueError("Tool arguments must be a JSON object")
         schema = next(tool["inputSchema"] for tool in ALL_RPC_DEFINITIONS if tool["name"] == tool_name)
-        unknown = set(args) - set(schema["properties"])
+        properties = schema["properties"]
+        unknown = args.keys() - properties.keys()
         if unknown:
             raise ValueError(f"Unknown arguments for {tool_name}: {sorted(unknown)}")
         missing = set(schema.get("required", [])) - set(args)
         if missing:
             raise ValueError(f"Missing required arguments for {tool_name}: {sorted(missing)}")
+        for key, value in args.items():
+            if properties[key].get("type") == "boolean" and not isinstance(value, bool):
+                raise ValueError(f"{key} must be a boolean")
         return args
 
     # Alias for callers using call_tool()
@@ -1588,7 +1592,7 @@ class RpcDispatcher:
             run_id,
             worker_name,
             project_root=args.get("project_root"),
-            copy_env=bool(args.get("copy_env", True)),
+            copy_env=args.get("copy_env", True),
             dep_mode=str(args.get("dep_mode") or "none"),
             git_backend=str(args.get("git_backend") or "auto"),
         )
@@ -1769,7 +1773,7 @@ class RpcDispatcher:
                     ws = self.workspace_mgr.workspace_create(
                         run_id,
                         target_worker_name,
-                        copy_env=bool(args.get("copy_env", True)),
+                        copy_env=args.get("copy_env", True),
                         dep_mode=str(args.get("dep_mode") or "none"),
                         git_backend=git_backend_arg,
                     )

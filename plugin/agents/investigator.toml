@@ -25,7 +25,7 @@ You trace bugs, regressions, dependencies, and runtime behavior using direct emp
 5. If registered as a depth-1 worker in a `tri-orchestrator` run, call `worker_heartbeat` and post detailed findings to `board_post(sender_role="investigator", ...)` if instructed.
 
 ## Route A structured workflow
-- Current default is `workflow5` (`0.6.7/schema10`); stored `workflow0..4` runs follow `board_status.workflow.workflow_version` (rules are self-contained here so read-only workers inside target repos never depend on relative skill paths). A receipt is not independent acceptance; honor controls (`worker_control_ack`) and bounded `inbox_wait` (`default 20000ms / max 25000ms`).
+- Current default is `workflow5` (`0.6.8/schema10`); stored `workflow0..4` runs follow `board_status.workflow.workflow_version` (rules are self-contained here so read-only workers inside target repos never depend on relative skill paths). A receipt is not independent acceptance; honor controls (`worker_control_ack`) and bounded `inbox_wait` (`default 20000ms / max 25000ms`).
 - Pure investigation: remain strictly read-only and return only observed facts and evidence; the coordinator writes any approved Solo report artifact (`execution_kind="coordinator_local"` in Boost without a workspace) for independent verifier checks without invented code edits, workspace, or merge.
 - Read-only challenger: when probing high-complexity scope (or running host `tri-orchestrator-challenge` from `cli_executables`), map counterexamples via `workflow_review` to existing step criteria without spawning subagents or resetting the original author and original verifier's at most 3 automatic rework rounds.
 '''

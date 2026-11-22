@@ -106,13 +106,14 @@ def _is_port_bindable(port: int, host: str = "127.0.0.1") -> bool:
         sock.close()
 
 
-def classify_project_kind(root_path: str | Path) -> str:
+def classify_project_kind(root_path: str | Path, *, legacy_fixture_layout: bool = False) -> str:
     """Classify project paths without changing the stored path."""
     path = posixpath.normpath(str(root_path).replace("\\", "/")).casefold()
     parts = tuple(path.split("/"))
     if any(parts[i:i + 2] == (".codex", "backups") for i in range(len(parts))):
         return "temp"
-    if any(parts[i:i + 2] == ("docs", "verification")
+    # Keep schema-8 migration behavior without labeling new projects by our test layout.
+    if legacy_fixture_layout and any(parts[i:i + 2] == ("docs", "verification")
            and any(part in {"fixture", "fixture-project"} for part in parts[i + 2:])
            for i in range(len(parts))):
         return "fixture"
@@ -553,7 +554,7 @@ def _migrate_session_metadata(conn: sqlite3.Connection, version: int) -> None:
     if version < 9:
         conn.executemany(
             "UPDATE projects SET project_kind = ? WHERE id = ?",
-            [(classify_project_kind(r["root_path"]), r["id"])
+            [(classify_project_kind(r["root_path"], legacy_fixture_layout=True), r["id"])
              for r in conn.execute("SELECT id, root_path FROM projects")],
         )
         _reconcile_codex_projects(conn, codex_bridge.list_codex_projects())

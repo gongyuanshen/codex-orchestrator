@@ -40,6 +40,13 @@ def _resolve_powershell() -> str | None:
     return shutil.which("powershell.exe") or shutil.which("pwsh.exe")
 
 
+def _resolve_bash() -> str | Path | None:
+    if os.name == "nt":
+        git = shutil.which("git")
+        return Path(git).resolve().parents[1] / "bin" / "bash.exe" if git else None
+    return shutil.which("bash")
+
+
 def _resolve_codex_exe() -> Path | None:
     env_cli = os.environ.get("CODEX_CLI_PATH", "").strip()
     if env_cli and Path(env_cli).is_file():
@@ -119,7 +126,7 @@ def _query_appserver_hooks_list(codex_exe: Path, codex_home: Path, cwd: Path) ->
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "clientInfo": {"name": "test-m9b-hooks-list", "version": "0.6.7"},
+                    "clientInfo": {"name": "test-m9b-hooks-list", "version": "0.6.8"},
                     "capabilities": {"experimentalApi": True},
                 },
             }
@@ -192,7 +199,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     assert manifest_path.is_file()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["name"] == "tri-orchestrator"
-    assert manifest["version"] == "0.6.7"
+    assert manifest["version"] == "0.6.8"
     assert manifest["hooks"] == "./hooks/hooks.json"
     assert manifest["skills"] == "./skills/"
     assert manifest["mcpServers"] == "./.mcp.json"
@@ -246,7 +253,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     spec.loader.exec_module(upgrade_mod)
     assert upgrade_mod.package_identity(PLUGIN_DIR) == {
         "name": "tri-orchestrator",
-        "version": "0.6.7",
+        "version": "0.6.8",
     }
     assert "pipeline_runner_v1" not in UPGRADE_PY.read_text(encoding="utf-8")
 
@@ -266,7 +273,7 @@ def test_install_ps1_rejects_legacy_dual_manifest(tmp_path: Path) -> None:
     )
     shutil.copy2(PLUGIN_DIR / "hooks" / "hooks.json", fake_plugin / "hooks" / "hooks.json")
     # Re-introduce a stale root plugin.json to confirm fail-closed detection
-    (fake_plugin / "plugin.json").write_text('{"name": "tri-orchestrator", "version": "0.6.7"}\n', encoding="utf-8")
+    (fake_plugin / "plugin.json").write_text('{"name": "tri-orchestrator", "version": "0.6.8"}\n', encoding="utf-8")
 
     codex_home = tmp_path / "codex_home"
     env = dict(
@@ -376,7 +383,7 @@ def test_real_install_hooks_list_trust_and_uninstall_e2e(tmp_path: Path) -> None
         / "cache"
         / "tri-orchestrator"
         / "tri-orchestrator"
-        / "0.6.7"
+        / "0.6.8"
         / ".venv"
         / "Scripts"
     )
@@ -535,11 +542,7 @@ def test_install_sh_lf_line_endings_and_features_section() -> None:
 @pytest.mark.parametrize("trust", [False, True])
 def test_install_sh_registers_plugin_and_verifies_hook_trust(tmp_path: Path, trust: bool) -> None:
     codex = _resolve_codex_exe()
-    if os.name == "nt":
-        git = shutil.which("git")
-        bash = Path(git).resolve().parents[1] / "bin" / "bash.exe" if git else None
-    else:
-        bash = shutil.which("bash")
+    bash = _resolve_bash()
     if not bash or not Path(bash).is_file() or codex is None or not shutil.which("uv"):
         pytest.skip("Requires Bash, Codex CLI and uv")
 
@@ -568,6 +571,49 @@ def test_install_sh_registers_plugin_and_verifies_hook_trust(tmp_path: Path, tru
     config = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
     assert len(config.get("hooks", {}).get("state", {})) == (4 if trust else 0)
     assert not data_dir.exists(), "Registry and hooks/list checks must not start the daemon"
+
+
+@pytest.mark.parametrize("layout", ["agents-symlink", "role-symlink", "role-directory", "role-hardlink"])
+def test_install_sh_does_not_write_through_role_links(tmp_path: Path, layout: str) -> None:
+    bash, codex = _resolve_bash(), _resolve_codex_exe()
+    if not bash or not Path(bash).is_file() or codex is None or not shutil.which("uv"):
+        pytest.skip("Requires Bash, Codex CLI and uv")
+
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    agents = codex_home / "agents"
+    outside = tmp_path / "custom-roles"
+    outside.mkdir()
+    original = outside / "coder.toml"
+    original.write_bytes(b'name = "user-coder"\n')
+    role = agents / "coder.toml"
+    try:
+        if layout == "agents-symlink":
+            agents.symlink_to(outside, target_is_directory=True)
+        else:
+            agents.mkdir()
+            if layout == "role-symlink":
+                role.symlink_to(original)
+            elif layout == "role-directory":
+                role.mkdir()
+            else:
+                os.link(original, role)
+    except OSError as exc:
+        pytest.skip(f"Cannot create {layout}: {exc}")
+
+    result = subprocess.run(
+        [str(bash), INSTALL_SH.as_posix(), "--skip-plugin-install", "--skip-uv-sync"],
+        env=dict(os.environ, CODEX_CLI_PATH=codex.as_posix(), CODEX_HOME=str(codex_home)),
+        cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=45,
+    )
+    assert original.read_bytes() == b'name = "user-coder"\n'
+    if layout == "role-hardlink":
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert role.read_bytes() == (PLUGIN_DIR / "agents" / role.name).read_bytes()
+    else:
+        assert result.returncode != 0, result.stdout + result.stderr
+        assert not (codex_home / "config.toml").exists()
+        assert not (codex_home / "backups").exists()
 
 
 @pytest.mark.parametrize("installation", [

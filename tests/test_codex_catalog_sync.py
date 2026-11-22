@@ -237,25 +237,25 @@ def test_daemon_codex_catalog_projection_and_sse_live_sync(tmp_path: Path, monke
     db_path = _init_catalog_codex_home(codex_home)
 
     repo_main = tmp_path / "星河笔记工程"
-    repo_git_sub = repo_main / "local-edition"
-    repo_empty = tmp_path / "工具"
-    repo_xian = tmp_path / "xian"
-    for d in (repo_main, repo_git_sub, repo_empty, repo_xian):
+    repo_git_sub = repo_main / "notebook-engine"
+    repo_empty = tmp_path / "工具箱"
+    repo_standalone = tmp_path / "standalone"
+    for d in (repo_main, repo_git_sub, repo_empty, repo_standalone):
         d.mkdir(parents=True)
     (repo_git_sub / ".git").mkdir()
 
     with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.executemany(
             "INSERT INTO projects (id, name, position) VALUES (?, ?, ?)",
-            [("p-tools", "工具", 0), ("p-douluo", "星河笔记工程", 1)],
+            [("p-tools", "工具箱", 0), ("p-notes", "星河笔记工程", 1)],
         )
         conn.executemany(
             "INSERT INTO project_roots VALUES (?, ?, ?)",
-            [("p-tools", 0, str(repo_empty)), ("p-douluo", 0, str(repo_main))],
+            [("p-tools", 0, str(repo_empty)), ("p-notes", 0, str(repo_main))],
         )
         conn.execute(
             """INSERT INTO threads VALUES
-               ('sess-relay', ?, 'p-douluo', '接力开发进度报告', NULL, NULL, 'user', 'vscode',
+               ('sess-relay', ?, 'p-notes', '示例项目迭代记录', NULL, NULL, 'user', 'vscode',
                 0, 0, 'gpt-6.2-sol', 'ultra', 'openai', 100.0, 200.0)""",
             (str(repo_main),),
         )
@@ -264,8 +264,8 @@ def test_daemon_codex_catalog_projection_and_sse_live_sync(tmp_path: Path, monke
     settings = Settings(host="127.0.0.1", port=_free_port(), data_dir=tmp_path / "data")
     with Database(settings=settings) as db:
         proj_main = db.ensure_project(repo_main, name="星河笔记工程")
-        proj_sub = db.ensure_project(repo_git_sub, name="local-edition", is_git=True)
-        proj_xian = db.ensure_project(repo_xian, name="xian")
+        proj_sub = db.ensure_project(repo_git_sub, name="notebook-engine", is_git=True)
+        proj_standalone = db.ensure_project(repo_standalone, name="standalone")
         fixture_dir = repo_main / "docs" / "verification" / "s1" / "fixture"
         fixture_dir.mkdir(parents=True)
         proj_fix = db.ensure_project(fixture_dir, name="Fixture")
@@ -273,7 +273,7 @@ def test_daemon_codex_catalog_projection_and_sse_live_sync(tmp_path: Path, monke
         r1 = db.create_run(project_id=proj_sub["id"], mode="swarm", title="Subdir bound run", session_id="sess-relay")
         r_boost = db.create_run(project_id=proj_main["id"], mode="boost", title="Boost bound run", session_id="sess-relay")
         db.create_run(project_id=proj_main["id"], mode="swarm", title="Unbound legacy")
-        db.create_run(project_id=proj_xian["id"], mode="boost", title="Non-Codex xian")
+        db.create_run(project_id=proj_standalone["id"], mode="boost", title="Non-Codex standalone")
         db.create_run(project_id=proj_fix["id"], mode="teamwork", title="Fixture run")
 
         app = create_app(settings, db=db, start_watchdog=False)
@@ -284,14 +284,14 @@ def test_daemon_codex_catalog_projection_and_sse_live_sync(tmp_path: Path, monke
             proj_resp = client.get("/api/projects").json()
             assert "codex_catalog" in proj_resp
             catalog = proj_resp["codex_catalog"]
-            assert [p["name"] for p in catalog["projects"]] == ["工具", "星河笔记工程"]
-            tools_proj, douluo_proj = catalog["projects"]
+            assert [p["name"] for p in catalog["projects"]] == ["工具箱", "星河笔记工程"]
+            tools_proj, notes_proj = catalog["projects"]
             assert tools_proj["id"].startswith("codex:")
             assert tools_proj["threads"] == []
-            assert douluo_proj["id"] == proj_main["id"]
-            assert [t["title"] for t in douluo_proj["threads"]] == ["接力开发进度报告"]
-            assert {r["id"] for r in douluo_proj["threads"][0]["runs"]} == {r1["id"], r_boost["id"]}
-            assert all(r["canonical_project_id"] == proj_main["id"] for r in douluo_proj["threads"][0]["runs"])
+            assert notes_proj["id"] == proj_main["id"]
+            assert [t["title"] for t in notes_proj["threads"]] == ["示例项目迭代记录"]
+            assert {r["id"] for r in notes_proj["threads"][0]["runs"]} == {r1["id"], r_boost["id"]}
+            assert all(r["canonical_project_id"] == proj_main["id"] for r in notes_proj["threads"][0]["runs"])
 
             # Mode filtering on /api/codex/catalog and /api/runs?project_id=codex:...
             swarm_cat = client.get("/api/codex/catalog", params={"mode": "swarm"}).json()
@@ -299,8 +299,8 @@ def test_daemon_codex_catalog_projection_and_sse_live_sync(tmp_path: Path, monke
             assert client.get("/api/runs", params={"project_id": tools_proj["id"]}).json()["runs"] == []
 
             # Subdir bound run is also returned under parent DB project query.
-            douluo_runs = client.get("/api/runs", params={"project_id": proj_main["id"], "mode": "swarm"}).json()["runs"]
-            assert r1["id"] in {r["id"] for r in douluo_runs}
+            notes_runs = client.get("/api/runs", params={"project_id": proj_main["id"], "mode": "swarm"}).json()["runs"]
+            assert r1["id"] in {r["id"] for r in notes_runs}
 
             # Existing /api/sessions still keeps unbound in sessions[] while attaching codex_catalog.
             sess_resp = client.get("/api/sessions").json()
@@ -548,8 +548,8 @@ def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
           {
             id: 'codex:tools',
             codex_project_id: 'tools',
-            name: '工具',
-            display_name: '工具',
+            name: '工具箱',
+            display_name: '工具箱',
             root_path: 'Q:\\工具箱',
             position: 0,
             is_git: false,
@@ -562,8 +562,8 @@ def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
             threads: [],
           },
           {
-            id: 'proj_douluo',
-            codex_project_id: 'douluo',
+            id: 'proj_notes',
+            codex_project_id: 'notes',
             name: '星河笔记工程',
             display_name: '星河笔记工程',
             root_path: 'G:\\星河笔记工程',
@@ -578,7 +578,7 @@ def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
             threads: [
               {
                 session_id: 'sess-relay',
-                title: '接力开发进度报告',
+                title: '示例项目迭代记录',
                 cwd: 'G:\\星河笔记工程',
                 is_pinned: false,
                 model: 'gpt-6.2-sol',
@@ -587,27 +587,27 @@ def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
                 runs: [
                   {
                     id: 'run_2',
-                    project_id: 'proj_douluo',
-                    canonical_project_id: 'proj_douluo',
+                    project_id: 'proj_notes',
+                    canonical_project_id: 'proj_notes',
                     mode: 'swarm',
                     status: 'completed',
-                    title: '星河 Phase 2 F23 收尾',
+                    title: '笔记搜索发布收尾',
                     session_id: 'sess-relay',
                     session_seq: 2,
-                    codex_thread_name: '接力开发进度报告',
+                    codex_thread_name: '示例项目迭代记录',
                     codex_project_name: '星河笔记工程',
                     updated_at: 2000,
                   },
                   {
                     id: 'run_1',
-                    project_id: 'proj_douluo',
-                    canonical_project_id: 'proj_douluo',
+                    project_id: 'proj_notes',
+                    canonical_project_id: 'proj_notes',
                     mode: 'swarm',
                     status: 'completed',
-                    title: 'Phase 2 平板续验',
+                    title: '记录导入后的检查',
                     session_id: 'sess-relay',
                     session_seq: 1,
-                    codex_thread_name: '接力开发进度报告',
+                    codex_thread_name: '示例项目迭代记录',
                     codex_project_name: '星河笔记工程',
                     updated_at: 1000,
                   },
@@ -618,8 +618,8 @@ def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
           {
             id: 'codex:log-lab',
             codex_project_id: 'log-lab',
-            name: '微信二次开发',
-            display_name: '微信二次开发',
+            name: '日志分析示例',
+            display_name: '日志分析示例',
             root_path: 'G:\\log-lab',
             position: 2,
             is_git: false,
@@ -632,7 +632,7 @@ def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
             threads: [
               {
                 session_id: 'sess-log-lab',
-                title: '无法启动，报错了。你可以查看下日志如果有的话',
+                title: '示例程序启动失败，请查看日志定位配置问题',
                 cwd: 'G:\\log-lab',
                 is_pinned: true,
                 model: 'gpt-6.1-sol',
@@ -664,37 +664,37 @@ def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
       renderProjectPopover();
       const popHtml = el.projectPopoverList.innerHTML;
       assert.ok(popHtml.includes('全部项目（Codex 目录）'));
-      assert.ok(popHtml.includes('工具') && popHtml.includes('星河笔记工程') && popHtml.includes('微信二次开发'));
+      assert.ok(popHtml.includes('工具箱') && popHtml.includes('星河笔记工程') && popHtml.includes('日志分析示例'));
       assert.ok(!popHtml.includes('临时与验收夹具') && !popHtml.includes('Fixture'));
 
       // Window 2: Sidebar shows Codex project folders, 暂无聊天, full thread titles, 0-run leaf, nested #2/#1, zero unbound.
       const sideHtml = el.runSidebarList.innerHTML;
       assert.ok(sideHtml.includes('data-codex-project="codex:tools"') && sideHtml.includes('暂无聊天'));
-      assert.ok(sideHtml.includes('session-group-title-row') && sideHtml.includes('接力开发进度报告'));
+      assert.ok(sideHtml.includes('session-group-title-row') && sideHtml.includes('示例项目迭代记录'));
       assert.ok(sideHtml.includes('#2') && sideHtml.includes('#1'));
       assert.ok(sideHtml.includes('data-select-thread="sess-log-lab"'));
-      assert.ok(sideHtml.includes('无法启动，报错了。你可以查看下日志如果有的话'));
+      assert.ok(sideHtml.includes('示例程序启动失败，请查看日志定位配置问题'));
       assert.ok(!sideHtml.includes('未绑定会话任务'));
 
       // Collapsing a project folder keeps it collapsed even though it contains the selected run.
-      state.codexProjectOpenOverrides.set('proj_douluo', false);
+      state.codexProjectOpenOverrides.set('proj_notes', false);
       renderRunSidebar();
-      assert.ok(!el.runSidebarList.innerHTML.match(/<details[^>]*data-codex-project="proj_douluo"[^>]*\bopen\b/));
-      state.codexProjectOpenOverrides.set('proj_douluo', true);
+      assert.ok(!el.runSidebarList.innerHTML.match(/<details[^>]*data-codex-project="proj_notes"[^>]*\bopen\b/));
+      state.codexProjectOpenOverrides.set('proj_notes', true);
 
       // Clicking a 0-run Codex thread updates topbar & overview cleanly.
       await selectCodexThread('codex:log-lab', 'sess-log-lab');
       assert.equal(state.selectedRunId, null);
       assert.equal(state.selectedSessionId, 'sess-log-lab');
-      assert.equal(el.runTitleHeading.textContent, '无法启动，报错了。你可以查看下日志如果有的话');
-      assert.ok(el.overviewContent.innerHTML.includes('无法启动，报错了'));
+      assert.equal(el.runTitleHeading.textContent, '示例程序启动失败，请查看日志定位配置问题');
+      assert.ok(el.overviewContent.innerHTML.includes('示例程序启动失败'));
 
       // Window 3: Ctrl+K palette includes Codex projects, 0-run threads, and runs, without fixtures/unbound.
       openCommandPalette();
       const cmdHtml = el.cmdPaletteResults.innerHTML;
       assert.ok(cmdHtml.includes('Codex 项目'));
-      assert.ok(cmdHtml.includes('无法启动，报错了'));
-      assert.ok(cmdHtml.includes('星河 Phase 2 F23 收尾'));
+      assert.ok(cmdHtml.includes('示例程序启动失败'));
+      assert.ok(cmdHtml.includes('笔记搜索发布收尾'));
       assert.ok(!cmdHtml.includes('Fixture'));
 
       // Resolve initial background /api/sessions so connectGlobalEvents() opens /api/events.
@@ -737,6 +737,6 @@ def test_ui_mirrors_codex_tree_and_handles_live_sse_updates() -> None:
 
       assert.equal(state.selectedSessionId, null);
       assert.ok(el.runSidebarList.innerHTML.includes('PPT'));
-      assert.ok(!el.runSidebarList.innerHTML.includes('微信二次开发'));
-      assert.ok(!el.runSidebarList.innerHTML.includes('无法启动，报错了'));
+      assert.ok(!el.runSidebarList.innerHTML.includes('日志分析示例'));
+      assert.ok(!el.runSidebarList.innerHTML.includes('示例程序启动失败'));
     })()''')

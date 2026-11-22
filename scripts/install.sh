@@ -223,6 +223,7 @@ PY
 
 ROLE_FILES="interviewer.toml planner.toml investigator.toml coder.toml verifier.toml swarm_worker.toml"
 AGENTS_SRC_DIR="$PLUGIN_DIR/agents"
+AGENTS_DST_DIR="$CODEX_HOME_DIR/agents"
 if [ ! -d "$AGENTS_SRC_DIR" ]; then
   echo "Missing plugin agents directory: $AGENTS_SRC_DIR" >&2
   exit 1
@@ -244,6 +245,21 @@ assert "model_reasoning_effort" not in d, f"Hardcoded model_reasoning_effort for
 assert d.get("name") and d.get("description") and d.get("developer_instructions"), f"Missing required fields in {p}"
 PY
 done
+
+run_py - "$AGENTS_DST_DIR" $ROLE_FILES <<'PY'
+import pathlib, stat, sys
+
+agents = pathlib.Path(sys.argv[1])
+destinations = [(agents, stat.S_ISDIR), *((agents / name, stat.S_ISREG) for name in sys.argv[2:])]
+for path, is_expected_type in destinations:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        continue
+    reparse = getattr(metadata, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    if reparse or not is_expected_type(metadata.st_mode):
+        raise SystemExit(f"Expected a regular agents directory or role file, not a link or another file type: {path}")
+PY
 
 CODEX_BIN="$(resolve_codex "$CODEX_HOME_DIR")"
 echo "[install] Using codex: $CODEX_BIN"
@@ -403,7 +419,6 @@ fi
 BACKED_UP_AGENTS_LIST=""
 BASELINE_PREEXISTING_LIST=""
 INSTALLED_AGENTS_LIST=""
-AGENTS_DST_DIR="$CODEX_HOME_DIR/agents"
 
 for rf in $ROLE_FILES; do
   src_file="$AGENTS_SRC_DIR/$rf"
@@ -418,7 +433,10 @@ for rf in $ROLE_FILES; do
       BASELINE_PREEXISTING_LIST="${BASELINE_PREEXISTING_LIST}${BASELINE_PREEXISTING_LIST:+,}$rf"
     fi
   fi
-  cp -f "$src_file" "$dst_file"
+  # Replace the directory entry so a hard-linked copy elsewhere keeps its original bytes.
+  tmp_role="$(mktemp "$AGENTS_DST_DIR/.$rf.XXXXXX")"
+  cp -f "$src_file" "$tmp_role"
+  run_py -c 'from pathlib import Path; import sys; Path(sys.argv[1]).replace(sys.argv[2])' "$tmp_role" "$dst_file"
   INSTALLED_AGENTS_LIST="${INSTALLED_AGENTS_LIST}${INSTALLED_AGENTS_LIST:+,}$rf"
 done
 

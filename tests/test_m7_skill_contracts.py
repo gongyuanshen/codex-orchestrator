@@ -36,8 +36,8 @@ def test_zero_script_agent_type_omission_and_host_qualified_model_selection(mode
     assert "xhigh" not in text
     rules = text.split("## Non-Negotiable Codex Subagent Rules", 1)[1].split("\n## ", 1)[0]
     assert "omit `agent_type`" in rules
-    assert "additionalProperties: false" in rules
-    assert "install.ps1" in rules
+    assert "`CODEX_HOME`" in rules
+    assert "live `spawn_agent` schema" in rules
     _assert_native_model_selection(rules)
     assert "100%" not in text
     for line in text.splitlines():
@@ -100,6 +100,7 @@ def test_nuanced_fork_turns_replaces_blanket_none(mode: str) -> None:
 def test_shared_workflow_documents_nuanced_fork_turns_and_reasoning_effort() -> None:
     shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
     assert "omit `agent_type`" in shared
+    assert "`CODEX_HOME`" in shared and "live `spawn_agent` schema" in shared
     assert "custom `agent_type` applies regardless of `fork_turns`" in shared
     assert 'fork_turns: "none"' in shared
     assert 'fork_turns: "all"' in shared
@@ -179,7 +180,7 @@ def test_workflow5_macro_rpc_primary_path_and_reconciliation_fence(mode: str) ->
     text = _skill_text(mode)
     for required in (
         "workflow5",
-        "0.6.7/schema10",
+        "0.6.8/schema10",
         "workflow_prepare_dispatch",
         "task_name",
         "/root/<task_name>",
@@ -232,7 +233,7 @@ def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_role_focuse
         data = tomllib.loads(raw)
         instructions = data["developer_instructions"]
         assert "workflow5" in instructions, path
-        assert "0.6.7/schema10" in instructions, path
+        assert "0.6.8/schema10" in instructions, path
         assert "board_status.workflow.workflow_version" in instructions, path
         assert "skills/route-a-workflow.md" not in instructions, f"{path} must not require broken relative path"
         assert "self-contained" in instructions, path

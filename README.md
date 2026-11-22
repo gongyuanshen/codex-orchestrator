@@ -15,7 +15,7 @@
 
 ## 环境要求
 
-- **Codex CLI**（支持插件机制、原生 V2 子代理与生命周期钩子）
+- **Codex CLI**（支持 `codex plugin`、`multi_agent_v2` 和生命周期钩子）
 - **[`uv`](https://docs.astral.sh/uv/)**（管理 Python `>=3.12` 运行环境）
 - **`git`**（用于 Git 工作区克隆隔离与合并；非 Git 目录自动回退到目录快照）
 
@@ -30,16 +30,28 @@
 ```bash
 codex plugin marketplace add gongyuanshen/codex-orchestrator
 codex plugin add tri-orchestrator@tri-orchestrator
+codex features enable multi_agent
+codex features enable multi_agent_v2
+codex mcp list
 ```
 
-安装完成后：
-- Codex 会将 `./plugin/` 缓存到本地插件目录（`~/.codex/plugins/cache/tri-orchestrator/tri-orchestrator/<version>/`）。
+确认列表中 `tri_orchestrator` 为启用状态，然后**打开一个新会话**。只安装插件并不会主动启用 V2。若 `multi_agent_v2` 不受当前 CLI 支持，先换用支持它的版本。
+
+- 下文的 Codex 配置目录默认是 `~/.codex`；若设置了 `CODEX_HOME`，插件缓存、角色和钩子配置都以该目录为准。
 - 首次触发 MCP 工具时，Codex 自动执行 `uv run --quiet --project . python -m orchestrator.mcp_shim` 初始化依赖并拉起后台单例守护进程。
 - 若未安装专用角色 TOML，技能省略 `agent_type` 并在提示词中内联角色契约。模型按 Codex 宿主配置解析；只有宿主明确支持，且不复制完整历史时，才显式传入任务需要的 `reasoning_effort`。
 
+**首次试用：**在一个已有初始提交的 Git 测试仓库启动 Codex，在聊天里输入：
+
+```text
+$boost 新建 hello.txt，内容为 hello world。只修改这个文件，并独立验收文件内容。
+```
+
+第一次调用编排工具后，打开 [本地控制台](http://127.0.0.1:18790/boost)，查看这次任务的轮次、成员和验收记录。要让生命周期钩子生效，按 Codex 的提示检查并信任插件钩子。
+
 ### 方式二：运行仓库安装脚本（完整角色与钩子配置）
 
-检出要安装的对应版本源码后再运行平台脚本（Release 的插件 ZIP 和 Python wheel 不含这些脚本）。完整安装会备份并替换 6 个同名角色 TOML（`~/.codex/agents/`），启用 `multi_agent`、`multi_agent_v2`，预热缓存并用 `hooks/list` 检查四个钩子。要保留现有同名角色不变，使用方式一：
+检出要安装的对应版本源码后再运行平台脚本（Release 的插件 ZIP 和 Python wheel 不含这些脚本）。完整安装会备份并替换 Codex 配置目录 `agents/` 下的 6 个同名角色 TOML，遇到符号链接或其他非普通文件会停止。脚本还会启用 `multi_agent`、`multi_agent_v2`，预热缓存并用 `hooks/list` 检查四个钩子。要保留现有同名角色不变，使用方式一：
 
 **Windows（PowerShell）：**
 
@@ -63,7 +75,7 @@ bash scripts/install.sh
 
 关闭 Codex 不会结束已分离的守护进程。若后台仍在运行，从对应数据目录的 `daemon.pid.json` 读取 URL 和 PID，与该 URL 的 `/api/health` 返回的 `pid`、`data_dir` 核对后，只停止这一进程（Windows `Stop-Process -Id`，macOS/Linux `kill -TERM`）。迁移期间不要用其他程序写入运行库。
 
-**版本之间数据库结构相同**（例如 `0.6.6 → 0.6.7`，均为 schema 10）时，不必运行迁移脚本，直接按下面的方式更新插件。
+**版本之间数据库结构相同**（例如 `0.6.7 → 0.6.8`，均为 schema 10）时，不必运行迁移脚本，直接按下面的方式更新插件。
 
 **数据库结构较旧**（例如 `0.6.0 / 0.6.1 → schema 10`）时，先检出**目标版本**的源码，从仓库根目录用该版本的 Python 环境准备备份并离线迁移。将命令中的目录替换为实际路径；`<old-plugin-dir>` 是旧版已安装缓存，`<backup-dir>` 是一个新目录。使用非默认端口时为 `prepare` 加上 `--port`：
 
@@ -202,6 +214,8 @@ flowchart LR
 
 守护进程启动后，在浏览器访问 **`http://127.0.0.1:18790`**（各模式共用同一服务与数据库，入口仅作展示分区）：
 
+控制台和 API 没有登录认证，面向本机使用；不要把端口开放到局域网或公网。
+
 - **模式入口**：[`/boost`](http://127.0.0.1:18790/boost)、[`/teamwork`](http://127.0.0.1:18790/teamwork)、[`/swarm`](http://127.0.0.1:18790/swarm)，支持携带 `run_id` 链接直达历史任务。
 - **三层导航与全局检索**：按「Codex 项目 → 对话（含无编排纯对话）→ 编排轮次」组织侧栏与项目选择器（Codex 目录不可用时自动回退至已登记项目与会话）；支持 `Ctrl+K` 跨项目、跨模式及按模型/推理强度检索，并标记同项目非隔离直改并发风险。
 - **概况与日志**：展示任务状态、主对话实时模型与触发快照对比（切模时标注 `⇄`）、模型分布汇总、触发原话、执行目录与带模型徽章的轮次分隔/消息流，支持全文展开及 `.md` / `.json` 运行报告导出（含模型与辅助子代理明细）。
@@ -218,6 +232,7 @@ flowchart LR
   - 使用 [Git 2.36 或更新版本](https://git-scm.com/docs/git-worktree/2.36.0) 时，可在 `workspace_create` 或 `workflow_prepare_dispatch` 显式传入 `git_backend="worktree"`，与原仓库共享 Git 对象和引用。复制未受版本管理的 `.env` 或依赖前，链接工作区的 Git 忽略规则须已覆盖这些路径；否则保持默认 clone。清理期间不要手动切换或移动工作区分支。
   - `mode="snapshot"` 下 `branch_name=None` 属正常状态；合入前 `dirty=true` 表示相对基线存在改动，合入与清理按三方目录快照基线核验。
   - 两种模式均应先执行 `workspace_merge_preview`，再执行 `workspace_merge(strategy="merge")` 与 `workspace_cleanup`。
+- **本地环境文件**：不需要补拷 `.env` / `.env.local` 时传入 JSON 布尔值 `copy_env: false`，不是字符串 `"false"`。Git 模式已提交的文件仍按提交检出；快照里其他目录的文件按 `.triignore` 过滤。
 - **依赖目录策略（`dep_mode`）**：
   - `none` 不配置依赖目录；需要独立依赖副本时使用 `copy`。
   - `fresh_venv_uv` 创建全新 `.venv` 供测试安装依赖，不负责创建 `node_modules`。
@@ -364,11 +379,14 @@ CLI 入口：tri-orchestrator-{mcp,daemon,verify,hook,challenge}
 
 ### 运行测试
 
+从 GitHub 完整克隆仓库（历史迁移测试需要旧提交），在仓库根目录执行。开发测试需要 PATH 上有 Git、`uv` 和 Node.js；安装器集成测试还需要对应平台的 shell 和 Codex CLI。
+
 ```bash
-uv run pytest -v
+uv run --locked pytest -v
 ```
 
 版本修复的验证范围见 [v0.6.7 发布验收](docs/verification/v0.6.6-release-regressions.md)。
+面向新用户的安装与兼容性修复见 [v0.6.8 公开安装验收](docs/verification/public-portability-20261122.md)。
 
 ### 卸载
 
@@ -388,7 +406,7 @@ powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1
 
 脚本只移除能核实由安装器写入且未被编辑的角色。若安装前有同名角色，符合移除条件时会恢复备份；自行编辑过或无法确认来源的角色会保留。
 
-**macOS / Linux**：执行上述 `codex plugin ...` 移除命令后，按需清理 `~/.codex/agents/` 下对应角色文件，停止 `daemon.pid.json` 进程并清理 `~/.local/share/tri-orchestrator`。
+**macOS / Linux**：执行上述 `codex plugin ...` 移除命令。若用脚本安装过角色，先和已安装版本的 `plugin/agents/` 源文件比较。只处理能确认由脚本安装且内容未变的角色：原件在配置目录的 `backups/tri-orchestrator-baseline/agents/` 时恢复原件；确认安装前没有该角色时才删除。停止后台前按升级章节核对进程；保留数据目录可保留历史记录。
 
 ---
 
