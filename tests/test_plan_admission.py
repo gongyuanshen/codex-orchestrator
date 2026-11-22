@@ -321,6 +321,59 @@ def test_local_packet_then_step_revision_then_original_repair_with_changed_crite
     assert step['attempt'] == 1 and step['owner_agent_id'] == '/root/a' and step['verifier_agent_id'] == '/root/va'
 
 
+@pytest.mark.parametrize('historical_checkpoint', [True, False], ids=['historical', 'frozen'])
+def test_executed_workspace_free_admission_keeps_its_source_after_revision(flow, historical_checkpoint):
+    db, s, run, root, _ = flow
+    slice_root = root / 'slice'
+    slice_root.mkdir()
+    (slice_root / 'source.txt').write_text('not the approved source')
+    step = failed_local(flow)
+    boundary = dict(agent_id='/root/a', evidence='Synchronous phase finished before source contract revision')
+    step = advance(s, step, 'local_revision_boundary', **boundary)
+    if historical_checkpoint:
+        del step['checkpoint']['admission']['source_root']
+        db.connect().execute("UPDATE workflow_steps SET checkpoint_json=? WHERE id=?",
+                             (json.dumps(step['checkpoint']), step['id']))
+    db.connect().execute("UPDATE runs SET execution_root=? WHERE id=?", (str(slice_root), run['id']))
+
+    revised = s.step_save(run['id'], 'a', 'a', 'va', step_id=step['id'],
+                          expected_revision=step['revision'], execution_kind='coordinator_local')
+    rework = advance(s, revised, 'start_rework', **boundary)
+    admission = rework['checkpoint']['admission']
+    assert admission['source_root'] == str(root)
+    assert set(admission['base_manifest']) == {'source.txt', 'slice/source.txt'}
+    new = s.step_save(run['id'], 'b', 'b', 'vb', execution_kind='coordinator_local')
+    plan = s.plan_readiness(run['id'])
+    assert not plan['ready']
+    assert plan['ownership_conflicts'] == [{
+        'step_id': step['id'], 'other_step_id': new['id'],
+        'paths': [str(root), str(slice_root)], 'reason': 'different_source_roots',
+    }]
+    assert new['checkpoint']['source_root'] == str(slice_root)
+
+
+@pytest.mark.parametrize('workflow_version', [1, 2, 3])
+def test_legacy_executed_workspace_free_capture_keeps_project_coordinates(flow, workflow_version):
+    db, s, run, root, _ = flow
+    execution = root / 'slice'
+    execution.mkdir()
+    (execution / 'source.txt').write_text('not the project source')
+    db.connect().execute("UPDATE runs SET workflow_version=?,execution_root=? WHERE id=?",
+                         (workflow_version, str(execution), run['id']))
+    step = s.step_save(run['id'], 'a', 'a', 'va')
+    for action in ('dispatch', 'accept', 'submit'):
+        step = advance(s, step, action)
+    assert ('original_bindings' in step['checkpoint']) == (workflow_version >= 2)
+    assert 'admission' not in step['checkpoint']
+    kwargs = {}
+    if workflow_version == 3:
+        kwargs['verification_commands'] = [dict(id='check', argv=[sys.executable, '-c', 'print(1)'],
+            cwd=str(root), timeout_sec=5, env_keys=[], criteria=['output'])]
+    artifact = s.capture(step['id'], 'candidate', **kwargs)
+    assert artifact['descriptor']['root'] == str(root)
+    assert set(artifact['descriptor']['manifest']) == {'source.txt', 'slice/source.txt'}
+
+
 @pytest.mark.parametrize('stale', ['no_boundary', 'edited', 'transition', 'wrong_identity', 'ended'])
 def test_local_revision_requires_fresh_current_phase_boundary(flow, stale):
     db, s, run, root, _ = flow

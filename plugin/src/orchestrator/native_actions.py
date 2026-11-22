@@ -190,6 +190,9 @@ class NativeActionStore:
                     action_id = old['action_id']
                     revision = old['revision'] + 1
                     history = json.loads(old['history_json'])
+                    frozen = json.loads(old['snapshot_json'])
+                    if 'dispatch_workspace_id' in frozen:
+                        snapshot['dispatch_workspace_id'] = frozen['dispatch_workspace_id']
                 else:
                     action_id = 'nat_' + uuid.uuid4().hex
                     revision = 1

@@ -583,6 +583,34 @@ def _classify_rpc_invalidation(
     return False, False
 
 
+def _dispatch_recovery(arguments: dict[str, Any], outcome: str) -> dict[str, Any]:
+    raw_run_id = arguments.get("run_id")
+    run_id = raw_run_id.strip() if isinstance(raw_run_id, str) else ""
+    sender = str(arguments.get("sender") or "coordinator").strip()
+    raw_key = arguments.get("message_key") or arguments.get("key")
+    key = raw_key.strip() if isinstance(raw_key, str) else ""
+    instructions = "Do not invoke the native action or repeat workflow_prepare_dispatch before reconciliation."
+    result: dict[str, Any] = {"dispatch_outcome": outcome}
+    if run_id and sender and key:
+        result["recovery"] = {
+            "tool": "inbox_get",
+            "arguments": {"run_id": run_id, "sender": sender, "message_key": key},
+        }
+        instructions = (
+            "Look up the original dispatch with inbox_get. No visible ticket yet does not prove rollback. "
+            + instructions
+        )
+    else:
+        result["dispatch_context"] = {
+            "run_id": run_id,
+            "sender": sender,
+            **{field: arguments[field] for field in ("step_id", "step_key") if field in arguments},
+        }
+        instructions = "No usable explicit message key; inspect the original run and step. " + instructions
+    result["recovery_instructions"] = instructions
+    return result
+
+
 async def _forward_rpc(
     settings: Settings,
     tool_name: str,
@@ -596,12 +624,22 @@ async def _forward_rpc(
 
     url = f"{settings.base_url}/api/rpc"
     payload = {"tool": tool_name, "arguments": arguments}
+    is_dispatch = tool_name == "workflow_prepare_dispatch"
     try:
         # Never replay an RPC: a missing response does not imply the write failed.
         resp = await client.post(url, json=payload)
-    except BaseException:
+    except BaseException as exc:
         invalidate_health_cache(settings)
         await _reset_pooled_client(settings, failed_client=client)
+        if is_dispatch and isinstance(
+            exc, (httpx.ReadTimeout, httpx.ReadError, httpx.WriteTimeout, httpx.WriteError, httpx.RemoteProtocolError),
+        ):
+            logger.exception("RPC dispatch response unknown at %s", url)
+            return {
+                "ok": False,
+                "error": f"{tool_name} at {settings.base_url}: {type(exc).__name__}: {exc}",
+                **_dispatch_recovery(arguments, "unknown"),
+            }
         raise
 
     try:
@@ -617,10 +655,22 @@ async def _forward_rpc(
     if reset_pool:
         await _reset_pooled_client(settings, failed_client=client)
 
-    if resp.status_code >= 400 or not body.get("ok", False):
-        err_msg = body.get("detail") or body.get("error") or f"HTTP {resp.status_code}"
-        return {"ok": False, "error": str(err_msg), "status_code": resp.status_code}
-    return {"ok": True, "result": body.get("result")}
+    result = body.get("result")
+    malformed_dispatch_success = is_dispatch and resp.is_success and (
+        body.get("ok") is not True
+        or not isinstance(result, dict)
+        or not all(isinstance(result.get(field), str) and result[field] for field in ("action_id", "message_id"))
+    )
+    if resp.status_code >= 400 or not body.get("ok", False) or malformed_dispatch_success:
+        err_msg = body.get("detail") or body.get("error") or (
+            "Malformed workflow_prepare_dispatch success response" if malformed_dispatch_success
+            else f"HTTP {resp.status_code}"
+        )
+        failure = {"ok": False, "error": str(err_msg), "status_code": resp.status_code}
+        if is_dispatch and (resp.status_code >= 500 or malformed_dispatch_success):
+            failure.update(_dispatch_recovery(arguments, "unknown"))
+        return failure
+    return {"ok": True, "result": result}
 
 
 def _deliver_tool_result(
@@ -728,8 +778,7 @@ def create_mcp_server(settings: Settings | None = None) -> Server[Any]:
         if is_error:
             logger.error("RPC tool=%s url=%s failed status_code=%s",
                          params.name, cfg.base_url, outcome.get("status_code"))
-            payload = {"error": outcome.get("error", "RPC error"),
-                       "status_code": outcome.get("status_code")}
+            payload = {"status_code": None, **{key: value for key, value in outcome.items() if key != "ok"}}
         else:
             payload = outcome.get("result")
         try:
@@ -738,12 +787,21 @@ def create_mcp_server(settings: Settings | None = None) -> Server[Any]:
             )
         except Exception as exc:
             logger.exception("RPC result delivery tool=%s url=%s failed", params.name, cfg.base_url)
+            error_payload = {
+                "error": f"Result delivery failed ({type(exc).__name__}); inspect shim.log. "
+                         "The RPC may already have completed. Do not repeat a write RPC.",
+                "tool": params.name,
+            }
+            if params.name == "workflow_prepare_dispatch":
+                if not is_error:
+                    recovery_args = arguments
+                    if isinstance(payload, dict) and payload.get("message_key"):
+                        recovery_args = arguments | {"message_key": payload["message_key"]}
+                    error_payload.update(_dispatch_recovery(recovery_args, "prepared"))
+                elif outcome.get("dispatch_outcome") == "unknown":
+                    error_payload.update(_dispatch_recovery(arguments, "unknown"))
             return types.CallToolResult(
-                content=[types.TextContent(type="text", text=json.dumps({
-                    "error": f"Result delivery failed ({type(exc).__name__}); inspect shim.log. "
-                             "The RPC may already have completed. Do not repeat a write RPC.",
-                    "tool": params.name,
-                }))],
+                content=[types.TextContent(type="text", text=json.dumps(error_payload))],
                 is_error=True,
             )
 

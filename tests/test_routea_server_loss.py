@@ -7,10 +7,13 @@ import os
 from pathlib import Path
 import socket
 import sys
+import threading
 import time
 
+import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+import pytest
 import uvicorn
 
 from orchestrator.config import Settings
@@ -161,4 +164,97 @@ def test_formal_mcp_inflight_loss_preserves_error_and_reconciles_without_replay(
         finally:
             await _stop_server(server, serving, sock)
 
+    asyncio.run(scenario())
+
+
+def test_timed_out_dispatch_can_be_looked_up_without_replaying(tmp_path, monkeypatch):
+    async def scenario():
+        project = tmp_path / "source"
+        project.mkdir()
+        (project / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        app, server, serving, sock, port = await _start_server(tmp_path / "state")
+        entered, release = threading.Event(), threading.Event()
+        manager = app.state.dispatcher.workspace_mgr
+        create = manager.workspace_create
+        created = []
+
+        def delayed_create(*args, **kwargs):
+            entered.set()
+            assert release.wait(10), "Test did not release the pending dispatch"
+            workspace = create(*args, **kwargs)
+            created.append(workspace["id"])
+            return workspace
+
+        monkeypatch.setattr(manager, "workspace_create", delayed_create)
+        request = None
+        try:
+            async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False) as client:
+                async def rpc(tool, *, timeout=5, **arguments):
+                    return await client.post("/api/rpc", json={"tool": tool, "arguments": arguments}, timeout=timeout)
+
+                run = (await rpc("run_create", mode="boost", title="Delayed dispatch", project_root=str(project))).raise_for_status().json()["result"]
+                lookup = dict(run_id=run["id"], sender="coordinator", message_key="first-author:1")
+                dispatch = dict(
+                    run_id=run["id"], key=lookup["message_key"], create_workspace=True,
+                    owner="author", task_name="author", verifier="reviewer", step_key="edit",
+                    instruction="Edit app.py", file_ownership={"author": ["app.py"]}, criteria=["AC-1"],
+                )
+                request = asyncio.create_task(rpc("workflow_prepare_dispatch", timeout=1, **dispatch))
+                assert await asyncio.to_thread(entered.wait, 5)
+                with pytest.raises(httpx.ReadTimeout):
+                    await request
+                pending = (await rpc("inbox_get", **lookup)).raise_for_status().json()["result"]
+                assert pending["status"] == "not_visible_yet"
+                assert created == []
+
+                release.set()
+                async with asyncio.timeout(5):
+                    while True:
+                        recovered = (await rpc("inbox_get", **lookup)).raise_for_status().json()["result"]
+                        if recovered["status"] == "found":
+                            break
+                        await asyncio.sleep(.01)
+                message, action, step, workspace = (recovered[k] for k in ("message", "native_action", "step", "workspace"))
+                assert message["status"] == "pending" and not message["recipient_agent_id"]
+                assert action["target_agent_path"] == "/root/author"
+                assert action["status"] == "invoking" and "claim_token" not in action
+                assert action["source_id"] == message["id"]
+                assert step["id"] == message["step_id"] and step["state"] == "dispatched"
+                assert workspace["id"] == step["workspace_id"] and recovered["workspace_recorded"]
+                assert Path(workspace["path"]).is_dir()
+                assert created == [workspace["id"]]
+
+                conflict = await rpc("workflow_prepare_dispatch", **dispatch)
+                assert conflict.status_code == 409 and "inbox_get" in conflict.json()["detail"]
+                assert created == [workspace["id"]]
+                assert (await rpc("inbox_get", **(lookup | {"sender": "someone_else"}))).json()["result"]["status"] == "not_visible_yet"
+                assert (await rpc("inbox_get", message_id=message["id"])).json()["result"] == message
+                assert (await rpc("inbox_get", message_id=message["id"], **lookup)).status_code == 400
+
+                # Expire the lease without sleeping. No worker was spawned in the isolated fixture.
+                with app.state.db.transaction() as conn:
+                    conn.execute("UPDATE native_actions SET lease_expires_at=0 WHERE action_id=?", (action["action_id"],))
+                expired = (await rpc("inbox_get", **lookup)).json()["result"]["native_action"]
+                assert expired["status"] == "invoking" and expired["lease_expired"]
+                reconcile = dict(
+                    run_id=run["id"], action_id=action["action_id"], outcome="not_called",
+                    reconcile=True, cancel=True, raw_response={"agents": []},
+                )
+                stale = await rpc("native_action_record_call", expected_revision=expired["revision"], **reconcile)
+                assert stale.status_code == 409 and "Stale native action revision" in stale.json()["detail"]
+                fenced = (await rpc("inbox_get", **lookup)).json()["result"]["native_action"]
+                assert fenced["status"] == "needs_reconciliation" and fenced["revision"] > expired["revision"]
+                cancel = await rpc("native_action_record_call", expected_revision=fenced["revision"], **reconcile)
+                assert cancel.raise_for_status().json()["result"]["status"] == "cancelled"
+                after = (await rpc("inbox_get", **lookup)).json()["result"]
+                assert after["message"]["status"] == after["native_action"]["status"] == "cancelled"
+                assert after["step"]["state"] == "planned" and after["workspace"]["id"] == workspace["id"]
+                assert (await rpc("workflow_prepare_dispatch", **dispatch)).status_code == 409
+                assert (await rpc("workspace_cleanup", workspace_id=workspace["id"], force=True)).status_code == 409
+                assert Path(workspace["path"]).is_dir()
+        finally:
+            release.set()
+            if request is not None:
+                await asyncio.gather(request, return_exceptions=True)
+            await _stop_server(server, serving, sock)
     asyncio.run(scenario())

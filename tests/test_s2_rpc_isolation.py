@@ -1,6 +1,7 @@
 """S2 regression scenarios for run attribution and lifecycle isolation."""
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 import subprocess
 import sys
@@ -242,6 +243,8 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
     run = _run(rpc, execution, "workspace")
     run_id = run["id"]
     assert run["execution_root"] == str(execution)
+    assert run["project_root"] == str(root)
+    assert run["source_root"] == str(root if git else execution)
     # A post-create admission failure must roll back its empty directory as well as DB rows.
     wrong_mode = "snapshot" if git else "git_clone"
     with pytest.raises(ValueError, match="workspace_base_mode"):
@@ -256,9 +259,10 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
 
     direct = rpc("workspace_create", run_id=run_id, worker_name="direct", dep_mode="none", copy_env=False)
     assert not list(Path(direct["path"]).rglob(".env"))
+    relative = (execution.relative_to(root) if git else Path()) / "app.py"
     rpc(
         "task_packet_save", run_id=run_id, title="Fixture", goal="Verify dispatch location",
-        file_ownership={"dispatched": ["app.py"]}, acceptance_criteria=["location"],
+        file_ownership={"dispatched": [relative.as_posix()]}, acceptance_criteria=["location"],
     )
     prep = rpc(
         "workflow_prepare_dispatch", run_id=run_id, create_workspace=True, dep_mode="none",
@@ -268,7 +272,7 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
     workspace = prep["workspace"]
     assert Path(direct["path"]).parent == Path(workspace["path"]).parent == execution / WORKSPACES_DIRNAME
     assert workspace["mode"] == ("git_clone" if git else "snapshot")
-    relative = execution.relative_to(root) / "app.py"
+    assert workspace["source_root"] == run["source_root"]
     assert (Path(workspace["path"]) / relative).read_text(encoding="utf-8") == "VALUE = 1\n"
     assert (Path(workspace["path"]) / ".env").read_text(encoding="utf-8") == "SOURCE=slice\n"
 
@@ -301,7 +305,65 @@ def test_t3_workspace_creation_and_explorer_use_run_execution_root(env, monkeypa
 
 
 
-def test_t3_nested_snapshot_uses_canonical_paths_through_workflow5_closeout(env, monkeypatch, tmp_path):
+@pytest.mark.parametrize("create_workspace", [True, False], ids=["automatic", "explicit"])
+def test_t3_nested_snapshot_admits_only_execution_root(env, monkeypatch, create_workspace):
+    root, db, rpc = env
+    monkeypatch.setattr(db.settings, "max_snapshot_mb", 1)
+    _codex_project(monkeypatch, root)
+    execution = root / "artifacts" / "slice"
+    execution.mkdir(parents=True)
+    (execution / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (execution / ".triignore").write_text("slice-cache.bin\n", encoding="utf-8")
+    (execution / "slice-cache.bin").write_bytes(b"x" * (2 << 20))
+    (root / "parent-material.bin").write_bytes(b"x" * (2 << 20))
+    run = rpc("run_create", mode="boost", title="nested", project_root=str(execution))
+    assert db.get_project(run["project_id"])["root_path"] == str(root)
+    assert run["execution_root"] == str(execution)
+    existing = {} if create_workspace else {
+        "workspace_id": rpc(
+            "workspace_create", run_id=run["id"], worker_name="author", project_root=str(execution),
+            copy_env=False,
+        )["id"],
+    }
+    prep = rpc(
+        "workflow_prepare_dispatch", run_id=run["id"], create_workspace=create_workspace,
+        owner="author", task_name="author", verifier="verifier", step_key="edit-slice",
+        instruction="Change the slice", file_ownership={"author": ["app.py"]},
+        acceptance_criteria=["Change app.py"], copy_env=False, **existing,
+    )
+
+    workspace = db.get_workspace(prep["workspace"]["id"])
+    assert workspace["snapshot_manifest"]["project_root"] == str(execution)
+    assert set(workspace["snapshot_manifest"]["files"]) == {".triignore", "app.py"}
+    assert {p.name for p in Path(workspace["path"]).iterdir()} == {".triignore", "app.py"}
+    admission = db.connect().execute(
+        "SELECT checkpoint_json FROM workflow_steps WHERE id = ?", (prep["step"]["id"],),
+    ).fetchone()
+    recorded = json.loads(admission["checkpoint_json"])["admission"]
+    assert recorded["base_manifest"] == workspace["snapshot_manifest"]["files"]
+    assert recorded["allowed_scopes"] == ["app.py"]
+    assert run["source_root"] == prep["workspace"]["source_root"] == recorded["source_root"] == str(execution)
+
+
+def test_t3_nested_snapshot_rejects_reusing_parent_source(env, monkeypatch):
+    root, db, rpc = env
+    _codex_project(monkeypatch, root)
+    execution = root / "slice"
+    execution.mkdir()
+    run = rpc("run_create", mode="boost", title="wrong source", project_root=str(execution))
+    workspace = rpc("workspace_create", run_id=run["id"], worker_name="author", project_root=str(root))
+    with pytest.raises(ValueError, match="Workspace source root.*expected"):
+        rpc(
+            "workflow_prepare_dispatch", run_id=run["id"], workspace_id=workspace["id"],
+            owner="author", task_name="author", verifier="verifier", step_key="edit-slice",
+            instruction="Change the slice", file_ownership={"author": ["app.py"]},
+            acceptance_criteria=["Change app.py"],
+        )
+    assert db.get_workspace(workspace["id"])["status"] == "active"
+    assert db.get_worker_by_name(run["id"], "author") is None
+
+
+def test_t3_nested_snapshot_uses_slice_paths_through_workflow5_closeout(env, monkeypatch, tmp_path):
     root, db, rpc = env
     _codex_project(monkeypatch, root)
     execution = root / "artifacts" / "slice"
@@ -316,8 +378,8 @@ def test_t3_nested_snapshot_uses_canonical_paths_through_workflow5_closeout(env,
 
     run = _run(rpc, execution, "merge-nested")
     run_id = run["id"]
-    relative = edited.relative_to(root).as_posix()
-    criterion = "nested file updated without changing its canonical siblings"
+    relative = edited.relative_to(execution).as_posix()
+    criterion = "nested file updated without changing its project siblings"
     rpc(
         "task_packet_save", run_id=run_id, title="Nested snapshot", goal=criterion,
         file_ownership={"author": [relative]}, acceptance_criteria=[criterion],
@@ -348,9 +410,7 @@ def test_t3_nested_snapshot_uses_canonical_paths_through_workflow5_closeout(env,
     assert workspace.parent == execution / WORKSPACES_DIRNAME
     rpc("workflow_author_turn", run_id=run_id, step_id=step_id, message_id=author["message_id"], phase="accept")
 
-    # Find the intended file in either snapshot layout to exercise the old merge failure,
-    # rather than failing early because the old candidate used a slice-relative path.
-    [candidate] = [file for file in workspace.rglob("app.py") if file.read_text(encoding="utf-8") == "old"]
+    candidate = workspace / relative
     candidate.write_text("new", encoding="utf-8")
     rpc(
         "workflow_author_turn", run_id=run_id, step_id=step_id, message_id=author["message_id"],
@@ -388,7 +448,7 @@ def test_t3_nested_snapshot_uses_canonical_paths_through_workflow5_closeout(env,
     assert candidate == workspace / relative
     assert edited.read_text(encoding="utf-8") == "new"
     assert {path: path.read_text(encoding="utf-8") for path in unchanged} == unchanged
-    verify("integrated", root, edited)
+    verify("integrated", execution, edited)
     assert rpc("workflow_closeout_run", run_id=run_id)["run"]["status"] == "completed"
     assert db.get_workspace(author["workspace"]["id"])["status"] == "cleaned" and not workspace.exists()
 

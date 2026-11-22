@@ -519,20 +519,18 @@ def _scan_snapshot_files(
 
 
 def _estimate_snapshot_size(
-    resolved_root: Path,
+    root: Path,
     *,
-    execution_root: Path | None,
     copy_env: bool,
     triignore: _TriIgnoreMatcher,
 ) -> tuple[int, int]:
-    """Estimate total bytes and file count that snapshot mode would copy from resolved_root."""
+    """Estimate total bytes and file count that snapshot mode would copy from root."""
     total_bytes = 0
     file_count = 0
-    copied_root_env: set[str] = set()
 
-    for dirpath, dirnames, filenames in os.walk(resolved_root):
+    for dirpath, dirnames, filenames in os.walk(root):
         parent = Path(dirpath)
-        rel_dir = parent.relative_to(resolved_root)
+        rel_dir = parent.relative_to(root)
         is_root = rel_dir == Path(".")
         kept_dirs: list[str] = []
         for d in sorted(dirnames):
@@ -545,9 +543,7 @@ def _estimate_snapshot_size(
         dirnames[:] = kept_dirs
 
         for fname in sorted(filenames):
-            if not copy_env and fname in ENV_FILENAMES and (
-                is_root or parent == execution_root
-            ):
+            if not copy_env and is_root and fname in ENV_FILENAMES:
                 continue
             src_file = parent / fname
             if _is_reparse_or_symlink(src_file):
@@ -558,23 +554,19 @@ def _estimate_snapshot_size(
             try:
                 total_bytes += src_file.lstat().st_size
                 file_count += 1
-                if is_root and fname in ENV_FILENAMES:
-                    copied_root_env.add(fname)
             except OSError:
                 continue
 
-    if copy_env and execution_root is not None and execution_root != resolved_root:
-        for fname in ENV_FILENAMES:
-            if fname in copied_root_env:
-                continue
-            candidate = execution_root / fname
-            if candidate.is_file() and not _is_reparse_or_symlink(candidate):
-                try:
-                    total_bytes += candidate.lstat().st_size
-                    file_count += 1
-                except OSError:
-                    continue
     return total_bytes, file_count
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceSource:
+    root: Path
+    placement_root: Path
+    env_roots: tuple[Path, ...]
+    git_common_dir: Path | None
+    use_git_clone: bool
 
 
 class WorkspaceManager:
@@ -598,40 +590,65 @@ class WorkspaceManager:
             raise NotFoundError(f"Workspace not found: {workspace_id}")
         return ws
 
-    def _resolve_project_root(
-        self, run_id: str, project_root: str | Path | None
-    ) -> tuple[dict[str, Any], Path]:
+    def _run_project(self, run_id: str) -> tuple[dict[str, Any], Path]:
         run = self.db.get_run(run_id)
         if run is None:
             raise NotFoundError(f"Run not found: {run_id}")
-        if project_root is not None:
-            root = Path(project_root).resolve(strict=False)
-        else:
-            project = self.db.get_project(run["project_id"])
-            if project is None:
-                raise NotFoundError(f"Project not found: {run['project_id']}")
-            root = Path(project["root_path"]).resolve(strict=False)
-        if not root.exists() or not root.is_dir():
-            raise FileNotFoundError(f"Project root directory does not exist: {root}")
-        return run, root
-
-    def _get_workspace_project_root(self, ws: dict[str, Any]) -> Path:
-        manifest = ws.get("snapshot_manifest") or {}
-        if isinstance(manifest, dict) and manifest.get("project_root"):
-            return Path(manifest["project_root"]).resolve(strict=False)
-        run = self.db.get_run(ws["run_id"])
-        if run is None:
-            raise NotFoundError(f"Run not found: {ws['run_id']}")
         project = self.db.get_project(run["project_id"])
         if project is None:
             raise NotFoundError(f"Project not found: {run['project_id']}")
-        root = Path(project["root_path"]).resolve(strict=False)
+        return run, Path(project["root_path"]).resolve(strict=False)
+
+    def registered_project_root(self, run_id: str) -> Path:
+        return self._run_project(run_id)[1]
+
+    def _resolve_workspace_source(
+        self, run_id: str, project_root: str | Path | None = None
+    ) -> _WorkspaceSource:
+        run, registered = self._run_project(run_id)
+        override = Path(project_root).resolve(strict=False) if project_root is not None else None
+        execution = Path(run["execution_root"]).resolve(strict=False) if run["execution_root"] else None
+        if execution and (override is None or override == execution):
+            execution = Path(resolve_execution_root(str(execution), registered))
+        else:
+            execution = None
+        # A committed Git workspace keeps repository coordinates; otherwise copy only the slice.
+        git_probe_root = registered if override is None or override == execution else override
+        is_git, repo_root, git_common_dir, has_head = self._detect_git_repo(git_probe_root)
+        use_git_clone = is_git and has_head
+        root = repo_root if use_git_clone else execution or override or registered
+        return _WorkspaceSource(
+            root=root,
+            placement_root=execution or root,
+            env_roots=tuple(dict.fromkeys((execution or git_probe_root, git_probe_root, repo_root))),
+            git_common_dir=git_common_dir,
+            use_git_clone=use_git_clone,
+        )
+
+    def run_source_root(self, run_id: str) -> Path:
+        """Return the source/merge coordinates for a run's workflow, before any scan."""
+        return self._resolve_workspace_source(run_id).root
+
+    def workspace_source_root(self, ws: dict[str, Any]) -> Path:
+        manifest = ws.get("snapshot_manifest") or {}
+        if isinstance(manifest, dict) and manifest.get("project_root"):
+            return Path(manifest["project_root"]).resolve(strict=False)
+        root = self.registered_project_root(ws["run_id"])
         # If project_root is a subdirectory of a git repo, map to git toplevel for git operations.
         if ws["mode"] == "git_clone":
             top = _run_git(root, "rev-parse", "--show-toplevel")
             if top.returncode == 0 and top.stdout.strip():
                 return Path(top.stdout.strip()).resolve(strict=False)
         return root
+
+    def _workspace_mutation_lock(self, ws: dict[str, Any], root: Path) -> threading.RLock:
+        if ws["mode"] == "snapshot":
+            project = self.registered_project_root(ws["run_id"])
+            if root.is_relative_to(project):
+                root = project  # A parent snapshot and a slice can write the same physical file.
+        key = os.path.normcase(str(root.resolve()))
+        with self._project_locks_guard:
+            return self._project_locks.setdefault(key, threading.RLock())
 
     @staticmethod
     def _detect_git_repo(project_root: Path) -> tuple[bool, Path, Path | None, bool]:
@@ -716,14 +733,11 @@ class WorkspaceManager:
             raise WorkspaceError(f"Git worktree cannot copy unignored local paths {entries!r}. {WORKTREE_COPY_HINT}")
         _append_git_exclude_entries(git_dir, entries)
 
-    def _copy_env_files(
+    def _copy_git_env_files(
         self,
-        source_roots: list[Path],
+        source_roots: tuple[Path, ...],
         ws_dir: Path,
-        *,
-        is_git: bool,
-    ) -> list[str]:
-        copied: list[str] = []
+    ) -> None:
         excludes_to_add: list[str] = []
         for fname in ENV_FILENAMES:
             src_file: Path | None = None
@@ -735,16 +749,14 @@ class WorkspaceManager:
             if src_file is None:
                 continue
             dst_file = ws_dir / fname
-            if is_git and self._is_git_tracked(ws_dir, fname):
+            if self._is_git_tracked(ws_dir, fname):
                 # Already checked out from tracked git history; do not overwrite or exclude.
                 continue
             shutil.copy2(src_file, dst_file)
-            copied.append(fname)
-            if is_git and not self._is_git_ignored(ws_dir, fname):
+            if not self._is_git_ignored(ws_dir, fname):
                 excludes_to_add.append(fname)
-        if is_git and excludes_to_add:
+        if excludes_to_add:
             self._append_workspace_excludes(ws_dir, excludes_to_add)
-        return copied
 
     def _apply_dep_mode(
         self,
@@ -921,7 +933,7 @@ class WorkspaceManager:
         ws_path = Path(ws["path"])
         if self._uses_git_worktree(ws):
             self._detach_git_worktree_safe(
-                self._get_workspace_project_root(ws), ws_path, ws["branch_name"], ws["merged_commit"] or ws["base_commit"]
+                self.workspace_source_root(ws), ws_path, ws["branch_name"], ws["merged_commit"] or ws["base_commit"]
             )
         else:
             _rmtree_safe(ws_path)
@@ -957,43 +969,31 @@ class WorkspaceManager:
             raise ValueError("worker_name must be a non-empty string")
 
         with self._lock:
-            run, resolved_root = self._resolve_project_root(run_id, project_root)
-            execution_root = Path(run["execution_root"]).resolve(strict=False) if run["execution_root"] else None
-            if project_root is not None and resolved_root != execution_root:
-                execution_root = None
-            if execution_root is not None:
-                project = self.db.get_project(run["project_id"])
-                if project is None:
-                    raise NotFoundError(f"Project not found: {run['project_id']}")
-                execution_root = Path(resolve_execution_root(str(execution_root), project["root_path"]))
-            if execution_root is not None and not execution_root.is_dir():
-                raise FileNotFoundError(f"Execution root directory does not exist: {execution_root}")
-            is_git_worktree, repo_root, git_common_dir, has_head = self._detect_git_repo(
-                resolved_root
-            )
-
-            use_git_clone = is_git_worktree and has_head
+            source = self._resolve_workspace_source(run_id, project_root)
+            base_root = source.root
+            if not base_root.is_dir():
+                raise FileNotFoundError(f"Source root directory does not exist: {base_root}")
+            if not source.placement_root.is_dir():
+                raise FileNotFoundError(f"Execution root directory does not exist: {source.placement_root}")
+            use_git_clone = source.use_git_clone
             use_linked_worktree = use_git_clone and effective_git_backend == "worktree"
-            base_root = repo_root if use_git_clone else resolved_root
-            triignore = _load_triignore(resolved_root) if not use_git_clone else _TriIgnoreMatcher()
-            source_roots = list(dict.fromkeys([execution_root or resolved_root, resolved_root, repo_root]))
             copy_paths: list[str] = []
             if use_linked_worktree:
                 if copy_env:
-                    copy_paths.extend(name for name in ENV_FILENAMES if any((root / name).is_file() for root in source_roots))
+                    copy_paths.extend(name for name in ENV_FILENAMES if any((root / name).is_file() for root in source.env_roots))
                 if dep_mode == "fresh_venv_uv":
                     copy_paths.append(".venv/")
                 elif dep_mode in {"link_ro_cache", "copy"}:
                     copy_paths.extend(f"{name}/" for name in DEP_DIRNAMES if (base_root / name).is_dir())
-                self._validate_worktree_copy_rules(repo_root, copy_paths)
+                self._validate_worktree_copy_rules(base_root, copy_paths)
 
-            if is_git_worktree and git_common_dir is not None:
-                _append_git_exclude_entries(git_common_dir, [EXCLUDE_ENTRY])
+            if source.git_common_dir is not None:
+                _append_git_exclude_entries(source.git_common_dir, [EXCLUDE_ENTRY])
 
             if not use_git_clone:
+                triignore = _load_triignore(base_root)
                 estimated_bytes, estimated_files = _estimate_snapshot_size(
-                    resolved_root,
-                    execution_root=execution_root,
+                    base_root,
                     copy_env=copy_env,
                     triignore=triignore,
                 )
@@ -1005,25 +1005,24 @@ class WorkspaceManager:
                         raise WorkspaceError(
                             f"Snapshot workspace size {estimated_mb:.2f} MB ({estimated_files} files) "
                             f"exceeds max_snapshot_mb={max_snapshot_mb} MB ({limit_bytes} bytes) "
-                            f"for {resolved_root}. Suggestions: initialize a Git repository (git init), "
+                            f"for source root {base_root}. Suggestions: initialize a Git repository (git init), "
                             "narrow execution_root, configure .triignore exclusions, or adjust "
                             "TRI_ORCH_MAX_SNAPSHOT_MB (0 = unlimited)."
                         )
 
-            # Placement follows the Run; source and merge paths still use project coordinates.
             ws_dir, branch_name = self._allocate_workspace_dir_and_branch(
-                execution_root or base_root, run_id, worker_name
+                source.placement_root, run_id, worker_name
             )
             created_worktree_commit = None
             try:
                 if use_git_clone:
                     if use_linked_worktree:
-                        if self._registered_worktree(repo_root, ws_dir) is not None:
+                        if self._registered_worktree(base_root, ws_dir) is not None:
                             raise WorkspaceGitError(f"Git already has a registered worktree at {ws_dir}")
-                        start_commit = _run_git(repo_root, "rev-parse", "HEAD", check=True).stdout.strip()
-                        _run_git(repo_root, "branch", "--no-track", branch_name, start_commit, check=True)
+                        start_commit = _run_git(base_root, "rev-parse", "HEAD", check=True).stdout.strip()
+                        _run_git(base_root, "branch", "--no-track", branch_name, start_commit, check=True)
                         created_worktree_commit = start_commit
-                        _run_git(repo_root, "worktree", "add", str(ws_dir), branch_name, check=True)
+                        _run_git(base_root, "worktree", "add", str(ws_dir), branch_name, check=True)
                         self._validate_worktree_copy_rules(ws_dir, copy_paths)
                         git_manifest: dict[str, Any] = {
                             "project_root": str(base_root),
@@ -1031,16 +1030,16 @@ class WorkspaceManager:
                         }
                     else:
                         _run_cmd(
-                            ["git", "clone", "--local", str(repo_root), str(ws_dir)],
+                            ["git", "clone", "--local", str(base_root), str(ws_dir)],
                             check=True,
                         )
                         _run_git(ws_dir, "checkout", "-b", branch_name, check=True)
-                        self._copy_git_identity(repo_root, ws_dir)
+                        self._copy_git_identity(base_root, ws_dir)
                         git_manifest = {"project_root": str(base_root)}
                     base_commit = _run_git(ws_dir, "rev-parse", "HEAD", check=True).stdout.strip()
 
                     if copy_env:
-                        self._copy_env_files(source_roots, ws_dir, is_git=True)
+                        self._copy_git_env_files(source.env_roots, ws_dir)
                     self._apply_dep_mode(base_root, ws_dir, dep_mode, is_git=True)
 
                     ws_record = self.db.create_workspace(
@@ -1058,11 +1057,10 @@ class WorkspaceManager:
                     baseline_files: dict[str, str] = {}
                     copied_bytes = 0
                     file_count = 0
-                    copied_file_sizes: dict[str, int] = {}
 
-                    for dirpath, dirnames, filenames in os.walk(resolved_root):
+                    for dirpath, dirnames, filenames in os.walk(base_root):
                         parent = Path(dirpath)
-                        rel_dir = parent.relative_to(resolved_root)
+                        rel_dir = parent.relative_to(base_root)
                         is_root = rel_dir == Path(".")
                         kept_dirs: list[str] = []
                         for d in sorted(dirnames):
@@ -1075,9 +1073,7 @@ class WorkspaceManager:
                         dirnames[:] = kept_dirs
                         (ws_dir / rel_dir).mkdir(parents=True, exist_ok=True)
                         for fname in sorted(filenames):
-                            if not copy_env and fname in ENV_FILENAMES and (
-                                is_root or parent == execution_root
-                            ):
+                            if not copy_env and is_root and fname in ENV_FILENAMES:
                                 continue
                             src_file = parent / fname
                             if _is_reparse_or_symlink(src_file):
@@ -1090,26 +1086,13 @@ class WorkspaceManager:
                             shutil.copy2(src_file, dst_file)
                             copied_bytes += src_size
                             file_count += 1
-                            copied_file_sizes[rel_posix] = src_size
                             if not (is_root and fname in ENV_FILENAMES):
                                 baseline_files[rel_posix] = _sha256_file(src_file)
 
-                    if copy_env and execution_root is not None and execution_root != resolved_root:
-                        copied_env = self._copy_env_files(source_roots, ws_dir, is_git=False)
-                        for env_name in copied_env:
-                            env_dst = ws_dir / env_name
-                            if env_dst.is_file():
-                                new_size = env_dst.lstat().st_size
-                                if env_name in copied_file_sizes:
-                                    copied_bytes += new_size - copied_file_sizes[env_name]
-                                else:
-                                    copied_bytes += new_size
-                                    file_count += 1
-                                copied_file_sizes[env_name] = new_size
-                    self._apply_dep_mode(execution_root or resolved_root, ws_dir, dep_mode, is_git=False)
+                    self._apply_dep_mode(base_root, ws_dir, dep_mode, is_git=False)
 
                     manifest = {
-                        "project_root": str(resolved_root),
+                        "project_root": str(base_root),
                         "copy_env": bool(copy_env),
                         "files": baseline_files,
                         "copied_bytes": copied_bytes,
@@ -1129,7 +1112,7 @@ class WorkspaceManager:
                     ws_record["file_count"] = file_count
             except BaseException:
                 if created_worktree_commit is not None:
-                    self._detach_git_worktree_safe(repo_root, ws_dir, branch_name, created_worktree_commit)
+                    self._detach_git_worktree_safe(base_root, ws_dir, branch_name, created_worktree_commit)
                 elif not use_linked_worktree:
                     _rmtree_safe(ws_dir)
                 raise
@@ -1220,7 +1203,7 @@ class WorkspaceManager:
 
         # Snapshot mode
         manifest = ws.get("snapshot_manifest") or {}
-        project_root = self._get_workspace_project_root(ws)
+        project_root = self.workspace_source_root(ws)
         triignore = _load_triignore(project_root)
         baseline: dict[str, str] = _filter_snapshot_baseline(
             dict(manifest.get("files") or {}),
@@ -1339,7 +1322,7 @@ class WorkspaceManager:
 
         # Snapshot mode diff
         manifest = ws.get("snapshot_manifest") or {}
-        project_root = self._get_workspace_project_root(ws)
+        project_root = self.workspace_source_root(ws)
         triignore = _load_triignore(project_root)
         baseline: dict[str, str] = _filter_snapshot_baseline(
             dict(manifest.get("files") or {}),
@@ -1416,7 +1399,7 @@ class WorkspaceManager:
 
         if ws["mode"] == "git_clone":
             with self._lock:
-                repo_root = self._get_workspace_project_root(ws)
+                repo_root = self.workspace_source_root(ws)
                 resolved_target = target_branch or self._current_branch_or_head(repo_root)
                 ws_branch = ws["branch_name"]
                 if not ws_branch:
@@ -1540,7 +1523,7 @@ class WorkspaceManager:
 
         # Snapshot mode 3-way preview
         manifest = ws.get("snapshot_manifest") or {}
-        project_root = self._get_workspace_project_root(ws)
+        project_root = self.workspace_source_root(ws)
         triignore = _load_triignore(project_root)
         baseline: dict[str, str] = _filter_snapshot_baseline(
             dict(manifest.get("files") or {}),
@@ -1593,12 +1576,9 @@ class WorkspaceManager:
         if strategy not in VALID_MERGE_STRATEGIES:
             raise ValueError(f"Invalid merge strategy: {strategy!r}")
         ws = self._require_workspace(workspace_id)
-        root = self._get_workspace_project_root(ws)
-        key = os.path.normcase(str(root.resolve()))
-        with self._project_locks_guard:
-            lock = self._project_locks.setdefault(key, threading.RLock())
+        root = self.workspace_source_root(ws)
         # Shared across plugin managers; external editors are detected, not locked.
-        with lock:
+        with self._workspace_mutation_lock(ws, root):
             run = self.db.get_run(ws["run_id"])
             if run is None:
                 raise NotFoundError(f"Run not found: {ws['run_id']}")
@@ -1871,7 +1851,7 @@ class WorkspaceManager:
                         f"Workspace {workspace_id} has uncommitted changes; commit or discard before merging"
                     )
 
-                repo_root = self._get_workspace_project_root(ws)
+                repo_root = self.workspace_source_root(ws)
                 ws_branch = ws["branch_name"]
                 if not ws_branch:
                     raise WorkspaceError(f"Workspace {workspace_id} has no branch_name")
@@ -2058,7 +2038,7 @@ class WorkspaceManager:
         # Snapshot mode 3-way merge
         with self._lock:
             manifest = ws.get("snapshot_manifest") or {}
-            project_root = self._get_workspace_project_root(ws)
+            project_root = self.workspace_source_root(ws)
             triignore = _load_triignore(project_root)
             baseline: dict[str, str] = _filter_snapshot_baseline(
                 dict(manifest.get("files") or {}),
@@ -2141,10 +2121,7 @@ class WorkspaceManager:
         self, workspace_id: str, force: bool = False,
     ) -> dict[str, Any]:
         ws = self._require_workspace(workspace_id)
-        key = os.path.normcase(str(self._get_workspace_project_root(ws).resolve()))
-        with self._project_locks_guard:
-            lock = self._project_locks.setdefault(key, threading.RLock())
-        with lock:
+        with self._workspace_mutation_lock(ws, self.workspace_source_root(ws)):
             return self._workspace_cleanup_locked(workspace_id, force)
 
     def _workspace_cleanup_locked(
@@ -2283,7 +2260,7 @@ class WorkspaceManager:
             try:
                 if self._uses_git_worktree(ws):
                     self._worktree_cleanup_preflight(
-                        self._get_workspace_project_root(ws), ws_path, ws["branch_name"], ws["merged_commit"]
+                        self.workspace_source_root(ws), ws_path, ws["branch_name"], ws["merged_commit"]
                     )
             except WorkspaceCleanupGuardError as exc:
                 unsafe_reason = str(exc)
@@ -2565,10 +2542,7 @@ class WorkspaceManager:
     def workspace_gc_cleanup(self, workspace_id: str) -> dict[str, Any]:
         """Reclaim a non-active merged workspace after verifying all static cleanup guards."""
         ws = self._require_workspace(workspace_id)
-        key = os.path.normcase(str(self._get_workspace_project_root(ws).resolve()))
-        with self._project_locks_guard:
-            lock = self._project_locks.setdefault(key, threading.RLock())
-        with lock:
+        with self._workspace_mutation_lock(ws, self.workspace_source_root(ws)):
             with self._lock:
                 ws = self._require_workspace(workspace_id)
                 ws_path = Path(ws["path"])

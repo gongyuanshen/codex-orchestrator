@@ -249,16 +249,17 @@ flowchart LR
 
 ### 1. 非 Git 目录 `snapshot` 隔离、体积上限与 `.triignore` 过滤
 
-- 当目标目录不是 Git 仓库时，`WorkspaceManager` 会回退至 `mode="snapshot"`，将受纳文件复制一份到 `<project_root>/.swarm-workspaces/<run>-<worker>` 作为三方比较基线。
+- 没有已提交 Git 基线时使用 `mode="snapshot"`。指定 `execution_root` 后，只从该子目录复制文件、扫描准入指纹和合并，`file_ownership` 与验收路径也相对于该子目录；未指定时使用项目根。已有 Git 提交的 clone/worktree 仍以仓库根为源码坐标。
+- 派单前查看 `run_create` 返回的 `project_root`（项目归属）和 `source_root`（扫描及合并范围）；派单返回的 `workspace.path` 是隔离副本，`workspace.source_root` 是它的来源。新派单不接收来源不匹配的历史工作区；已准入步骤继续使用原有源码坐标，不搬移旧工作区，也不重解释旧证据。
 - **体积阈值保护（`TRI_ORCH_MAX_SNAPSHOT_MB`）**：在执行快照拷贝前会先估算源目录的文件数与总字节数；默认上限为 **`500` MB**（设为 `0` 表示不限制）。一旦超限将直接拒绝创建并给出明确错误提示，严禁静默硬拷贝数 GB 构建目录；可通过改用 Git 仓库、缩小 `execution_root`、配置 `.triignore` 或调整环境变量解决。
-- **内置排除与 `.triignore`**：快照与状态比对会自动跳过内置 `SNAPSHOT_EXCLUDE_DIRS`（含 `.swarm-workspaces`、`.git`、`node_modules`、`.venv`、`__pycache__`、`.pytest_cache`、`.ruff_cache`、`.mypy_cache` 以及常见构建/缓存目录 `bin`、`obj`、`dist`、`build`、`out`、`target` 等），并支持在项目根目录放置可选 **`.triignore`** 文件（按行配置目录名或 glob 模式进行过滤）。
+- **内置排除与 `.triignore`**：快照与状态比对会自动跳过内置 `SNAPSHOT_EXCLUDE_DIRS`（含 `.swarm-workspaces`、`.git`、`node_modules`、`.venv`、`__pycache__`、`.pytest_cache`、`.ruff_cache`、`.mypy_cache` 以及常见构建/缓存目录 `bin`、`obj`、`dist`、`build`、`out`、`target` 等），并读取有效源码根下的可选 **`.triignore`**（逐行设置目录名或 glob 模式）。子目录快照不继承父目录规则。
 
 ### 2. 数据目录、隔离工作区与备份位置及生命周期
 
 | 存储路径 | 内容组成 | 生命周期与清理边界 |
 | :--- | :--- | :--- |
 | **`%LOCALAPPDATA%\tri-orchestrator`**（Windows）<br>`~/.local/share/tri-orchestrator`（POSIX）<br>（`TRI_ORCH_DATA_DIR`） | - `state.db`：SQLite WAL 状态机库<br>- `daemon.log` / `shim.log`：运行日志（`RotatingFileHandler` 自动轮转）<br>- `results/`：超大 MCP 返回体缓存 JSON<br>- `receipts/`：派发与验收 SHA-256 回执 | `state.db` 与 `receipts/` 长期留存以保留审计轨迹；`results/` 下缓存文件超过 `TRI_ORCH_RESULT_TTL_SEC`（默认 `86400` 秒）或超出最近 `TRI_ORCH_RESULT_MAX_FILES`（默认 `50` 份）时自动清理。 |
-| **`<project_root>/.swarm-workspaces/`** | 每个隔离写入子代理一个子目录（`git_clone` 或 `snapshot` 复制目录） | 任务结束调用 `workflow_closeout_run` / `workspace_cleanup` 时回收；已合入且无未提交改动的过期工作区超过 `TRI_ORCH_WORKSPACE_RETENTION_SEC`（默认 `86400` 秒）由 GC 清理。可检测到的未合入改动会阻止清理；被 Git 或快照规则忽略的文件不算改动，不要把它们的唯一副本放在临时工作区。 |
+| **`<execution_root 或 source_root>/.swarm-workspaces/`** | 每个隔离写入子代理一个子目录（`git_clone` 或 `snapshot` 复制目录） | 任务结束调用 `workflow_closeout_run` / `workspace_cleanup` 时回收；已合入且无未提交改动的过期工作区超过 `TRI_ORCH_WORKSPACE_RETENTION_SEC`（默认 `86400` 秒）由 GC 清理。可检测到的未合入改动会阻止清理；被 Git 或快照规则忽略的文件不算改动，不要把它们的唯一副本放在临时工作区。 |
 | **`~/.codex/backups/`** 与<br>`~/.codex/plugins/cache/tri-orchestrator/` | - `tri-orchestrator-baseline`：首次安装前配置基线<br>- `tri-orchestrator-2*`：历次安装配置与角色备份<br>- `plugin-backup-*`：插件重装/升级残留 staging 目录 | 安装脚本仅备份 `config.toml` 与必要角色 TOML（绝不拷贝 `.venv`），永久保留唯一 `tri-orchestrator-baseline` 与最近 `N=3` 个时间戳备份（`-KeepBackups` / `--keep-backups` 可覆盖）；`scripts/upgrade.py verify` / `prune` 轮转清理已验证完成的旧升级备份与过期 `plugin-backup-*` staging 目录。 |
 
 ### 3. 三种存储清理与 GC 触发方式

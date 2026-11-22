@@ -107,6 +107,20 @@ def test_shared_workflow_documents_nuanced_fork_turns_and_reasoning_effort() -> 
     _assert_native_model_selection(shared)
 
 
+def test_swarm_reasoning_effort_records_per_task_plan_and_observation() -> None:
+    _, heading, rest = _skill_text("swarm").partition("### Per-task reasoning effort and evidence")
+    assert heading, "Swarm must define per-task reasoning evidence"
+    rules = rest.split("\n## ", 1)[0]
+    for expected in (
+        "before first spawn", "`medium`", "`high`", "`ultra`", 'fork_turns="none"', 'fork_turns="all"',
+        "`target_effort`", "`selection_reason`", "`planned_source`", "`override_unavailable_reason`",
+        "`explicit`", "`role_override`", "`agents_default`", "`session_inheritance`", "`unknown`",
+        "`body_md`", "`board_post`", "`codex_thread_id`", "first turn", "`observed_effort`",
+        "`observed_source`", "`evidence_ref`", "`unverified`", "does not change verification gates",
+    ):
+        assert expected in rules
+
+
 def test_shared_verification_contract_explains_group_boundaries_and_keepalive() -> None:
     shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
     assert "consecutive commands with the same `parallel_group`" in shared

@@ -21,7 +21,7 @@ from typing import Any
 from orchestrator import codex_bridge
 from orchestrator.board import BoardService, _strip_artifact_manifests, _strip_step_manifests
 from orchestrator.native_actions import NativeActionStore, digest as native_digest
-from orchestrator.inbox import INBOX_TOOL_DEFINITIONS, InboxStore
+from orchestrator.inbox import INBOX_TOOL_DEFINITIONS, InboxConflictError, InboxStore
 from orchestrator.workflow import ENV_PROFILES, WorkflowConflictError, WorkflowService
 from orchestrator.db import (
     VALID_MSG_TYPES,
@@ -87,6 +87,9 @@ def _compact_workspace_payload(
         for k, v in ws.items()
         if k not in {"snapshot_manifest", "snapshot_manifest_json"}
     }
+    manifest = ws.get("snapshot_manifest")
+    if isinstance(manifest, dict) and (source_root := manifest.get("project_root")):
+        compact["source_root"] = source_root
     merged_stats = _extract_workspace_copy_stats(ws)
     if extra_stats:
         for key in ("copied_bytes", "file_count"):
@@ -757,8 +760,8 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                     "additionalProperties": False,
                 },
                 "sender": {"type": "string", "default": "coordinator"},
-                "message_key": {"type": "string"},
-                "key": {"type": "string"},
+                "message_key": {"type": "string", "description": "Unique key for this dispatch attempt. Choose it before sending; recover a lost response via inbox_get(run_id, sender, message_key)."},
+                "key": {"type": "string", "description": "Alias for message_key."},
                 "kind": {"type": "string", "enum": ["task", "rework", "review", "result", "notice"]},
                 "subject": {"type": "string"},
                 "summary": {"type": "string"},
@@ -1284,13 +1287,16 @@ class RpcDispatcher:
                 trigger_model=trigger_model,
                 trigger_reasoning_effort=trigger_reasoning_effort,
             )
+            source_root = str(self.workspace_mgr.run_source_root(run["id"]))
+            project_root = self.db.get_project(run["project_id"])["root_path"]
         self._emit("run_updated", {"run_id": run["id"], "run": run}, run_id=run["id"])
         if session_id:
             self._emit("session_updated", {"run_id": run["id"], "session_id": session_id}, run_id=run["id"])
             if previous_run_id and previous_run_id != run["id"]:
                 self._emit("session_updated", {"run_id": previous_run_id, "session_id": session_id,
                                                "turn_id": turn_id}, run_id=previous_run_id)
-        return {**run, "cli_executables": _discover_cli_executables()}
+        return {**run, "project_root": project_root, "source_root": source_root,
+                "cli_executables": _discover_cli_executables()}
 
     @staticmethod
     def _is_git_project_root(root: Path) -> bool:
@@ -1515,7 +1521,15 @@ class RpcDispatcher:
         return result
 
     def _handle_inbox_get(self, args: dict[str, Any]) -> dict[str, Any]:
-        return self.inbox.get(**args)
+        if set(args) == {"message_id"}:
+            return self.inbox.get(self._require_str(args, "message_id"))
+        if set(args) != {"run_id", "sender", "message_key"}:
+            raise ValueError("inbox_get requires either message_id or run_id, sender and message_key")
+        return self.inbox.lookup_dispatch(
+            self._require_str(args, "run_id").strip(),
+            self._require_str(args, "sender").strip(),
+            self._require_str(args, "message_key").strip(),
+        )
 
     def _handle_inbox_ack(self, args: dict[str, Any]) -> dict[str, Any]:
         message = self.inbox.ack(**args)
@@ -1674,6 +1688,11 @@ class RpcDispatcher:
         create_ws = args.get("create_workspace", False)
         if type(create_ws) is not bool:
             raise ValueError("create_workspace must be a boolean")
+        sender = str(args.get("sender") or "coordinator").strip()
+        if not sender:
+            raise ValueError("sender must be a non-empty string")
+        key_field = "message_key" if args.get("message_key") else "key"
+        explicit_key = self._require_str(args, key_field).strip() if key_field in args else None
 
         # Fence expired leases before entering the composite transaction so a rollback never erases fences.
         self.native_actions.expire()
@@ -1698,6 +1717,13 @@ class RpcDispatcher:
                     raise NotFoundError(f"Run not found: {run_id}")
                 if run["status"] != "active":
                     raise WorkflowConflictError(f"Workflow run is not active: {run_id}")
+                if explicit_key is not None and conn.execute(
+                    "SELECT 1 FROM inbox_messages WHERE run_id=? AND sender=? AND key=?",
+                    (run_id, sender, explicit_key),
+                ).fetchone() is not None:
+                    raise InboxConflictError(
+                        "Dispatch message_key already exists; use inbox_get(run_id, sender, message_key) to reconcile"
+                    )
 
                 raw_step_id = args.get("step_id")
                 existing_step: dict[str, Any] | None = None
@@ -2014,7 +2040,6 @@ class RpcDispatcher:
                     self.workflow._bindings(step, dispatch=True, allow_lazy_verifier=allow_lazy)
 
                 # 5) inbox_send
-                sender = str(args.get("sender") or "coordinator").strip()
                 default_kind = {
                     "dispatch": "task",
                     "start_rework": "rework",
@@ -2033,11 +2058,7 @@ class RpcDispatcher:
                 if not isinstance(raw_body, str) or not raw_body.strip():
                     raise ValueError("body_md or instruction must be a non-empty string")
 
-                msg_key = str(
-                    args.get("message_key")
-                    or args.get("key")
-                    or f"{step['id']}:{dispatch_action}:{step['state']}:v{step['packet_version']}:c{step['contract_revision']}:a{step['attempt']}:r{step['revision']}"
-                ).strip()
+                msg_key = explicit_key or f"{step['id']}:{dispatch_action}:{step['state']}:v{step['packet_version']}:c{step['contract_revision']}:a{step['attempt']}:r{step['revision']}"
 
                 sent = self.inbox.send(
                     run_id=run_id,
@@ -2077,6 +2098,11 @@ class RpcDispatcher:
                     _skip_expire=True,
                 )
                 assert begun is not None
+                # Recovery must identify this attempt's workspace even if the step is later re-dispatched.
+                conn.execute(
+                    "UPDATE native_actions SET snapshot_json=? WHERE action_id=?",
+                    (json.dumps(begun["snapshot"] | {"dispatch_workspace_id": resolved_ws_id}, ensure_ascii=False), begun["action_id"]),
+                )
 
                 # 7) Optional session_id binding
                 if args.get("session_id") is not None:
@@ -2156,6 +2182,7 @@ class RpcDispatcher:
             "workspace": compact_ws,
             "worker": worker,
             "message_id": msg["id"],
+            "message_key": msg["key"],
             "board_seq": msg["board_seq"],
             "action_id": begun["action_id"],
             "action_type": begun["action_type"],

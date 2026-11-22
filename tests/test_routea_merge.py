@@ -6,7 +6,7 @@ import pytest
 
 from orchestrator.config import Settings
 from orchestrator.db import Database
-from orchestrator.workspace_mgr import WorkspaceManager
+from orchestrator.workspace_mgr import WorkspaceCleanupGuardError, WorkspaceManager
 from orchestrator.workflow import WorkflowService, WorkflowConflictError
 import orchestrator.workspace_mgr as workspace_module
 
@@ -58,6 +58,40 @@ def test_reconcile_cannot_bypass_candidate_gate(tmp_path):
         assert (root / "app.txt").read_text(encoding="utf-8") == "before\n"
     finally:
         db.close()
+
+
+def test_nested_snapshot_mutations_share_registered_project_lock(tmp_path, monkeypatch):
+    root, db, _, mgr, parent_ws = _setup(tmp_path)
+    with db:
+        execution = root / "slice"
+        execution.mkdir()
+        nested = db.create_run(mode="boost", title="nested", project_root=root, execution_root=str(execution))
+        nested_ws = mgr.workspace_create(nested["id"], "nested")
+        external = tmp_path / "explicit"
+        external.mkdir()
+        external_ws = mgr.workspace_create(nested["id"], "external", project_root=external)
+
+        keys = []
+
+        class TrackLocks(dict):
+            def setdefault(self, key, default):
+                keys.append(key)
+                return super().setdefault(key, default)
+
+        monkeypatch.setattr(WorkspaceManager, "_project_locks", TrackLocks())
+        with pytest.raises(WorkflowConflictError, match="owning workflow step"):
+            mgr.workspace_merge(parent_ws["id"])
+        with pytest.raises(WorkflowConflictError, match="owning workflow step"):
+            mgr.workspace_merge(nested_ws["id"])
+        with pytest.raises(WorkspaceCleanupGuardError, match="must be 'merged'"):
+            mgr.workspace_cleanup(nested_ws["id"])
+        with pytest.raises(WorkspaceCleanupGuardError, match="run status"):
+            mgr.workspace_gc_cleanup(nested_ws["id"])
+        with pytest.raises(WorkspaceCleanupGuardError, match="must be 'merged'"):
+            mgr.workspace_cleanup(external_ws["id"])
+
+        assert keys[:4] == [keys[0]] * 4
+        assert keys[4] != keys[0]
 
 
 def _approve(tmp_path, db, run, ws):

@@ -127,6 +127,51 @@ class InboxStore:
                 raise NotFoundError(f"Inbox message not found: {message_id}")
             return _message(row)
 
+    def lookup_dispatch(self, run_id: str, sender: str, message_key: str) -> dict[str, Any]:
+        """Read one dispatch receipt without re-running admission or waking the host."""
+        identity = dict(run_id=run_id, sender=sender, message_key=message_key)
+        with self.db.read_connection() as conn:
+            if conn.execute("SELECT 1 FROM runs WHERE id=?", (run_id,)).fetchone() is None:
+                raise NotFoundError(f"Run not found: {run_id}")
+            row = conn.execute(
+                """SELECT m.*, s.state AS step_state, s.revision AS step_revision,
+                          s.workspace_id AS step_workspace_id,
+                          a.action_id, a.action_type, a.status AS action_status, a.revision AS action_revision,
+                          a.outcome AS action_outcome, a.lease_expires_at,
+                          json_extract(a.snapshot_json, '$.pending_agent_path') AS pending_agent_path,
+                          json_type(a.snapshot_json, '$.dispatch_workspace_id') AS workspace_record,
+                          w.id AS workspace_id, w.path AS workspace_path, w.mode AS workspace_mode,
+                          w.status AS workspace_status
+                   FROM inbox_messages m
+                   LEFT JOIN workflow_steps s ON s.id=m.step_id AND s.run_id=m.run_id
+                   LEFT JOIN native_actions a ON a.run_id=m.run_id AND a.source_type='inbox' AND a.source_id=m.id
+                   LEFT JOIN workspaces w ON w.run_id=m.run_id
+                       AND w.id=json_extract(a.snapshot_json, '$.dispatch_workspace_id')
+                   WHERE m.run_id=? AND m.sender=? AND m.key=?""",
+                (run_id, sender, message_key),
+            ).fetchone()
+        if row is None:
+            return {"status": "not_visible_yet", **identity}
+        return {
+            "status": "found", **identity, "message": _message(row),
+            "step": {
+                "id": row["step_id"], "state": row["step_state"], "revision": row["step_revision"],
+                "workspace_id": row["step_workspace_id"],
+            } if row["step_id"] else None,
+            "native_action": {
+                "action_id": row["action_id"], "action_type": row["action_type"], "source_id": row["id"],
+                "status": row["action_status"], "revision": row["action_revision"],
+                "outcome": row["action_outcome"], "lease_expires_at": row["lease_expires_at"],
+                "lease_expired": row["lease_expires_at"] is not None and row["lease_expires_at"] <= time.time(),
+                "target_agent_path": row["pending_agent_path"] or row["recipient_agent_id"],
+            } if row["action_id"] else None,
+            "workspace_recorded": row["workspace_record"] is not None,
+            "workspace": {
+                "id": row["workspace_id"], "path": row["workspace_path"],
+                "mode": row["workspace_mode"], "status": row["workspace_status"],
+            } if row["workspace_id"] else None,
+        }
+
     def ack(self, message_id: str, recipient: str, status: str, evidence: str) -> dict[str, Any]:
         _validate_text(message_id=message_id, recipient=recipient, status=status, evidence=evidence)
         if status not in ACK_STATUSES:
@@ -393,10 +438,13 @@ INBOX_TOOL_DEFINITIONS = [{'name': 'inbox_send',
                                'body_md'],
                   'additionalProperties': False}},
  {'name': 'inbox_get',
-  'description': 'Read a durable message and its receipt history by stable message ID.',
+  'description': 'Read a durable message by ID, or recover dispatch state by run_id/sender/message_key. '
+                 'not_visible_yet does not prove rollback; do not replay the dispatch.',
   'inputSchema': {'type': 'object',
-                  'properties': {'message_id': {'type': 'string'}},
-                  'required': ['message_id'],
+                  'properties': {'message_id': {'type': 'string'}, 'run_id': {'type': 'string'},
+                                 'sender': {'type': 'string'}, 'message_key': {'type': 'string'}},
+                  'oneOf': [{'required': ['message_id'], 'maxProperties': 1},
+                            {'required': ['run_id', 'sender', 'message_key'], 'maxProperties': 3}],
                   'additionalProperties': False}},
  {'name': 'inbox_ack',
   'description': 'Record acceptance, completion/failure or explicit cancellation. Cancellation '

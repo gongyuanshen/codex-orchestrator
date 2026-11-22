@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from orchestrator.native_actions import NativeActionStore, NativeActionConflictError
 from orchestrator.db import Database
@@ -80,6 +82,24 @@ def test_expired_late_receipt_persists_fence(setup):
         store.update(action='record',action_id=row['action_id'],expected_revision=row['revision'],claim_token=row['claim_token'],outcome='confirmed',evidence_ref='fixture:late',evidence_digest='c'*64,result='late')
     assert store.get(row['action_id'])['status']=='needs_reconciliation'
     assert store.get(row['action_id'])['history'][-1]['reason']=='lease_expired'
+
+def test_reclaim_after_definite_rejection_preserves_dispatch_workspace(setup):
+    db, board, run, message, store = setup
+    args = claim_args(setup)
+    claimed = store.update(action='claim', **args)
+    frozen = claimed['snapshot'] | {'dispatch_workspace_id': 'ws_original'}
+    with db.transaction() as conn:
+        conn.execute('UPDATE native_actions SET snapshot_json=? WHERE action_id=?',
+                     (json.dumps(frozen), claimed['action_id']))
+    begun = store.update(action='begin', action_id=claimed['action_id'],
+                         expected_revision=claimed['revision'], claim_token=claimed['claim_token'])
+    rejected = store.update(action='record', action_id=begun['action_id'], expected_revision=begun['revision'],
+                            claim_token=begun['claim_token'], outcome='rejected',
+                            evidence_ref='fixture:rejected', evidence_digest='a'*64, result='Explicit host rejection')
+    assert rejected['status'] == 'failed'
+    reclaimed = store.update(action='claim', **args)
+    assert reclaimed['action_id'] == begun['action_id']
+    assert reclaimed['snapshot']['dispatch_workspace_id'] == 'ws_original'
 
 def test_control_uses_original_id_and_does_not_ack(setup):
     db,board,run,message,store=setup

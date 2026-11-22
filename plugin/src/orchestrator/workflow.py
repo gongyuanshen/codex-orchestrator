@@ -12,6 +12,7 @@ from typing import Any
 from orchestrator.artifacts import capture_content, capture_evidence, digest, evidence_current, recapture
 from orchestrator.db import Database, NotFoundError
 from orchestrator.admission import ownership_scopes, overlap, contains
+from orchestrator.workspace_mgr import WorkspaceManager
 
 EXECUTION_KINDS = frozenset({'native', 'coordinator_local'})
 
@@ -122,18 +123,51 @@ def _decode(row: sqlite3.Row) -> dict[str, Any]:
 class WorkflowService:
     def __init__(self, db: Database):
         self.db = db
+        self.workspaces = WorkspaceManager(db)
 
     def _steps(self, run_id: str) -> list[dict]:
         with self.db.read_connection() as conn:
             return [_decode(row) for row in conn.execute(
                 'SELECT * FROM workflow_steps WHERE run_id=? ORDER BY created_at,id', (run_id,))]
 
-    def _project_root(self, run_id: str) -> Path:
-        return Path(self.db.get_project(self.db.get_run(run_id)['project_id'])['root_path'])
+    def _frozen_source_root(self, step: dict) -> Path | None:
+        checkpoint = step['checkpoint']
+        if 'source_root' in checkpoint:
+            return Path(checkpoint['source_root'])
+        admission = checkpoint.get('admission')
+        if admission is not None and 'source_root' in admission:
+            return Path(admission['source_root'])
+        if not step['workspace_id'] and (admission is not None or 'original_bindings' in checkpoint):
+            # Historical workspace-free steps used project coordinates even before admission snapshots.
+            return self.workspaces.registered_project_root(step['run_id'])
+        return None
+
+    def _source_root(self, step: dict) -> Path:
+        frozen = self._frozen_source_root(step)
+        if step['workspace_id']:
+            workspace = self.db.get_workspace(step['workspace_id'])
+            if workspace is None:
+                raise NotFoundError(f'Workspace not found: {step["workspace_id"]}')
+            source = self.workspaces.workspace_source_root(workspace)
+            if frozen is not None and source != frozen:
+                raise WorkflowConflictError(f'Workspace source root {source} differs from frozen root {frozen}; reconciliation required')
+            return source
+        if frozen is not None:
+            return frozen
+        run_id = step['run_id']
+        if self._run(run_id, active=False)['workflow_version'] < 4:
+            # workflow1 did not store admission or binding checkpoints.
+            return self.workspaces.registered_project_root(run_id)
+        return self.workspaces.run_source_root(run_id)
+
+    @staticmethod
+    def _require_workspace_source(source_root: Path, expected: Path) -> None:
+        if source_root != expected:
+            raise ValueError(f'Workspace source root {source_root} does not match expected source root {expected}')
 
     def _scopes(self, step: dict) -> list[str]:
         packet = self._packet(step)
-        return ownership_scopes(self._project_root(step['run_id']), packet['file_ownership'][step['owner']])
+        return ownership_scopes(self._source_root(step), packet['file_ownership'][step['owner']])
 
     def _ancestors(self, step: dict) -> set[str]:
         result, pending = set(), list(step['dependencies'])
@@ -159,11 +193,14 @@ class WorkflowService:
         boundary = step['checkpoint'].get('local_revision_boundary')
         if (not boundary or boundary['agent_id'] != step['owner_agent_id']
                 or any(boundary[key] != step[key] for key in ('revision', 'packet_version', 'contract_revision', 'attempt'))
-                or boundary['content_digest'] != digest(capture_content(self._project_root(step['run_id']))['manifest'])):
+                or boundary['content_digest'] != digest(capture_content(self._source_root(step))['manifest'])):
             raise WorkflowConflictError('Fresh current local_revision_boundary required before revising coordinator-local work')
 
     def _admit(self, step: dict, *, first: bool) -> None:
         """Called only inside step_advance's BEGIN IMMEDIATE admission transaction."""
+        source_root = self._source_root(step)
+        if first and step['workspace_id'] and self._frozen_source_root(step) is None:
+            self._require_workspace_source(source_root, self.workspaces.run_source_root(step['run_id']))
         scopes = self._scopes(step)
         ancestors = self._ancestors(step)
         for other in self._steps(step['run_id']):
@@ -174,6 +211,8 @@ class WorkflowService:
                 if 'original_bindings' in other['checkpoint']:
                     self._quiescent(other, other['checkpoint'].get('owner_last_dispatch_at', other['created_at']))
                 continue
+            if self._source_root(other) != source_root:
+                raise WorkflowConflictError('Workflow steps use different source roots; reconciliation required')
             conflict = overlap(scopes, self._scopes(other))
             if not conflict:
                 continue
@@ -205,13 +244,14 @@ class WorkflowService:
                 'packet_version': step['packet_version'], 'contract_revision': step['contract_revision'],
                 'execution_kind': step['checkpoint'].get('execution_kind', 'native'),
                 'dependencies': dependencies, 'allowed_scopes': scopes,
-                'base_manifest': capture_content(self._project_root(step['run_id']))['manifest'],
+                'source_root': str(source_root), 'base_manifest': capture_content(source_root)['manifest'],
                 'prior_merge_ids': sorted(merge['merge_id'] for current in self._steps(step['run_id'])
                     for merge in current['checkpoint'].get('merge_history', []))}
         else:
             admission = step['checkpoint'].get('admission')
             if (not admission or any(admission[key] != step[key] for key in ('packet_version', 'contract_revision'))
                     or admission.get('execution_kind', 'native') != step['checkpoint'].get('execution_kind', 'native')
+                    or ('source_root' in admission and Path(admission['source_root']) != source_root)
                     or admission['allowed_scopes'] != scopes or set(admission['dependencies']) != ancestors):
                 raise WorkflowConflictError('Missing or changed dependency admission; reconciliation required')
             for identity, frozen in admission['dependencies'].items():
@@ -246,7 +286,7 @@ class WorkflowService:
             if merge['proof']['mode'] == 'snapshot' and merge['proof']['target_manifest'] != after:
                 raise WorkflowConflictError('Merge proof does not certify its recorded target')
             current = after
-        if capture_content(self._project_root(step['run_id']))['manifest'] != current:
+        if capture_content(self._source_root(step))['manifest'] != current:
             raise WorkflowConflictError('Foreign changes or missing merge chain proof; reconciliation required')
         return current
 
@@ -256,9 +296,15 @@ class WorkflowService:
         covered = {criterion for step in steps for criterion in step['criteria']}
         uncovered = sorted(set(packet['acceptance_criteria']) - covered) if packet else []
         conflicts = []
-        if self.db.get_run(run_id)['workflow_version'] in {4, 5}:
+        if len(steps) > 1 and self.db.get_run(run_id)['workflow_version'] in {4, 5}:
+            roots = {step['id']: self._source_root(step) for step in steps}
             for index, step in enumerate(steps):
                 for other in steps[index + 1:]:
+                    root, other_root = roots[step['id']], roots[other['id']]
+                    if root != other_root:
+                        conflicts.append({'step_id': step['id'], 'other_step_id': other['id'],
+                                          'paths': [str(root), str(other_root)], 'reason': 'different_source_roots'})
+                        continue
                     if other['id'] in self._ancestors(step) or step['id'] in self._ancestors(other):
                         continue
                     conflict = overlap(self._scopes(step), self._scopes(other))
@@ -540,8 +586,6 @@ class WorkflowService:
             if not set(criteria) <= set(packet_criteria):
                 raise ValueError('Step criteria must come from the frozen task packet')
             self._owned_paths(packet, owner)
-            if run['workflow_version'] in {4, 5}:
-                ownership_scopes(self._project_root(run_id), packet['file_ownership'][owner])
             old = self.get_step(step_id) if step_id else None
             if run['workflow_version'] == 5:
                 self._require_no_fenced_spawn(run_id, owner, verifier)
@@ -575,6 +619,7 @@ class WorkflowService:
                     raise ValueError('Author and verifier must be different native agents')
                 author_aid = author['agent_id']
                 gate_aid = gate['agent_id']
+            workspace = None
             if workspace_id:
                 workspace = self.db.get_workspace(workspace_id)
                 if workspace is None or workspace['run_id'] != run_id or workspace['worker_name'] != owner:
@@ -583,6 +628,12 @@ class WorkflowService:
                 raise ValueError('Cannot move or rename an existing workflow step')
             if old and old['revision'] != expected_revision:
                 raise WorkflowConflictError('Workflow revision conflict')
+            executed = bool(old and 'original_bindings' in old['checkpoint'])
+            if run['workflow_version'] in {4, 5}:
+                source_root = self._source_root(old) if executed else self.workspaces.run_source_root(run_id)
+                if workspace is not None:
+                    self._require_workspace_source(self.workspaces.workspace_source_root(workspace), source_root)
+                ownership_scopes(source_root, packet['file_ownership'][owner])
             if old and run['workflow_version'] == 5:
                 frozen_v = old['checkpoint'].get('frozen_verifier_binding')
                 if frozen_v and (verifier != frozen_v.get('verifier') or gate_aid != frozen_v.get('verifier_agent_id')):
@@ -632,6 +683,7 @@ class WorkflowService:
                 checkpoint = old['checkpoint']
                 checkpoint.pop('challenge', None)
                 if run['workflow_version'] in {4, 5}:
+                    checkpoint['source_root'] = str(source_root)
                     checkpoint['complexity'] = complexity
                     checkpoint['execution_kind'] = execution_kind
                     checkpoint.pop('admission', None)
@@ -659,7 +711,9 @@ class WorkflowService:
                      dependencies_json,criteria_json,handoff_required,updated_at,created_at,state)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'planned')''', (sid, run_id, step_key, *values, now))
                 if run['workflow_version'] in {4, 5}:
-                    init_cp: dict[str, Any] = {'complexity': complexity, 'execution_kind': execution_kind}
+                    init_cp: dict[str, Any] = {
+                        'complexity': complexity, 'execution_kind': execution_kind, 'source_root': str(source_root),
+                    }
                     if run['workflow_version'] == 5:
                         if not author_aid and author.get('pending_agent_path'):
                             init_cp['pending_owner_path'] = author['pending_agent_path']
@@ -729,7 +783,7 @@ class WorkflowService:
                     raise WorkflowConflictError('Local revision boundary requires current original local owner, completed-phase evidence and live binding')
                 boundary = {key: step[key] for key in ('packet_version', 'contract_revision', 'attempt')}
                 boundary.update(revision=step['revision'] + 1, agent_id=agent_id, evidence=evidence,
-                    content_digest=digest(capture_content(self._project_root(step['run_id']))['manifest']), recorded_at=time.time())
+                    content_digest=digest(capture_content(self._source_root(step))['manifest']), recorded_at=time.time())
                 checkpoint['local_revision_boundary'] = boundary
                 checkpoint.setdefault('local_revision_boundaries', []).append(boundary)
                 return self._set(step, state, checkpoint)
@@ -909,8 +963,7 @@ class WorkflowService:
             run = self._run(step['run_id'])
             self._packet(step)
             self._bindings(step)
-            project = self.db.get_project(run['project_id'])
-            root, mode, baseline = Path(project['root_path']), 'snapshot', {}
+            root, mode, baseline = self._source_root(step), 'snapshot', {}
             if scope == 'candidate' and step['workspace_id']:
                 ws = self.db.get_workspace(step['workspace_id'])
                 root, mode, baseline = Path(ws['path']), ws['mode'], ws['snapshot_manifest'].get('files', {})
@@ -1247,13 +1300,14 @@ class WorkflowService:
                 admission = data.get('admission')
                 if admission and admission['dependencies']:
                     self._admitted_manifest(step)
-                checkpoint['observed_before_manifest'] = capture_content(self._project_root(step['run_id']))['manifest']
+                source_root = self._source_root(step)
+                checkpoint['observed_before_manifest'] = capture_content(source_root)['manifest']
                 if checkpoint['mode'] == 'snapshot':
                     before, after = checkpoint['observed_before_manifest'], checkpoint['desired_manifest']
                     changes = {p for p in set(before) | set(after) if before.get(p) != after.get(p)}
                 else:
                     from orchestrator.artifacts import git
-                    changes = git(self._project_root(step['run_id']), '-c', 'core.quotePath=false',
+                    changes = git(source_root, '-c', 'core.quotePath=false',
                         'diff', '--name-only', checkpoint['target_before_commit'], checkpoint['desired_tree']).splitlines()
                 if any(not contains(self._scopes(step), p) for p in changes):
                     raise WorkflowConflictError('Planned merge exceeds frozen ownership')
@@ -1275,12 +1329,12 @@ class WorkflowService:
             checkpoint['merge'].pop('error', None)
             if self.db.get_run(step['run_id'])['workflow_version'] in {4, 5}:
                 before = checkpoint['merge']['observed_before_manifest']
-                after = capture_content(self._project_root(step['run_id']))['manifest']
+                root = self._source_root(step)
+                after = capture_content(root)['manifest']
                 if proof['mode'] == 'snapshot' and proof['target_manifest'] != after:
                     raise WorkflowConflictError('Actual target changed after merge proof capture; reconciliation required')
                 if proof['mode'] == 'git_clone':
                     from orchestrator.artifacts import git
-                    root = self._project_root(step['run_id'])
                     if git(root, 'status', '--porcelain') or git(root, 'rev-parse', 'HEAD') != proof['target_commit'] or git(root, 'rev-parse', 'HEAD^{tree}') != proof['target_tree']:
                         raise WorkflowConflictError('Actual Git target changed after merge proof capture; reconciliation required')
                 changes = {p for p in set(before) | set(after) if before.get(p) != after.get(p)}
