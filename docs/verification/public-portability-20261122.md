@@ -1,6 +1,6 @@
 # v0.6.8 public install and portability audit — 2026-11-22
 
-The published `v0.6.7` tag (`8ee268f`) is the comparison baseline. The changes target `v0.6.8`; the plugin identity, `workflow5` and schema 10 stay the same.
+The published `v0.6.7` tag (`11b1f04`) is the comparison baseline. The changes target `v0.6.8`; the plugin identity, `workflow5` and schema 10 stay the same.
 
 | Reproduced issue | Candidate change |
 | --- | --- |

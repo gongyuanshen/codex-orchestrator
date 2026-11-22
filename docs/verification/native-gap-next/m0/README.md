@@ -10,7 +10,7 @@ $output = Join-Path ([IO.Path]::GetTempPath()) "tri-native-gap-m0-$([guid]::NewG
 .venv/Scripts/python.exe -m pytest -q -W error tests/test_native_gap_baseline.py --basetemp "$output-unit" -p no:cacheprovider
 ```
 
-The runner archives commit `9c29cdb308a92cfdbdf259289bdc284f160abdfd`, imports only its `plugin/src`, and runs its existing workflow/inbox tests and two owned recovery extensions in isolated temporary databases. Contract pytest explicitly uses the archived pyproject config so absolute extension-test paths cannot select the mutable checkout package. It never starts a daemon, invokes a native model, installs a package, or touches port 18790. No new state machine is implemented.
+The runner archives commit `6ccba9bbce41a32818fb6c8a1841b97578904ec7`, imports only its `plugin/src`, and runs its existing workflow/inbox tests and two owned recovery extensions in isolated temporary databases. Contract pytest explicitly uses the archived pyproject config so absolute extension-test paths cannot select the mutable checkout package. It never starts a daemon, invokes a native model, installs a package, or touches port 18790. No new state machine is implemented.
 
 `cases.json` contains all six tasks, actual executable fault seeds and scripted repairs, original frozen business-test bytes and SHA256 provenance, fixed permissions, concurrency, and machine failure/success criteria. Business tests come from the previous modes-20261117 native fixture manifest; they are embedded here so old absolute temporary paths are not runtime dependencies. The original manifest/script files remain read-only.
 
