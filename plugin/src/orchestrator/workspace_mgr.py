@@ -5,6 +5,7 @@ from __future__ import annotations
 import difflib
 import fnmatch
 import hashlib
+import json
 import logging
 import os
 import re
@@ -2585,3 +2586,186 @@ class WorkspaceManager:
                     "status": "cleaned",
                     "path": ws["path"],
                 }
+
+    # ------------------------------------------------------------------
+    # v0.6.11: discard clean, never-merged workspaces of finished runs.
+    #
+    # ``workspace_cleanup`` / GC only reclaim *merged* workspaces, so a workspace whose author never
+    # started (cancelled dispatch) or never wrote anything stays on disk forever once its run fails
+    # or is archived.  Discard is the narrow complement: the run must be finished, the checkout must
+    # be byte-identical to its baseline (+A:0 / ~M:0 / -D:0, Git HEAD at the base commit, branch
+    # unchanged), no native wake for its author may be unresolved, and a bound author must not be
+    # recorded as still working.  Any change at all keeps the "unmerged work is never deleted" rule.
+    # ------------------------------------------------------------------
+    _DISCARD_RUN_STATUSES = frozenset({"failed", "archived", "completed"})
+    _DISCARDABLE_WS_STATUSES = frozenset({"active", "verified", "conflict"})
+
+    def _unresolved_actions_for(self, ws: dict[str, Any]) -> list[dict[str, Any]]:
+        with self.db.read_connection() as conn:
+            rows = conn.execute(
+                "SELECT action_id, recipient, action_type, status, snapshot_json FROM native_actions "
+                "WHERE run_id=? AND status IN ('claimed','invoking','needs_reconciliation')",
+                (ws["run_id"],),
+            ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                snapshot = json.loads(row["snapshot_json"] or "{}")
+            except (TypeError, ValueError):
+                snapshot = {}
+            if row["recipient"] == ws["worker_name"] or snapshot.get("dispatch_workspace_id") == ws["id"]:
+                result.append({
+                    "action_id": row["action_id"],
+                    "recipient": row["recipient"],
+                    "action_type": row["action_type"],
+                    "status": row["status"],
+                })
+        return result
+
+    def workspace_discard_check(self, workspace_id: str) -> dict[str, Any]:
+        """Read-only: may this workspace be discarded?  Never mutates disk or state.db."""
+        ws = self._require_workspace(workspace_id)
+        ws_path = Path(ws["path"])
+        is_reparse = _is_reparse_or_symlink(ws_path)
+        exists = ws_path.exists() or is_reparse
+        base = {
+            "workspace_id": workspace_id,
+            "run_id": ws["run_id"],
+            "worker_name": ws["worker_name"],
+            "mode": ws["mode"],
+            "status": ws["status"],
+            "path": ws["path"],
+            "exists": bool(exists),
+            "unresolved_actions": [],
+        }
+
+        def verdict(ok: bool, reason: str, **extra: Any) -> dict[str, Any]:
+            return {**base, **extra, "discardable": ok, "reason": reason}
+
+        if ws["status"] == "cleaned":
+            if exists:
+                return verdict(False, "Status is 'cleaned' but the directory still exists; inspect it manually")
+            return verdict(True, "Already discarded or cleaned", already_cleaned=True)
+        if ws["status"] == "merged":
+            return verdict(False, "Workspace is merged; use workspace_cleanup / GC instead")
+        if ws["status"] not in self._DISCARDABLE_WS_STATUSES:
+            return verdict(False, f"Workspace status {ws['status']!r} cannot be discarded")
+        run = self.db.get_run(ws["run_id"])
+        if run is None:
+            return verdict(False, f"Run not found: {ws['run_id']}")
+        if run["status"] not in self._DISCARD_RUN_STATUSES:
+            return verdict(False, f"Run status is {run['status']!r}; discard only applies to failed, archived or completed runs")
+        if is_reparse:
+            return verdict(False, "Workspace path is a symlink or junction; refusing automatic removal")
+        unresolved = self._unresolved_actions_for(ws)
+        if unresolved:
+            return verdict(
+                False,
+                f"{len(unresolved)} native action(s) for this workspace are unresolved; reconcile them first "
+                "(list_agents observation, then native_action_update(action='reconcile'))",
+                unresolved_actions=unresolved,
+            )
+        worker = self.db.get_worker_by_name(ws["run_id"], ws["worker_name"])
+        if worker is not None and worker.get("agent_id") and worker.get("status") == "working":
+            return verdict(
+                False,
+                "The bound author is still recorded as working; confirm it ended (list_agents) and record "
+                "worker_status_update(status='stopped') before discarding",
+            )
+
+        if not exists:
+            if self._uses_git_worktree(ws):
+                try:
+                    self._check_worktree_branch_tip(self.workspace_source_root(ws), ws["branch_name"], ws["base_commit"])
+                except (WorkspaceCleanupGuardError, WorkspaceError, OSError) as exc:
+                    return verdict(False, f"Worktree branch moved beyond its base: {exc}")
+            return verdict(True, "Directory already absent; only the record remains",
+                           added_count=0, modified_count=0, deleted_count=0)
+
+        try:
+            status_info = self.workspace_status(workspace_id)
+        except (WorkspaceError, WorkspaceCleanupGuardError, OSError, NotFoundError) as exc:
+            return verdict(False, f"Inspection error: {exc}")
+        if ws["mode"] == "snapshot":
+            added = list(status_info.get("added_files") or [])
+            modified = list(status_info.get("modified_files") or [])
+            deleted = list(status_info.get("deleted_files") or [])
+            counts = {"added_count": len(added), "modified_count": len(modified), "deleted_count": len(deleted)}
+            if added or modified or deleted or status_info.get("dirty"):
+                return verdict(
+                    False,
+                    f"Snapshot has changes (+A:{len(added)}, ~M:{len(modified)}, -D:{len(deleted)}); "
+                    "never discard unmerged work",
+                    **counts,
+                )
+            return verdict(True, "Snapshot is identical to its baseline (+A:0, ~M:0, -D:0)", **counts)
+
+        # git_clone (clone or linked worktree)
+        if not (ws_path / ".git").exists():
+            if any(ws_path.iterdir()):
+                return verdict(False, "Missing .git metadata in a non-empty directory")
+            return verdict(True, "Empty git_clone shell", added_count=0, modified_count=0, deleted_count=0)
+        try:
+            actual_branch = self._current_branch_or_head(ws_path)
+            head = _run_git(ws_path, "rev-parse", "HEAD", check=True).stdout.strip()
+        except (WorkspaceError, OSError, subprocess.CalledProcessError) as exc:
+            return verdict(False, f"Git inspection error: {exc}")
+        changed = list(status_info.get("uncommitted_files") or [])
+        counts = {"added_count": 0, "modified_count": len(changed), "deleted_count": 0,
+                  "commits_ahead": int(status_info.get("commits_ahead") or 0)}
+        if not ws["base_commit"]:
+            return verdict(False, "Missing base commit; cannot prove the clone is unchanged", **counts)
+        if actual_branch != ws["branch_name"]:
+            return verdict(False, f"Workspace is on {actual_branch!r}, expected {ws['branch_name']!r}", **counts)
+        if head != ws["base_commit"] or counts["commits_ahead"]:
+            return verdict(
+                False,
+                f"HEAD {head} has commits beyond base {ws['base_commit']}; never discard unmerged work",
+                **counts,
+            )
+        if changed or status_info.get("dirty"):
+            return verdict(
+                False,
+                f"Working tree has {len(changed)} uncommitted change(s); never discard unmerged work",
+                **counts,
+            )
+        return verdict(True, "Git checkout is at its base commit with a clean tree", **counts)
+
+    def workspace_discard(self, workspace_id: str, reason: str) -> dict[str, Any]:
+        """Remove a clean, never-merged workspace of a finished run and mark it ``cleaned``."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("workspace_discard requires a nonblank reason")
+        ws = self._require_workspace(workspace_id)
+        with self._workspace_mutation_lock(ws, self.workspace_source_root(ws)):
+            with self._lock:
+                check = self.workspace_discard_check(workspace_id)
+                if check.get("already_cleaned"):
+                    return {**check, "discarded": True, "already_cleaned": True}
+                if not check["discardable"]:
+                    raise WorkspaceCleanupGuardError(
+                        f"Refusing discard for workspace {workspace_id}: {check['reason']}"
+                    )
+                ws = self._require_workspace(workspace_id)
+                ws_path = Path(ws["path"])
+                self.remove_workspace_checkout(ws)
+                parent = ws_path.parent
+                if parent.name == WORKSPACES_DIRNAME and parent.exists():
+                    try:
+                        parent.rmdir()
+                    except OSError:
+                        pass
+                self.db.update_workspace(workspace_id, status="cleaned")
+                self.db.insert_board_message(
+                    ws["run_id"],
+                    sender="orchestrator",
+                    channel="main",
+                    msg_type="info",
+                    summary=f"workspace_discard {workspace_id}",
+                    body_md=(
+                        f"Discarded clean, never-merged workspace `{workspace_id}` "
+                        f"(@{ws['worker_name']}, {ws['mode']}).\n\n"
+                        f"- Basis: {check['reason']}\n- Reason: {reason.strip()}\n- Path: `{ws['path']}`"
+                    ),
+                )
+                return {**check, "discarded": True, "already_cleaned": False, "status": "cleaned",
+                        "discard_reason": reason.strip()}

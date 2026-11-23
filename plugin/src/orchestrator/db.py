@@ -31,6 +31,13 @@ VALID_WORKER_ROLES = frozenset(
     {"interviewer", "planner", "investigator", "coder", "verifier", "swarm_worker"}
 )
 VALID_WORKER_STATUSES = frozenset({"waiting", "working", "stopped", "killed"})
+# Default stall threshold = TRI_ORCH_STALL_SEC x role multiplier (explicit stall_threshold_sec wins).
+# Verifiers run whole test suites and authors run long builds between tool calls.
+ROLE_STALL_MULTIPLIER = {"verifier": 3, "coder": 2, "swarm_worker": 2}
+
+
+def default_stall_threshold(stall_sec: float, role: str) -> int:
+    return int(stall_sec) * ROLE_STALL_MULTIPLIER.get(role, 1)
 VALID_MSG_TYPES = frozenset({"info", "handoff", "diff", "test", "alert", "human"})
 VALID_WORKSPACE_MODES = frozenset({"git_clone", "snapshot"})
 VALID_WORKSPACE_STATUSES = frozenset(
@@ -260,7 +267,90 @@ def _worker_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "stalled_alerted": bool(row["stalled_alerted"]),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
+        "effort_plan": _json_or_none(row["effort_plan_json"]) if "effort_plan_json" in keys else None,
+        "effort_observation": (
+            _json_or_none(row["effort_observation_json"]) if "effort_observation_json" in keys else None
+        ),
     }
+
+
+def _json_or_none(raw: Any) -> Any:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+EFFORT_SOURCES = frozenset({
+    "explicit", "role_override", "agents_default", "model_default", "session_inheritance", "unknown",
+})
+EFFORT_EVIDENCE_KINDS = frozenset({"first_turn", "catalog_snapshot", "spawn_result"})
+_EFFORT_PLAN_KEYS = frozenset({"target_effort", "selection_reason", "planned_source", "override_unavailable_reason"})
+_EFFORT_OBSERVATION_KEYS = frozenset({"observed_effort", "observed_source", "evidence_ref", "evidence_kind", "codex_thread_id"})
+
+
+def _short_label(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 32:
+        raise ValueError(f"{field} must be a nonblank string of at most 32 characters")
+    return value.strip()
+
+
+def normalize_effort_plan(plan: Any) -> dict[str, Any]:
+    """Validate a per-task effort plan (frozen with the dispatch; observability only, never a gate)."""
+    if not isinstance(plan, dict):
+        raise ValueError("effort_plan must be an object")
+    unknown = set(plan) - _EFFORT_PLAN_KEYS
+    if unknown:
+        raise ValueError(f"Unknown effort_plan keys: {sorted(unknown)}")
+    result: dict[str, Any] = {"target_effort": _short_label(plan.get("target_effort"), "target_effort")}
+    reason = plan.get("selection_reason")
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("effort_plan.selection_reason must be a nonblank string")
+    result["selection_reason"] = reason.strip()
+    source = plan.get("planned_source")
+    if source not in EFFORT_SOURCES:
+        raise ValueError(f"effort_plan.planned_source must be one of {sorted(EFFORT_SOURCES)}")
+    result["planned_source"] = source
+    override = plan.get("override_unavailable_reason")
+    if override is not None:
+        if not isinstance(override, str) or not override.strip():
+            raise ValueError("effort_plan.override_unavailable_reason must be a nonblank string when given")
+        result["override_unavailable_reason"] = override.strip()
+    result["recorded_at"] = time.time()
+    return result
+
+
+def normalize_effort_observation(observation: Any) -> dict[str, Any]:
+    """Validate an independent effort observation; use 'unverified' when first-turn evidence is missing."""
+    if not isinstance(observation, dict):
+        raise ValueError("observed_effort must be an object")
+    unknown = set(observation) - _EFFORT_OBSERVATION_KEYS
+    if unknown:
+        raise ValueError(f"Unknown observed_effort keys: {sorted(unknown)}")
+    effort = _short_label(observation.get("observed_effort"), "observed_effort")
+    source = observation.get("observed_source", "unknown")
+    if source not in EFFORT_SOURCES:
+        raise ValueError(f"observed_effort.observed_source must be one of {sorted(EFFORT_SOURCES)}")
+    result: dict[str, Any] = {"observed_effort": effort, "observed_source": source}
+    ref = observation.get("evidence_ref")
+    if effort != "unverified" and (not isinstance(ref, str) or not ref.strip()):
+        raise ValueError("observed_effort.evidence_ref is required unless observed_effort is 'unverified'")
+    if isinstance(ref, str) and ref.strip():
+        result["evidence_ref"] = ref.strip()
+    kind = observation.get("evidence_kind")
+    if kind is not None:
+        if kind not in EFFORT_EVIDENCE_KINDS:
+            raise ValueError(f"observed_effort.evidence_kind must be one of {sorted(EFFORT_EVIDENCE_KINDS)}")
+        result["evidence_kind"] = kind
+    thread = observation.get("codex_thread_id")
+    if thread is not None:
+        if not isinstance(thread, str) or not thread.strip():
+            raise ValueError("observed_effort.codex_thread_id must be a nonblank string when given")
+        result["codex_thread_id"] = thread.strip()
+    result["recorded_at"] = time.time()
+    return result
 
 
 def _worker_subagent_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -443,6 +533,8 @@ CREATE TABLE IF NOT EXISTS workers (
     stalled_alerted INTEGER NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
+    effort_plan_json TEXT,
+    effort_observation_json TEXT,
     UNIQUE (run_id, name)
 );
 
@@ -589,6 +681,9 @@ def _migrate_model_metadata(conn: sqlite3.Connection) -> None:
                 "model": "TEXT",
                 "reasoning_effort": "TEXT",
                 "model_provider": "TEXT",
+                # v0.6.11: structured per-task reasoning-effort plan and independent observation.
+                "effort_plan_json": "TEXT",
+                "effort_observation_json": "TEXT",
             }),
         ),
     )
@@ -1604,7 +1699,7 @@ class Database:
         threshold = (
             int(stall_threshold_sec)
             if stall_threshold_sec is not None
-            else int(self.settings.stall_sec)
+            else default_stall_threshold(self.settings.stall_sec, role)
         )
         if threshold <= 0:
             raise ValueError(f"stall_threshold_sec must be > 0, got {threshold}")
@@ -1992,6 +2087,40 @@ class Database:
                 params,
             ).fetchall()
             return [_worker_from_row(r) for r in rows]
+
+    def set_worker_effort(
+        self,
+        run_id: str,
+        worker_name: str,
+        *,
+        plan: dict[str, Any] | None = None,
+        observation: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Store a normalized effort plan and/or observation on a worker (observability only)."""
+        with self.transaction() as conn:
+            existing = self._resolve_worker_in_tx(conn, run_id=run_id, worker_name=worker_name)
+            now = time.time()
+            if plan is not None:
+                conn.execute("UPDATE workers SET effort_plan_json = ?, updated_at = ? WHERE id = ?;",
+                             (json.dumps(plan, ensure_ascii=False), now, existing["id"]))
+            if observation is not None:
+                conn.execute("UPDATE workers SET effort_observation_json = ?, updated_at = ? WHERE id = ?;",
+                             (json.dumps(observation, ensure_ascii=False), now, existing["id"]))
+            row = conn.execute("SELECT * FROM workers WHERE id = ?;", (existing["id"],)).fetchone()
+            return _worker_from_row(row)
+
+    def touch_worker_activity(self, run_id: str, worker_name: str, *, at: float | None = None) -> bool:
+        """Refresh the heartbeat of a *working* worker that just made an MCP call (no status change)."""
+        ts = float(at) if at is not None else time.time()
+        with self.transaction() as conn:
+            changed = conn.execute(
+                """
+                UPDATE workers SET last_heartbeat_at = ?, stalled_alerted = 0
+                WHERE run_id = ? AND name = ? AND status = 'working' AND last_heartbeat_at < ?;
+                """,
+                (ts, run_id, worker_name, ts),
+            )
+            return changed.rowcount == 1
 
     def mark_worker_stalled_alerted(
         self, worker_id: str, *, alerted: bool = True

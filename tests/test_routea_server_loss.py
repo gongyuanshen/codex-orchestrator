@@ -80,7 +80,10 @@ def test_formal_mcp_inflight_loss_preserves_error_and_reconciles_without_replay(
                         return json.loads(text)
 
                     tools = await sdk.list_tools()
-                    assert {"inbox_wait", "inbox_send", "verification_record"} <= {tool.name for tool in tools.tools}
+                    listed = {tool.name for tool in tools.tools}
+                    # Core tier: advanced primitives are unlisted but still callable by name below.
+                    assert {"inbox_wait", "workflow_prepare_dispatch", "tool_advanced"} <= listed
+                    assert not {"inbox_send", "verification_record"} & listed
                     run = await call("run_create", mode="swarm", title="Formal MCP in-flight loss",
                                      project_root=str(project), is_git=False)
                     # Service-loss evidence concerns foundation delivery, not structured work acceptance.

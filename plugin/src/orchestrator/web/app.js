@@ -549,6 +549,7 @@
 
   const STORAGE_CATEGORY_META = {
     cleanable: { label: '可安全清理', tone: 'tint-success', order: 1 },
+    discardable: { label: '已废弃（可安全作废）', tone: 'tint-cyan', order: 1 },
     dirty_review: { label: '含未合入变更待核查', tone: 'tint-warning', order: 0 },
     active: { label: '进行中', tone: 'tint-primary', order: 2 },
   };
@@ -615,6 +616,24 @@
     if (source === 'trigger_snapshot') return '触发快照';
     if (source === 'snapshot') return '历史快照';
     return '未观测';
+  }
+
+  const EFFORT_SOURCE_LABELS = {explicit: '显式参数', role_override: '角色配置覆盖', agents_default: '[agents] 默认', model_default: '模型默认', session_inheritance: '继承会话', unknown: '来源未确认'};
+
+  function describeEffortPlan(worker) {
+    const plan = worker?.effort_plan;
+    const seen = worker?.effort_observation;
+    if (!plan && !seen) return null;
+    const planned = plan ? `计划 ${plan.target_effort}（${EFFORT_SOURCE_LABELS[plan.planned_source] || plan.planned_source}）` : '计划未登记';
+    const observed = seen ? `实际 ${seen.observed_effort}（${EFFORT_SOURCE_LABELS[seen.observed_source] || seen.observed_source}${seen.evidence_kind === 'catalog_snapshot' ? '，目录快照' : seen.evidence_kind === 'first_turn' ? '，首轮记录' : ''}）` : '实际未观察';
+    const mismatch = plan && seen && seen.observed_effort !== 'unverified' && plan.target_effort !== seen.observed_effort;
+    return { text: `${planned} · ${observed}`, mismatch, reason: plan?.selection_reason || '' };
+  }
+
+  function renderEffortPlanChip(worker) {
+    const info = describeEffortPlan(worker);
+    if (!info) return '';
+    return `<span class="chip-tag ${info.mismatch ? 'tint-warning' : 'tint-muted'}" title="${escapeHtml(info.reason)}">${escapeHtml(info.text)}${info.mismatch ? ' · 不一致' : ''}</span>`;
   }
 
   function renderModelBadge(model, effort, opts = {}) {
@@ -3604,6 +3623,32 @@
     return `<p class="overview-footnote">分项审查由原验收者记录；项目目标达成仍需最终集成门禁，不等于多角色独立审查。</p>${reviews.length ? `<details class="workflow-more" data-overview-detail="review-dimensions" ${state.overviewExpanded.has('review-dimensions') ? 'open' : ''}><summary>规格、代码、反例与证据检查（${reviews.length} 份）</summary><ul>${rows}</ul></details>` : '<p class="muted-caption">尚未记录分项审查。</p>'}`;
   }
 
+  const STAGE_LABELS = {dispatch: '派发', author: '作者实现', candidate_review: '候选验收', rework: '返工等待', merge: '合入', integrated_review: '集成验收', handoff: '交接', decision: '等待决策'};
+
+  function formatStageSeconds(seconds) {
+    const total = Math.max(0, Math.round(Number(seconds) || 0));
+    if (total < 60) return `${total}秒`;
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const sec = total % 60;
+    if (h > 0) return m > 0 ? `${h}小时${m}分` : `${h}小时`;
+    return sec > 0 ? `${m}分${sec}秒` : `${m}分`;
+  }
+
+  function renderStageTimings() {
+    const timings = state.workflow?.stage_timings;
+    if (!timings || !Array.isArray(timings.stage_order)) return '';
+    const totals = timings.totals_sec || {};
+    const chips = timings.stage_order.filter((stage) => totals[stage]).map((stage) => `<span class="metric-chip">${escapeHtml(STAGE_LABELS[stage] || stage)} ${escapeHtml(formatStageSeconds(totals[stage]))}</span>`).join('');
+    if (!chips) return '<p class="muted-caption">阶段耗时：尚无已结束的阶段。</p>';
+    const rows = (timings.steps || []).map((step) => {
+      const parts = timings.stage_order.filter((stage) => step.stages_sec?.[stage]).map((stage) => `${STAGE_LABELS[stage] || stage} ${formatStageSeconds(step.stages_sec[stage])}`);
+      const current = step.current_stage ? ` · 当前：${STAGE_LABELS[step.current_stage] || step.current_stage}（自 ${formatLocalTime(step.current_since)}）` : '';
+      return `<li>${escapeHtml(step.step_key)}：${escapeHtml(parts.join(' / ') || '无已结束阶段')}${escapeHtml(current)}</li>`;
+    }).join('');
+    return `<p class="overview-footnote">阶段耗时 · 记录跨度 ${escapeHtml(formatStageSeconds(timings.logged_span_sec))}（按流程转换日志统计，仅供定位慢点，不参与门禁）</p><div class="workflow-delivery tabular">${chips}</div><details class="workflow-more" data-overview-detail="stage-timings" ${state.overviewExpanded.has('stage-timings') ? 'open' : ''}><summary>按步骤查看阶段耗时</summary><ul>${rows}</ul></details>`;
+  }
+
   function renderWorkflowSummary() {
     const version = state.run.workflow_version;
     const versionLabel = version === 0 ? '旧流程，未启用结构化门禁' : [1, 2, 3, 4, 5].includes(version) ? `结构化门禁 · v${version}` : '流程版本未记录';
@@ -3621,7 +3666,7 @@
       return `${stepKey}：${labelWorkflowState(blocker.state)}`;
     });
     const blocking = blockerLabels.length ? `<details class="workflow-blockers" data-overview-detail="workflow-blockers" ${state.overviewExpanded.has('workflow-blockers') ? 'open' : ''}><summary class="workflow-warning">${escapeHtml(blockerLabels[0])}${blockers.length > 1 ? `（共 ${blockers.length} 项阻塞，展开查看）` : '（展开查看）'}</summary><ul>${blockerLabels.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}</ul></details>` : '<p class="overview-footnote">流程记录暂无阻塞；最终完成仍由后端核对当前产物与验收证据。</p>';
-    return `<section class="overview-section workflow-overview" aria-label="结构化流程与收件状态">${heading}${delivery}<p class="overview-footnote">回执不等于独立验收 · 已记录 ${verifications.length} 次验收，是否有效由当前门禁核对。</p>${renderLocalReceipts()}${renderReviewDimensions()}${blocking}${ordered.length ? `<ul class="workflow-steps">${ordered.slice(0, 3).map(renderWorkflowStep).join('')}</ul>${more}` : '<p class="muted-caption">尚未建立工作步骤，不能据此认定任务已验收。</p>'}</section>`;
+    return `<section class="overview-section workflow-overview" aria-label="结构化流程与收件状态">${heading}${delivery}<p class="overview-footnote">回执不等于独立验收 · 已记录 ${verifications.length} 次验收，是否有效由当前门禁核对。</p>${renderLocalReceipts()}${renderReviewDimensions()}${renderStageTimings()}${blocking}${ordered.length ? `<ul class="workflow-steps">${ordered.slice(0, 3).map(renderWorkflowStep).join('')}</ul>${more}` : '<p class="muted-caption">尚未建立工作步骤，不能据此认定任务已验收。</p>'}</section>`;
   }
 
   function hostObservation(worker) {
@@ -3669,9 +3714,24 @@
     const btn = `          <button type="button" class="overview-member" data-worker-id="${escapeHtml(w.id)}">
             <span class="overview-member-role">${renderRoleBadge(w.role, false)}<span>${escapeHtml(labelRole(w.role))}<small>@${escapeHtml(w.name)}</small></span></span>
             <span class="overview-member-work"><span>${escapeHtml(roleResponsibility(w.role))}</span><span class="overview-current-task">最近登记工作：${escapeHtml(w.current_task || '尚未记录')}</span></span>
-            <span class="overview-member-state">${modelBadge}<span class="pill-badge ${statusTone}">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
+            <span class="overview-member-state">${modelBadge}${renderEffortPlanChip(w)}<span class="pill-badge ${statusTone}">登记：${escapeHtml(labelWorkerStatus(w.status))}</span>${renderHostObservation(w)}</span>
           </button>`;
     return subTree ? `<div class="overview-member-wrap">${btn}${subTree}</div>` : btn;
+  }
+
+  function renderReconciliationGuide(projection) {
+    const pending = Number(projection?.needs_reconciliation_count || 0);
+    if (pending <= 0) return '';
+    const runActive = state.run?.status === 'active';
+    const steps = [
+      '先观察宿主真实状态：spawn_agent 调用 list_agents(path_prefix="/root/<task_name>")，其他动作查看子代理当前状态；派单响应丢失时先用 inbox_get(run_id, sender, message_key) 查回原记录。',
+      '把观察结果交给 native_action_update(action="reconcile") 或 native_action_record_call(..., reconcile=True)：看到 /root/<task_name> 就以 outcome="confirmed" 绑定真实 agent_id；只有 list_agents 证明不存在（或宿主同步明确拒绝）才可用 outcome="not_called"|"rejected"、cancel=True 释放后重新派发。',
+      '证据不足时保持 unknown，不要重放、换 key 重派或手工改库；对应工作区保持保留。',
+    ];
+    const tail = runActive
+      ? ''
+      : '<p class="overview-footnote">此 run 已结束：若原会话已无法观察，保持未决只作记录；它只会阻止作废该收件人的工作区，不影响其他 run。</p>';
+    return `<div class="workflow-warning" role="alert"><strong>有 ${escapeHtml(pending)} 项原生动作需要对账</strong>：结果未知的动作已被隔离，不会自动重放。<ol>${steps.map((step) => `<li>${escapeHtml(step)}</li>`).join('')}</ol></div>${tail}`;
   }
 
   function renderNativeActions() {
@@ -3695,6 +3755,7 @@
       <div class="workflow-delivery tabular"><span class="metric-chip ${projection.next_actions_count > 0 ? 'is-active' : ''}">等待转交 ${lowerBound}${escapeHtml(projection.next_actions_count)}</span><span class="metric-chip ${counts.confirmed > 0 ? 'is-ok' : ''}">已转交 ${escapeHtml(counts.confirmed)}</span><span class="metric-chip ${projection.needs_reconciliation_count > 0 ? 'is-warn' : ''}">需核对 ${lowerBound}${escapeHtml(projection.needs_reconciliation_count)}</span><span class="metric-chip ${projection.needs_clarification_count > 0 ? 'is-danger' : ''}">待澄清 ${lowerBound}${escapeHtml(projection.needs_clarification_count)}</span></div>
       <p class="overview-footnote">领取中 ${escapeHtml(counts.claimed)} · 调用中 ${escapeHtml(counts.invoking)} · 转交失败 ${escapeHtml(counts.failed)} · 已取消 ${escapeHtml(counts.cancelled)}</p>
       <p class="overview-footnote">转交登记不代表宿主实时状态；已转交不等于业务完成或独立验收。需核对项不会自动重放。</p>
+      ${renderReconciliationGuide(projection)}
       <details class="workflow-more" data-overview-detail="native-ledger" ${state.overviewExpanded.has('native-ledger') ? 'open' : ''}><summary>转交账本与待办明细（本次 ${rows.length} 项${projection.native_actions_has_more ? '，有更多记录' : ''}）</summary><p class="muted-caption">每类最多 ${escapeHtml(projection.limit)} 项；${projection.counts_complete ? '待办计数完整。' : '待办计数为当前查询下界，不代表完整总数。'}转交状态计数来自账本。</p>${rows.length ? `<ul class="workflow-steps">${ledger}</ul>` : '<p class="muted-caption">当前没有等待转交、需核对或待澄清项。</p>'}</details>
     </section>`;
   }
@@ -4885,6 +4946,8 @@
     return `
       <div class="kv-key">使用模型</div>
       <div class="kv-val">${modelBadge}${sourceCaption}</div>
+      <div class="kv-key">推理档</div>
+      <div class="kv-val">${describeEffortPlan(worker) ? `${renderEffortPlanChip(worker)}${worker.effort_plan?.selection_reason ? `<span class="muted-caption">选择理由：${escapeHtml(worker.effort_plan.selection_reason)}</span>` : ''}${worker.effort_observation?.evidence_ref ? `<span class="muted-caption mono">证据：${escapeHtml(worker.effort_observation.evidence_ref)}</span>` : ''}` : '<span class="muted-caption">未登记计划档或实际档</span>'}</div>
       <div class="kv-key">Codex 线程</div>
       <div class="kv-val mono">${threadParts.length ? escapeHtml(threadParts.join(' · ')) : '—'}</div>
     `;
@@ -5588,6 +5651,7 @@
                   <span class="mono">run ${escapeHtml(shortId(item.run_id || ''))}（${escapeHtml(runStatusLabel)}）</span>
                   ${item.reason ? `<span>${escapeHtml(item.reason)}</span>` : ''}
                   ${isDirty ? '<span class="storage-dirty-note">含未合入改动，不自动删除，请先核查并合入或手工处理</span>' : ''}
+                  ${cat === 'discardable' ? `<span>从未合入且与基线完全一致；作废前会再次核对。</span><button type="button" class="btn btn-ghost btn-xs" data-storage-action="discard-workspace" data-workspace-id="${escapeHtml(item.workspace_id || '')}" ${state.storageDiscardBusy ? 'disabled' : ''}>作废</button>` : ''}
                 </div>
               </article>
             `;
@@ -5601,6 +5665,7 @@
             <h3 class="storage-section-title">隔离工作区（.swarm-workspaces）</h3>
             <span class="pill-badge tint-success tabular">可安全清理 ${escapeHtml(String(wsSummary.cleanable_count ?? 0))}（${escapeHtml(formatBytes(wsSummary.cleanable_bytes ?? 0))}）</span>
             <span class="pill-badge ${Number(wsSummary.dirty_review_count ?? 0) > 0 ? 'tint-warning' : 'tint-muted'} tabular">待核查 ${escapeHtml(String(wsSummary.dirty_review_count ?? 0))}</span>
+            <span class="pill-badge ${Number(wsSummary.discardable_count ?? 0) > 0 ? 'tint-cyan' : 'tint-muted'} tabular">可作废 ${escapeHtml(String(wsSummary.discardable_count ?? 0))}（${escapeHtml(formatBytes(wsSummary.discardable_bytes ?? 0))}）</span>
             <span class="pill-badge tint-primary tabular">进行中 ${escapeHtml(String(wsSummary.active_count ?? 0))}</span>
           </div>
           <span class="pill-badge tint-muted tabular">总计 ${escapeHtml(formatBytes(wsSummary.total_bytes ?? 0))}</span>
@@ -5689,6 +5754,31 @@
       if (state.storageModalOpen) {
         renderStorageModal();
       }
+    }
+  }
+
+  async function discardStorageWorkspace(workspaceId) {
+    if (!workspaceId || state.storageDiscardBusy) return null;
+    const ok = window.confirm(`确认作废工作区 ${workspaceId}？
+
+仅当它从未合入、与基线完全一致、相关原生动作已对账且作者不在工作时才会删除目录；服务端会再次核对，任何改动都会被拒绝。此操作不可撤销。`);
+    if (!ok) return null;
+    state.storageDiscardBusy = true;
+    if (state.storageModalOpen) renderStorageModal();
+    try {
+      const resp = await apiRequest(`/api/workspaces/${encodeURIComponent(workspaceId)}/discard`, {
+        method: 'POST',
+        body: JSON.stringify({ confirm: true, reason: '控制台存储面板人工确认作废' }),
+      });
+      if (resp?.workspace) upsertWorkspace(resp.workspace);
+      showToast('工作区已作废', resp?.reason || '已删除从未合入且无改动的工作区目录。', 'success', 4000);
+      return resp;
+    } catch (err) {
+      showToast(err.status === 409 ? '作废被安全守卫拦截' : '作废失败', err.message, err.status === 409 ? 'warning' : 'error', 6000);
+      return null;
+    } finally {
+      state.storageDiscardBusy = false;
+      await loadStorageReport({ silent: false });
     }
   }
 
@@ -5966,6 +6056,8 @@
         state.storageGcResult = null;
         state.storageGcError = '';
         renderStorageModal();
+      } else if (action === 'discard-workspace') {
+        await discardStorageWorkspace(btn.getAttribute('data-workspace-id') || '');
       }
     });
 

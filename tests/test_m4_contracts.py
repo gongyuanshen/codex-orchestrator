@@ -1,6 +1,7 @@
 """Static evidence-based routing & challenger instruction contracts."""
 from pathlib import Path
 import tomllib
+from skill_docs import reference_text
 
 ROOT = Path(__file__).resolve().parents[1] / "plugin"
 
@@ -29,8 +30,8 @@ def test_boost_routes_unknowns_from_evidence_not_file_count():
 
 
 def test_shared_challenger_returns_findings_to_original_gate_and_budget():
-    text = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
-    section = text.split("## 6. Routing, verification collector, challenge & review gates", 1)[1].split("\n## ", 1)[0]
+    text = reference_text("verification")
+    section = text
     for term in (
         "read-only challenger",
         "original author",
@@ -76,7 +77,7 @@ def test_all_roles_and_modes_share_rework_and_challenger_boundaries_without_mode
         assert "challenger" in text, challenger_role
     for mode in ("boost", "teamwork", "swarm"):
         text = (ROOT / f"skills/{mode}/SKILL.md").read_text(encoding="utf-8")
-        inline_section = text.split("## Inline Fallback Role Contracts", 1)[1].split("\n## ", 1)[0]
+        inline_section = text + reference_text("inline-roles")
         assert "../route-a-workflow.md" in inline_section, mode
 
 

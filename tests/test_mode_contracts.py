@@ -3,6 +3,8 @@ from pathlib import Path
 import re
 import tomllib
 
+from skill_docs import mode_corpus, reference_text, section, shared_corpus, shared_text
+
 ROOT = Path(__file__).resolve().parents[1] / "plugin"
 
 
@@ -70,7 +72,7 @@ def test_all_skills_yaml_frontmatter_never_truncates_on_hash_comments():
 def test_all_roles_and_modes_load_all_supported_strict_contracts():
     skill_paths = sorted((ROOT / "skills").glob("*/SKILL.md"))
     assert {path.parent.name for path in skill_paths} == {"boost", "teamwork", "swarm"}
-    for path in list((ROOT / "agents").glob("*.toml")) + skill_paths:
+    for path in (ROOT / "agents").glob("*.toml"):
         text = path.read_text(encoding="utf-8")
         assert "workflow5" in text and "0.6.10/schema10" in text, path
         assert "workflow0..4" in text, path
@@ -80,8 +82,13 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
         assert text.startswith("---\n"), path
         assert f"name: {path.parent.name}" in text, path
         assert "../route-a-workflow.md" in text, path
-    shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
-    assert "workflow5" in shared and "0.6.10/schema10" in shared
+        assert "workflow5" in text, path
+        corpus = mode_corpus(path.parent.name)
+        assert "0.6.10/schema10" in corpus and "workflow0..4" in corpus, path
+        assert "board_status.workflow.workflow_version" in corpus, path
+    assert "workflow5" in shared_text() and "0.6.10/schema10" in shared_text()
+    assert "reference/legacy-resume.md" in shared_text()
+    shared = shared_corpus()
     assert 'artifact_id=candidate["id"]' in shared
     assert 'recipient_agent_id=next_coordinator_agent_id' in shared
     assert "admission precedes native implementation dispatch" in shared
@@ -90,7 +97,7 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
 
 def test_interactive_modes_and_agents_enforce_native_and_local_execution_kinds():
     for native_mode in ("boost", "teamwork", "swarm"):
-        native_text = (ROOT / "skills" / native_mode / "SKILL.md").read_text(encoding="utf-8")
+        native_text = mode_corpus(native_mode)
         assert 'execution_kind="native"' in native_text
         assert "app_server_pipeline" not in native_text
         assert "$pipeline" not in native_text
@@ -124,14 +131,19 @@ def test_implementation_sequences_support_workflow5_direct_and_legacy_fallback()
                              ("swarm", "### 2.", "### 3.")):
         text = (ROOT / "skills" / mode / "SKILL.md").read_text(encoding="utf-8")
         implementation = text.split(start, 1)[1].split(end, 1)[0]
-        # Primary workflow5 path: 1-turn direct dispatch + lazy verifier frozen & reused via followup_task
+        # Primary workflow5 path stays in the always-loaded mode file
         assert "workflow_prepare_dispatch" in implementation, mode
         assert "native_action_record_call" in implementation, mode
-        assert "followup_task" in implementation, mode
-        # Stored workflow1..4 fallback preserved via board_status.workflow.workflow_version
-        assert "`workflow1..4` fallback" in implementation, mode
-        assert "workflow_step_advance" in implementation, mode
-        assert "prebound verifier" in implementation, mode
+    # Lazy verifier frozen & reused via followup_task is part of the shared normal path
+    normal_path = section(shared_text(), "## Normal path")
+    assert "followup_task" in normal_path and 'dispatch_action="request_verify"' in normal_path
+    # Stored workflow1..4 fallback moved to the on-demand legacy reference
+    legacy = reference_text("legacy-resume")
+    assert "`workflow1..4` fallback" in legacy
+    assert "workflow_step_advance" in legacy
+    assert "prebound verifier" in legacy
+    assert "followup_task" in legacy
+    assert "board_status.workflow.workflow_version" in legacy
 
 
 def test_teamwork_integrates_and_confirms_each_milestone_before_next():

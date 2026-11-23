@@ -21,6 +21,77 @@ STEP_ACTIONS = frozenset({'dispatch', 'accept', 'submit', 'challenge', 'start_re
                           'begin_integrated_review', 'complete', 'handoff', 'ack_handoff',
                           'reconcile', 'observe', 'reverify', 'local_revision_boundary'})
 
+# Observability only: groups step states into the phases a coordinator waits on.
+STAGE_ORDER = ('dispatch', 'author', 'candidate_review', 'rework', 'merge',
+               'integrated_review', 'handoff', 'decision')
+STAGE_OF_STATE = {
+    'planned': 'dispatch', 'dispatched': 'dispatch',
+    'implementing': 'author',
+    'candidate_review': 'candidate_review',
+    'rework': 'rework',
+    'ready_to_merge': 'merge', 'integrating': 'merge', 'reconciliation_required': 'merge',
+    'integrated_review': 'integrated_review',
+    'handoff': 'handoff',
+    'needs_decision': 'decision',
+}
+
+
+def stage_timings(steps: list[dict], transitions: list[dict]) -> dict:
+    """Per-stage elapsed seconds reconstructed from the workflow transition log.
+
+    Every ``WorkflowService._set`` appends ``"<step_key>: <state>"`` to the ``workflow`` channel, so
+    the log also covers runs created before this projection existed.  Values are derived only from
+    stored timestamps (no wall clock), so the projection is stable between transitions.  It is a
+    dashboard aid and never participates in a gate.
+    """
+    by_key: dict[str, list[tuple[float, str]]] = {step['step_key']: [] for step in steps}
+    for row in transitions:
+        key, sep, state = str(row['summary']).rpartition(': ')
+        if not sep or key not in by_key:
+            continue
+        if state == 'saved':
+            # Only the creating save marks the start of planning; later saves are revisions.
+            if not by_key[key]:
+                by_key[key].append((float(row['created_at']), 'planned'))
+        elif state in STAGE_OF_STATE or state == 'done':
+            by_key[key].append((float(row['created_at']), state))
+    totals = dict.fromkeys(STAGE_ORDER, 0.0)
+    projected: list[dict] = []
+    first_at: float | None = None
+    last_at: float | None = None
+    for step in steps:
+        entries = by_key[step['step_key']]
+        stages = dict.fromkeys(STAGE_ORDER, 0.0)
+        for (at, state), (next_at, _) in zip(entries, entries[1:]):
+            stage = STAGE_OF_STATE.get(state)
+            if stage is not None:
+                stages[stage] += max(0.0, next_at - at)
+        for stage, seconds in stages.items():
+            totals[stage] += seconds
+        current_stage = current_since = done_at = None
+        if entries:
+            first_at = entries[0][0] if first_at is None else min(first_at, entries[0][0])
+            last_at = entries[-1][0] if last_at is None else max(last_at, entries[-1][0])
+            at, state = entries[-1]
+            if state == 'done':
+                done_at = at
+            else:
+                current_stage, current_since = STAGE_OF_STATE.get(state), at
+        projected.append({
+            'step_id': step['id'], 'step_key': step['step_key'], 'transitions': len(entries),
+            'stages_sec': {stage: round(seconds, 1) for stage, seconds in stages.items() if seconds},
+            'current_stage': current_stage, 'current_since': current_since, 'done_at': done_at,
+        })
+    return {
+        'source': 'workflow_transition_log',
+        'stage_order': list(STAGE_ORDER),
+        'totals_sec': {stage: round(seconds, 1) for stage, seconds in totals.items() if seconds},
+        'logged_span_sec': round(last_at - first_at, 1) if first_at is not None and last_at is not None else 0.0,
+        'first_at': first_at,
+        'last_at': last_at,
+        'steps': projected,
+    }
+
 ENV_PROFILES: dict[str, tuple[str, ...]] = {
     'none': (),
     'windows_minimal_py': (
@@ -862,7 +933,13 @@ class WorkflowService:
                     checkpoint['owner_last_dispatch_at'] = time.time()
                 return self._set(step, 'implementing', checkpoint, step['attempt'] + 1)
             if action == 'begin_integrated_review' and state == 'ready_to_merge' and not step['workspace_id']:
-                self._valid_verification(step, 'candidate')
+                candidate = self._valid_verification(step, 'candidate')
+                if run['workflow_version'] == 5:
+                    reuse = self._integrated_reuse_basis(step, candidate)
+                    if reuse is not None:
+                        checkpoint['integrated_reuse'] = reuse
+                        checkpoint.setdefault('integrated_reuse_history', []).append(reuse)
+                        return self._set(step, 'integrated_review', checkpoint)
                 return self._set(step, 'integrated_review')
             if action == 'complete' and state == 'integrated_review':
                 self._valid_verification(step, 'integrated')
@@ -1256,7 +1333,83 @@ class WorkflowService:
                 if not set(paths) <= {item['path'] for item in v['evidence_manifest']}:
                     raise WorkflowConflictError('Receipt outputs are missing from original evidence chain')
             return artifact
+        if scope == 'integrated' and step['checkpoint'].get('integrated_reuse'):
+            return self._reused_integrated(step)
         raise WorkflowConflictError(f'No current {scope} independent PASS')
+
+    # ------------------------------------------------------------------
+    # Workspace-less integrated reuse (workflow5).
+    #
+    # Without an isolated workspace the candidate was captured from the very tree an integrated
+    # capture would read, so a second verifier round re-checks identical content.  When the
+    # approved candidate artifact still matches the current tree and covers the integrated scope,
+    # its PASS stands in for the integrated PASS.  The basis is frozen in the checkpoint and fully
+    # re-validated at every use: any later edit makes the candidate stale and the integrated gate
+    # falls back to requiring a real integrated verification.  An explicit integrated verification
+    # recorded for the current attempt always takes precedence over reuse.
+    # ------------------------------------------------------------------
+    def _candidate_pass_record(self, step: dict, artifact: dict) -> dict:
+        with self.db.read_connection() as conn:
+            row = conn.execute('''SELECT * FROM verification_records WHERE step_id=? AND artifact_id=?
+                AND verdict='PASS' AND packet_version=? AND attempt=? AND verifier_agent_id=?
+                ORDER BY created_at DESC LIMIT 1''', (step['id'], artifact['id'], step['packet_version'],
+                step['attempt'], step['verifier_agent_id'])).fetchone()
+        if row is None:
+            raise WorkflowConflictError('Integrated reuse requires the current candidate PASS record')
+        return _decode(row)
+
+    def _reuse_eligible(self, step: dict, candidate: dict) -> bool:
+        if step['workspace_id'] or candidate['scope'] != 'candidate' or candidate['descriptor'].get('workspace_id'):
+            return False
+        try:
+            same_root = Path(candidate['descriptor']['root']).resolve() == self._source_root(step).resolve()
+        except (KeyError, OSError, ValueError, WorkflowConflictError):
+            return False
+        return same_root and self._covers(self._required_capture_scope(step, 'integrated'),
+                                          candidate['descriptor']['paths'])
+
+    def _integrated_reuse_basis(self, step: dict, candidate: dict) -> dict | None:
+        if not self._reuse_eligible(step, candidate):
+            return None
+        record = self._candidate_pass_record(step, candidate)
+        return {
+            'candidate_artifact_id': candidate['id'],
+            'candidate_verification_id': record['id'],
+            'candidate_digest': candidate['digest'],
+            'packet_version': step['packet_version'],
+            'attempt': step['attempt'],
+            'contract_revision': step['contract_revision'],
+            'verifier_agent_id': step['verifier_agent_id'],
+            'basis': 'workspace-less step: candidate artifact is current on the integrated source tree',
+            'recorded_at': time.time(),
+        }
+
+    def _reused_integrated(self, step: dict) -> dict:
+        reuse = step['checkpoint']['integrated_reuse']
+        if any(reuse.get(key) != step[key] for key in
+               ('packet_version', 'attempt', 'contract_revision', 'verifier_agent_id')):
+            raise WorkflowConflictError('No current integrated independent PASS (reuse basis is for another delivery)')
+        try:
+            candidate = self._valid_verification(step, 'candidate')
+        except WorkflowConflictError as exc:
+            raise WorkflowConflictError(
+                'No current integrated independent PASS: reused candidate PASS is no longer current '
+                f'({exc}); capture and verify scope="integrated"') from exc
+        if (candidate['id'] != reuse['candidate_artifact_id'] or candidate['digest'] != reuse['candidate_digest']
+                or not self._reuse_eligible(step, candidate)
+                or self._candidate_pass_record(step, candidate)['id'] != reuse['candidate_verification_id']):
+            raise WorkflowConflictError('No current integrated independent PASS: reuse basis does not match the current candidate')
+        return candidate
+
+    def integrated_reuse_current(self, step: dict) -> bool:
+        """Read-only projection helper: is the frozen reuse basis still valid right now?"""
+        if not step['checkpoint'].get('integrated_reuse'):
+            return False
+        try:
+            self._reused_integrated(step)
+        except (WorkflowConflictError, NotFoundError, ValueError, OSError):
+            return False
+        return True
 
     def find_step_for_workspace(self, workspace_id: str) -> dict | None:
         ws = self.db.get_workspace(workspace_id)
@@ -1398,6 +1551,8 @@ class WorkflowService:
                 ON s.id=v.step_id WHERE s.run_id=? ORDER BY v.created_at''', (run_id,))]
             artifacts = [dict(r) for r in conn.execute('''SELECT a.id,a.step_id,a.scope,a.digest,a.created_at,a.descriptor_json FROM workflow_artifacts a
                 JOIN workflow_steps s ON s.id=a.step_id WHERE s.run_id=? ORDER BY a.created_at''', (run_id,))]
+            transitions = [dict(r) for r in conn.execute('''SELECT seq,summary,created_at FROM board_messages
+                WHERE run_id=? AND sender='workflow' AND channel='workflow' ORDER BY seq''', (run_id,))]
         for artifact in artifacts:
             descriptor = json.loads(artifact.pop('descriptor_json'))
             if run['workflow_version'] in {3, 4, 5} and 'verification_manifest' in descriptor:
@@ -1409,4 +1564,5 @@ class WorkflowService:
         blockers = [{'step_id': s['id'], 'state': s['state']} for s in compact_steps if s['state'] != 'done']
         return {'steps': compact_steps, 'verifications': records, 'artifacts': artifacts,
                 'blockers': blockers, 'max_reworks': MAX_REWORKS,
-                'workflow_version': run['workflow_version'], 'artifact_validity': 'checked_at_gate_use'}
+                'workflow_version': run['workflow_version'], 'artifact_validity': 'checked_at_gate_use',
+                'stage_timings': stage_timings(steps, transitions)}

@@ -17,7 +17,7 @@ import httpx
 
 from orchestrator.config import Settings
 from orchestrator.mcp_shim import _is_pid_alive, ensure_daemon_running
-from orchestrator.rpc_handlers import TOOL_DEFINITIONS
+from orchestrator.rpc_handlers import get_mcp_tool_definitions
 
 
 def _free_port() -> int:
@@ -169,7 +169,7 @@ def test_five_concurrent_shims_spawn_single_daemon_pure_stdout(tmp_path: Path) -
     env["TRI_ORCH_DATA_DIR"] = str(data_dir)
     env["TRI_ORCH_WATCHDOG_INTERVAL_SEC"] = "60"
 
-    expected_tools = {t["name"] for t in TOOL_DEFINITIONS}
+    expected_tools = {t["name"] for t in get_mcp_tool_definitions("core")}  # default tier
 
     daemon_pid = 0
     try:
@@ -185,7 +185,7 @@ def test_five_concurrent_shims_spawn_single_daemon_pure_stdout(tmp_path: Path) -
             assert res["returncode"] == 0, f"Shim {res['idx']} failed: {res['stderr']}"
             assert res["stderr"] == ""
             assert set(res["tool_names"]) == expected_tools
-            assert len(res["tool_names"]) == len(TOOL_DEFINITIONS)
+            assert len(res["tool_names"]) == len(expected_tools)
 
         # Verify exactly one singleton daemon wrote daemon.pid.json and is serving /api/health
         pid_file = data_dir / "daemon.pid.json"

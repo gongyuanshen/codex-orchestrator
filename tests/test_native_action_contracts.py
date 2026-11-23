@@ -5,16 +5,18 @@ import tomllib
 
 import pytest
 
+from skill_docs import mode_corpus, reference_text, section, shared_corpus
+
 ROOT = Path(__file__).resolve().parents[1]
 SHARED = ROOT / "plugin/skills/route-a-workflow.md"
 MODES = ("boost", "teamwork", "swarm")
 
 
 def test_shared_transfer_sequence_persists_before_native_execution():
-    text = SHARED.read_text(encoding="utf-8")
+    text = shared_corpus()
     assert "workflow0..4" in text and "waiting-only" in text
-    dispatch_section = text.split("## 4. Dispatch, native transfer ledger & reconciliation", 1)[1].split("\n## ", 1)[0]
-    manual_section = dispatch_section.split("### Manual primitive transfer ledger & grouped transfers", 1)[1]
+    dispatch_section = reference_text("transfers-and-recovery")
+    manual_section = section(dispatch_section, "## Manual primitive transfer ledger & grouped transfers")
     steps = re.findall(r"^\d+\. (.+)", manual_section, re.MULTILINE)
     required = ("inbox_send", "board_status", 'action="claim"', 'action="begin"', "actual native", 'action="record"')
     positions = [next(i for i, step in enumerate(steps) if term in step) for term in required]
@@ -39,7 +41,7 @@ def test_shared_transfer_sequence_persists_before_native_execution():
 
 @pytest.mark.parametrize("mode", MODES)
 def test_modes_reference_shared_transfer_and_reconciliation_protocol(mode):
-    text = (ROOT / f"plugin/skills/{mode}/SKILL.md").read_text(encoding="utf-8")
+    text = mode_corpus(mode)
     assert "../route-a-workflow.md" in text
     for term in (
         "workflow_prepare_dispatch",

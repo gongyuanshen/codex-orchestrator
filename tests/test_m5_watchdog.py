@@ -60,6 +60,10 @@ def test_heartbeat_expiry_only_requires_observation_and_never_death(case):
     alerts = watchdog.StallWatchdog(db, board).scan_once()
     assert len(alerts) == 1
     assert 'dead' not in alerts[0]['message']['body_md'].lower()
+    # v0.6.11: heartbeat expiry without native-state evidence is a hint, never an alert.
+    assert alerts[0]['level'] == 'hint'
+    assert alerts[0]['message']['msg_type'] == 'info'
+    assert alerts[0]['message']['summary'].startswith('Heartbeat hint: host_unknown')
     assert watchdog.StallWatchdog(db, board).scan_once() == []
 
 

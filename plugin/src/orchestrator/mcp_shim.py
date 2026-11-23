@@ -29,7 +29,7 @@ from mcp.server.models import InitializationOptions
 from orchestrator import __version__
 from orchestrator.config import Settings, get_settings
 from orchestrator.db import SCHEMA_VERSION, require_runtime_schema
-from orchestrator.rpc_handlers import get_tool_definitions
+from orchestrator.rpc_handlers import get_mcp_tool_definitions
 
 if os.name == "nt":
     import msvcrt
@@ -753,13 +753,19 @@ def create_mcp_server(settings: Settings | None = None) -> Server[Any]:
         ctx: Any, params: types.PaginatedRequestParams | None
     ) -> types.ListToolsResult:
         del ctx, params
+        try:
+            catalog = get_mcp_tool_definitions()
+        except ValueError as exc:
+            # An invalid TRI_ORCH_TOOL_TIER must not take the catalog offline; fall back to core.
+            logger.warning("Invalid tool tier (%s); advertising the core tier", exc)
+            catalog = get_mcp_tool_definitions("core")
         tools = [
             types.Tool(
                 name=td["name"],
                 description=td.get("description", ""),
                 input_schema=td["inputSchema"],
             )
-            for td in get_tool_definitions()
+            for td in catalog
         ]
         return types.ListToolsResult(tools=tools)
 
