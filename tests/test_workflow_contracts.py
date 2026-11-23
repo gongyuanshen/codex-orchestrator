@@ -5,6 +5,8 @@ import re
 
 import pytest
 
+from skill_docs import mode_corpus, reference_text, shared_text
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ("boost", "teamwork", "swarm")
@@ -27,7 +29,7 @@ def test_boost_rework_retains_the_actual_author_and_verifier() -> None:
 
 
 def test_boost_reads_human_text_with_a_durable_cursor_and_honest_receipts() -> None:
-    text = skill_text("boost")
+    text = reference_text("human-control")
     assert 'board_read(run_id=run_id, reader_name="coordinator", advance_cursor=False)' in text
     assert 'since_seq=batch["since_seq"], limit=batch["count"], advance_cursor=True' in text
     assert "Only after recording the batch" in text
@@ -44,8 +46,8 @@ def test_boost_reads_human_text_with_a_durable_cursor_and_honest_receipts() -> N
 
 @pytest.mark.parametrize("name", SKILLS)
 def test_workspace_contract_distinguishes_git_and_snapshot(name: str) -> None:
-    text = skill_text(name)
-    assert "## Workspace Mode & Dependency Contract" in text
+    text = shared_text() + "\n" + skill_text(name)
+    assert "## Workspaces" in shared_text() and "../route-a-workflow.md" in skill_text(name)
     assert '`mode="git_clone"`' in text
     assert '`mode="snapshot"`' in text
     assert "`branch_name=None` is normal" in text
@@ -54,26 +56,26 @@ def test_workspace_contract_distinguishes_git_and_snapshot(name: str) -> None:
     assert "workspace_diff" in text
     assert "Do not require a Git commit or a clean Git worktree" in text
     role = "swarm_worker" if name == "swarm" else "coder"
-    inline_role = next(line for line in text.splitlines() if line.startswith(f"- **`{role}` ("))
+    inline_role = next(line for line in reference_text("inline-roles").splitlines() if line.startswith(f"- **`{role}` ("))
     assert 'only for `git_clone`' in inline_role
     assert 'snapshot' in inline_role
-    assert "to verify clean commits" not in text
-    assert "to verify clean git status" not in text
+    assert "to verify clean commits" not in mode_corpus(name)
+    assert "to verify clean git status" not in mode_corpus(name)
 
 
 @pytest.mark.parametrize("name", SKILLS)
 def test_linked_dependencies_are_not_promised_to_be_isolated(name: str) -> None:
-    text = skill_text(name)
+    text = shared_text()
     assert '`dep_mode="link_ro_cache"`' in text
     assert "shared writable dependencies" in text
     assert "not read-only or write-isolated" in text
     assert '`dep_mode="copy"`' in text and '`dep_mode="fresh_venv_uv"`' in text
-    assert '(Use `dep_mode="link_ro_cache"`' not in text
+    assert "(Use `dep_mode=\"link_ro_cache\"`" not in mode_corpus(name)
 
 
 @pytest.mark.parametrize("name", SKILLS)
 def test_pre_spawn_registration_is_not_reported_as_working(name: str) -> None:
-    text = skill_text(name)
+    text = mode_corpus(name)
     registration_examples = re.findall(r"worker_register\([^\n`]*\)", text)
     assert registration_examples
     pre_spawn = [call for call in registration_examples if "agent_id=" not in call]

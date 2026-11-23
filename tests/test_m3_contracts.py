@@ -4,11 +4,13 @@ import re
 import tomllib
 import pytest
 
+from skill_docs import mode_corpus, reference_text, shared_corpus, skill_text
+
 ROOT = Path(__file__).resolve().parents[1] / "plugin"
 
 
 def test_shared_workflow5_preserves_legacy_and_admission_proof_boundaries():
-    text = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
+    text = shared_corpus()
     assert "New runs default to `workflow5` (`0.6.10/schema10`" in text
     assert "New runs use workflow4" not in text
     assert "software 0.5.0/schema7" not in text
@@ -40,7 +42,7 @@ def test_shared_workflow5_preserves_legacy_and_admission_proof_boundaries():
 
 
 def test_workflow5_challenger_and_independent_review_dimensions_preserve_single_gate():
-    text = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
+    text = shared_corpus()
     for term in (
         'complexity="high"',
         "workflow_review(step_id, expected_revision, agent_id, criterion, evidence)",
@@ -60,7 +62,9 @@ def test_workflow5_challenger_and_independent_review_dimensions_preserve_single_
 
 @pytest.mark.parametrize("mode", ("boost", "teamwork", "swarm"))
 def test_modes_and_inline_roles_use_current_workflow5(mode):
-    text = (ROOT / f"skills/{mode}/SKILL.md").read_text(encoding="utf-8")
+    text = mode_corpus(mode)
+    assert "../route-a-workflow.md" in skill_text(mode)
+    assert "workflow5" in skill_text(mode)
     for term in (
         "workflow5",
         "0.6.10/schema10",
@@ -80,7 +84,7 @@ def test_modes_and_inline_roles_use_current_workflow5(mode):
     assert "New runs use workflow4" not in text
     assert "software 0.5.0/schema7" not in text
     assert "New runs use workflow3" not in text
-    inline_section = text.split("## Inline Fallback Role Contracts", 1)[1].split("\n## ", 1)[0]
+    inline_section = reference_text("inline-roles")
     assert "../route-a-workflow.md" in inline_section
     assert re.search(r"- \*\*`\w+` \(", inline_section)
 
@@ -114,8 +118,8 @@ def test_all_installed_roles_load_workflow5_without_permission_or_model_expansio
 
 
 def test_swarm_group_wakeup_keeps_per_message_receipts_and_honest_stall_states():
-    text = (ROOT / "skills/swarm/SKILL.md").read_text(encoding="utf-8")
-    section = text.split("## Grouped Transfer & Global Stall Contract", 1)[1].split("\n## ", 1)[0]
+    text = reference_text("transfers-and-recovery")
+    section = text
     for term in (
         "next_action_groups",
         "source_type",
@@ -172,17 +176,17 @@ def test_documented_m3_m5_fields_exist_in_the_shared_public_tool_catalog():
 
 
 def test_original_verifier_can_dismiss_only_unsubstantiated_findings_without_fake_rework():
-    text = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
+    text = shared_corpus()
     for term in ("dismissed_finding_ids", "unsubstantiated", "without increasing attempt", "substantiated `FAIL` cannot be dismissed"):
         assert term in text, term
     for mode in ("boost", "teamwork", "swarm"):
-        assert "dismissed_finding_ids" in (ROOT / f"skills/{mode}/SKILL.md").read_text(encoding="utf-8")
+        assert "dismissed_finding_ids" in mode_corpus(mode)
     verifier = tomllib.loads((ROOT / "agents/verifier.toml").read_text(encoding="utf-8"))["developer_instructions"]
     assert "dismissed_finding_ids" in verifier and "unsubstantiated" in verifier
 
 
 def test_m5_recovery_uses_exact_frozen_group_projection_and_classifier_states():
-    text = (ROOT / "skills/swarm/SKILL.md").read_text(encoding="utf-8")
+    text = reference_text("transfers-and-recovery")
     for term in (
         "native_action_groups",
         "frozen_member_ids",
@@ -197,7 +201,7 @@ def test_m5_recovery_uses_exact_frozen_group_projection_and_classifier_states():
 
 
 def test_solo_local_boundary_is_frozen_and_never_claims_host_idle():
-    shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
+    shared = shared_corpus()
     for term in (
         'execution_kind="coordinator_local"',
         'execution_kind="native"',
@@ -230,9 +234,9 @@ def test_installed_and_inline_roles_retain_native_default_and_local_exception_sc
         assert "execution_kind" in text and "coordinator_local" in text, name
         assert "Boost" in text, name
     for mode in ("boost", "teamwork", "swarm"):
-        text = (ROOT / f"skills/{mode}/SKILL.md").read_text(encoding="utf-8")
+        text = mode_corpus(mode)
         assert "execution_kind" in text and "coordinator_local" in text
-        inline_section = text.split("## Inline Fallback Role Contracts", 1)[1].split("\n## ", 1)[0]
+        inline_section = reference_text("inline-roles")
         assert "execution_kind" in inline_section, mode
 
 
@@ -246,7 +250,7 @@ def test_coordinator_local_enum_and_default_match_the_actual_public_catalog():
 
 
 def test_local_revision_proof_is_single_use_and_packet_then_step_needs_fresh_proof():
-    shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
+    shared = shared_corpus()
     for term in (
         'action="local_revision_boundary"',
         "single-use",
@@ -271,7 +275,7 @@ def test_modes_and_planner_include_local_revision_protocol():
     for term in ("local_revision_boundary", "single-use", "content_digest", "task_packet_save", "fresh", "workflow_step_save"):
         assert term in planner, term
     for mode in ("boost", "teamwork", "swarm"):
-        text = (ROOT / f"skills/{mode}/SKILL.md").read_text(encoding="utf-8")
+        text = mode_corpus(mode)
         assert "local_revision_boundary" in text, mode
 
 

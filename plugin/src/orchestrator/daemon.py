@@ -29,7 +29,7 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from orchestrator.board import BoardService
-from orchestrator import __version__, codex_bridge, gc
+from orchestrator import __version__, codex_bridge, gc, host_features
 from orchestrator.config import Settings, get_settings
 from orchestrator.db import Database, NotFoundError, SCHEMA_VERSION, VALID_RUN_MODES, require_runtime_schema
 from orchestrator.inbox import InboxConflictError, request_wait
@@ -1024,6 +1024,7 @@ def create_app(
                 "sse_subscribers": state.event_bus.subscriber_count(),
                 "software_version": __version__,
                 "schema_version": SCHEMA_VERSION,
+                "host_wake": host_features.host_wake_status(probe=host_features.cached_probe),
                 "capabilities": [
                     "durable_inbox_v1",
                     "workflow_gates_v1",
@@ -1060,6 +1061,7 @@ def create_app(
             name = tool_name.strip()
             arguments = dispatcher.validate_arguments(name, body.get("arguments"))
             if name == "inbox_wait":
+                dispatcher.record_activity(name, arguments)
                 result = await request_wait(request, arguments)
                 if result is None:
                     return Response(status_code=499)
@@ -1928,6 +1930,30 @@ def create_app(
         except Exception as exc:
             return _map_exception_to_response(exc)
 
+    def _discard_workspace_sync(state: Any, workspace_id: str, reason: str) -> dict[str, Any]:
+        result = state.workspace_mgr.workspace_discard(workspace_id, reason)
+        ws = state.db.get_workspace(workspace_id)
+        if ws is not None:
+            ws = {k: v for k, v in ws.items() if k not in {"snapshot_manifest", "snapshot_manifest_json"}}
+            if getattr(state, "event_bus", None) is not None:
+                state.event_bus.publish("workspace_updated", {"run_id": ws["run_id"], "workspace": ws}, run_id=ws["run_id"])
+        return {**result, "workspace": ws}
+
+    async def api_workspace_discard(request: Request) -> JSONResponse:
+        """Human-confirmed discard of a clean, never-merged workspace of a finished run."""
+        workspace_id = request.path_params["workspace_id"]
+        try:
+            body = await _parse_json_body(request, allow_empty=True)
+            if body.get("confirm") is not True:
+                raise ValueError("Discard requires explicit human confirmation (confirm=true)")
+            reason = body.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                reason = "Confirmed in the dashboard storage panel"
+            payload = await asyncio.to_thread(_discard_workspace_sync, request.app.state, workspace_id, reason)
+            return JSONResponse(payload)
+        except Exception as exc:
+            return _map_exception_to_response(exc)
+
     def _validate_explorer_target(state: Any, workspace_id: str) -> Path:
         database: Database = state.db
         ws = database.get_workspace(workspace_id)
@@ -2078,6 +2104,7 @@ def create_app(
         Route("/api/workspaces/{workspace_id}/diff", api_workspace_diff, methods=["GET"]),
         Route("/api/workspaces/{workspace_id}/merge-preview", api_workspace_merge_preview, methods=["POST"]),
         Route("/api/workspaces/{workspace_id}/cleanup", api_workspace_cleanup, methods=["POST"]),
+        Route("/api/workspaces/{workspace_id}/discard", api_workspace_discard, methods=["POST"]),
         Route("/api/workspaces/{workspace_id}/open-explorer", api_workspace_open_explorer, methods=["POST"]),
         Route("/api/workers/{worker_id}/status", api_worker_status, methods=["POST"]),
         # Explicitly disallowed dangerous operations

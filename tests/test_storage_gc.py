@@ -412,7 +412,12 @@ def test_storage_report_and_gc_lifecycle_respects_retention_junctions_and_cli(tm
         assert report["runtime"]["results_count"] == 4
         assert report["runtime"]["receipts_bytes"] > 0
         assert report["workspaces"]["cleanable_count"] == 1
-        assert report["workspaces"]["dirty_review_count"] == 2
+        # The merged-but-dirty one needs review; the failed run's untouched snapshot is discardable
+        # (never merged, identical to its baseline) but is still never removed by automatic GC.
+        assert report["workspaces"]["dirty_review_count"] == 1
+        assert report["workspaces"]["discardable_count"] == 1
+        failed_item = next(it for it in report["workspaces"]["items"] if it["workspace_id"] == ws_failed["id"])
+        assert failed_item["category"] == "discardable"
         assert report["workspaces"]["active_count"] == 1
         # Must NOT include the 1 MB external_shared file via junction!
         clean_item = next(

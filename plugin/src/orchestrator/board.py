@@ -232,6 +232,8 @@ def _strip_workflow_manifests(wf_summary: dict[str, Any]) -> dict[str, Any]:
     result = dict(wf_summary)
     if 'steps' in result:
         result['steps'] = [_strip_step_manifests(s) for s in result['steps']]
+    # Stage timings are a dashboard aid; keep compact coordinator polls small.
+    result.pop('stage_timings', None)
     return result
 
 

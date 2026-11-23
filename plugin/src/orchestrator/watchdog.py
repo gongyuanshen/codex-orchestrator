@@ -225,17 +225,25 @@ class StallWatchdog:
                     continue
                 from orchestrator.native_actions import digest
                 signature = digest([facts['classification'], [{k: v for k, v in blocker.items() if k != 'revision'} for blocker in facts['blockers']]])[:16]
-                summary = f"Coordination alert: {facts['classification']} [{signature}]"
-                if conn.execute("SELECT 1 FROM board_messages WHERE run_id=? AND sender='watchdog' AND msg_type='alert' AND summary=?", (run_id, summary)).fetchone():
+                # Heartbeat expiry alone is not host evidence of a stall (long builds and test runs are
+                # normal), so without any native-state blocker it is posted as a hint, not an alert.
+                heartbeat_only = bool(facts['blockers']) and all(b['kind'] == 'observe_host' for b in facts['blockers'])
+                level = 'hint' if heartbeat_only else 'alert'
+                prefix = 'Heartbeat hint' if heartbeat_only else 'Coordination alert'
+                summary = f"{prefix}: {facts['classification']} [{signature}]"
+                if conn.execute("SELECT 1 FROM board_messages WHERE run_id=? AND sender='watchdog' AND msg_type IN ('alert','info') AND summary=?", (run_id, summary)).fetchone():
                     continue
+                lead = ('Heartbeat expired without native-state evidence; observe the host (list_agents / wait_agent) '
+                        'before acting. This is a hint, not evidence that the agent stopped.' if heartbeat_only else
+                        'Waiting for coordinator handling. Events are hints; recover from the database.')
                 pointer = self.board.board_post(run_id, sender='watchdog', sender_role='system',
-                    mentions=['coordinator'], msg_type='alert', summary=summary,
-                    body_md='Waiting for coordinator handling. Events are hints; recover from the database.\n\n' +
-                        '\n'.join('- ' + item['reason'] for item in facts['blockers']))
+                    mentions=['coordinator'], msg_type='info' if heartbeat_only else 'alert', summary=summary,
+                    body_md=lead + '\n\n' + '\n'.join('- ' + item['reason'] for item in facts['blockers']))
             message = self.board.get_message(pointer['seq'])
             self._emit('board_message', {'run_id': run_id, 'message': message}, run_id=run_id)
-            self._emit('stall_alert', {'run_id': run_id, 'classification': facts, 'message': message}, run_id=run_id)
-            alerts.append(dict(classification=facts, message=message))
+            self._emit('stall_hint' if heartbeat_only else 'stall_alert',
+                       {'run_id': run_id, 'classification': facts, 'message': message}, run_id=run_id)
+            alerts.append(dict(classification=facts, message=message, level=level))
 
         for worker in stalled_workers:
             worker_id = worker["id"]

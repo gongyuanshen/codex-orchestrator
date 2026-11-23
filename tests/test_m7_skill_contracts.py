@@ -7,6 +7,8 @@ import tomllib
 
 import pytest
 
+from skill_docs import mode_corpus, reference_paths, reference_text, section, shared_corpus, shared_text, skill_text
+
 ROOT = Path(__file__).resolve().parents[1] / "plugin"
 MODES = ("boost", "teamwork", "swarm")
 ALL_SKILLS = ("boost", "teamwork", "swarm")
@@ -30,11 +32,11 @@ def _inline_role_map(text: str) -> dict[str, str]:
 
 @pytest.mark.parametrize("mode", MODES)
 def test_zero_script_agent_type_omission_and_host_qualified_model_selection(mode: str) -> None:
-    text = _skill_text(mode)
+    text = mode_corpus(mode)
     assert 'agent_type: "default"' not in text
     assert 'agent_type="default"' not in text
     assert "xhigh" not in text
-    rules = text.split("## Non-Negotiable Codex Subagent Rules", 1)[1].split("\n## ", 1)[0]
+    rules = section(shared_text(), "## Subagent rules")
     assert "omit `agent_type`" in rules
     assert "`CODEX_HOME`" in rules
     assert "live `spawn_agent` schema" in rules
@@ -57,6 +59,7 @@ def test_zero_legacy_v1_or_stale_version_artifacts_across_all_skills_and_roles()
     all_docs = [ROOT / "skills/route-a-workflow.md"]
     all_docs += [ROOT / "skills" / name / "SKILL.md" for name in ALL_SKILLS]
     all_docs += sorted((ROOT / "agents").glob("*.toml"))
+    all_docs += reference_paths()
     for path in all_docs:
         text = path.read_text(encoding="utf-8")
         assert "functions.exec" not in text, f"{path} still references removed functions.exec"
@@ -84,10 +87,10 @@ def test_agent_tomls_omit_model_and_reasoning_effort_overrides(path: Path) -> No
 
 @pytest.mark.parametrize("mode", MODES)
 def test_nuanced_fork_turns_replaces_blanket_none(mode: str) -> None:
-    text = _skill_text(mode)
+    text = mode_corpus(mode)
     assert 'Always pass `fork_turns: "none"`' not in text
     assert 'forces parent model and `reasoning_effort` when `fork_turns="all"`' not in text
-    rules = text.split("## Non-Negotiable Codex Subagent Rules", 1)[1].split("\n## ", 1)[0]
+    rules = section(shared_text(), "## Subagent rules")
     assert "custom `agent_type` applies regardless of `fork_turns`" in rules
     assert 'fork_turns: "none"' in rules
     assert 'fork_turns: "all"' in rules
@@ -98,7 +101,7 @@ def test_nuanced_fork_turns_replaces_blanket_none(mode: str) -> None:
 
 
 def test_shared_workflow_documents_nuanced_fork_turns_and_reasoning_effort() -> None:
-    shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
+    shared = shared_text()
     assert "omit `agent_type`" in shared
     assert "`CODEX_HOME`" in shared and "live `spawn_agent` schema" in shared
     assert "custom `agent_type` applies regardless of `fork_turns`" in shared
@@ -108,7 +111,7 @@ def test_shared_workflow_documents_nuanced_fork_turns_and_reasoning_effort() -> 
 
 
 def test_swarm_reasoning_effort_records_per_task_plan_and_observation() -> None:
-    _, heading, rest = _skill_text("swarm").partition("### Per-task reasoning effort and evidence")
+    _, heading, rest = reference_text("reasoning-effort").partition("# Per-task reasoning effort and evidence")
     assert heading, "Swarm must define per-task reasoning evidence"
     rules = rest.split("\n## ", 1)[0]
     for expected in (
@@ -122,7 +125,7 @@ def test_swarm_reasoning_effort_records_per_task_plan_and_observation() -> None:
 
 
 def test_shared_verification_contract_explains_group_boundaries_and_keepalive() -> None:
-    shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
+    shared = shared_corpus()
     assert "consecutive commands with the same `parallel_group`" in shared
     assert "ungrouped commands run serially" in shared
     assert "pass a positive `max_parallel`" in shared
@@ -155,7 +158,7 @@ def test_depth1_roles_allow_only_readonly_investigator_helpers_in_toml(role_name
 
 @pytest.mark.parametrize("mode", MODES)
 def test_inline_role_contracts_enforce_tiered_max_depth_2_helper_rules(mode: str) -> None:
-    text = _skill_text(mode)
+    text = reference_text("inline-roles")
     roles = _inline_role_map(text)
     assert roles
     for name, line in roles.items():
@@ -176,7 +179,7 @@ def test_inline_role_contracts_enforce_tiered_max_depth_2_helper_rules(mode: str
 
 @pytest.mark.parametrize("mode", MODES)
 def test_wait_agent_30s_compact_board_and_parallel_direct_mcp_calls_contract(mode: str) -> None:
-    text = _skill_text(mode)
+    text = mode_corpus(mode)
     assert "wait_agent(timeout_ms=30000)" in text
     assert "compact=True" in text
     assert "<=30s" in text
@@ -191,7 +194,7 @@ def test_wait_agent_30s_compact_board_and_parallel_direct_mcp_calls_contract(mod
 
 @pytest.mark.parametrize("mode", MODES)
 def test_workflow5_macro_rpc_primary_path_and_reconciliation_fence(mode: str) -> None:
-    text = _skill_text(mode)
+    text = mode_corpus(mode)
     for required in (
         "workflow5",
         "0.6.10/schema10",
@@ -220,7 +223,7 @@ def test_workflow5_macro_rpc_primary_path_and_reconciliation_fence(mode: str) ->
 
 
 def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_role_focused_macros() -> None:
-    shared = (ROOT / "skills/route-a-workflow.md").read_text(encoding="utf-8")
+    shared = shared_corpus()
     for required in (
         "workflow_prepare_dispatch",
         "native_action_record_call",

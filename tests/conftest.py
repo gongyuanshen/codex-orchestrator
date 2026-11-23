@@ -13,3 +13,5 @@ def isolated_runtime_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("TRI_ORCH_HOST", "127.0.0.1")
     monkeypatch.setenv("TRI_ORCH_DATA_DIR", str(tmp_path / "isolated-runtime"))
     monkeypatch.setenv("TRI_ORCH_PORT", str(port))
+    monkeypatch.delenv("TRI_ORCH_TOOL_TIER", raising=False)
+    monkeypatch.delenv("TRI_ORCH_HOST_WAKE", raising=False)

@@ -18,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from orchestrator import codex_bridge
+from orchestrator import codex_bridge, host_features
 from orchestrator.board import BoardService, _strip_artifact_manifests, _strip_step_manifests
 from orchestrator.native_actions import NativeActionStore, digest as native_digest
 from orchestrator.inbox import INBOX_TOOL_DEFINITIONS, InboxConflictError, InboxStore
@@ -31,6 +31,8 @@ from orchestrator.db import (
     VALID_WORKER_STATUSES,
     Database,
     NotFoundError,
+    normalize_effort_observation,
+    normalize_effort_plan,
 )
 from orchestrator.gc import _dir_size_bytes
 from orchestrator.workspace_mgr import (
@@ -433,6 +435,10 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "workspace_id": {"type": "string"},
                 "current_task": {"type": "string", "default": ""},
                 "stall_threshold_sec": {"type": "integer", "minimum": 1},
+                "effort_plan": {
+                    "type": "object",
+                    "description": "{target_effort, selection_reason, planned_source[, override_unavailable_reason]}",
+                },
             },
             "required": ["run_id", "name", "role"],
             "additionalProperties": False,
@@ -561,6 +567,20 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "force": {"type": "boolean", "default": False},
             },
             "required": ["workspace_id"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "workspace_discard",
+        "description": "Delete a never-merged workspace of a failed/archived/completed run ONLY when it is identical to its baseline, no native action for it is unresolved and its author is not working.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "workspace_id": {"type": "string"},
+                "reason": {"type": "string", "minLength": 1},
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "required": ["workspace_id", "reason"],
             "additionalProperties": False,
         },
     },
@@ -767,6 +787,14 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                 "summary": {"type": "string"},
                 "body_md": {"type": "string"},
                 "session_id": {"type": "string", "minLength": 1},
+                "effort_plan": {
+                    "type": "object",
+                    "description": "{target_effort, selection_reason, planned_source[, override_unavailable_reason]}",
+                },
+                "options": {
+                    "type": "object",
+                    "description": "Low-frequency fields folded into one object; each key is validated exactly like the same top-level field.",
+                },
             },
             "required": ["run_id"],
             "additionalProperties": False,
@@ -795,6 +823,10 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                 "error_text": {"type": "string"},
                 "reconcile": {"type": "boolean", "default": False},
                 "cancel": {"type": "boolean", "default": False},
+                "observed_effort": {
+                    "type": "object",
+                    "description": "{observed_effort, observed_source, evidence_ref[, evidence_kind, codex_thread_id]}",
+                },
             },
             "required": ["run_id", "outcome", "raw_response"],
             "additionalProperties": False,
@@ -909,12 +941,139 @@ INTERNAL_RPC_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
 ]
+# ---------------------------------------------------------------------------
+# MCP exposure tiers (v0.6.11 usability).
+#
+# Every tool stays registered and callable by name on both HTTP and MCP; the tier only decides
+# which schemas are *advertised* in MCP tools/list, because each advertised schema is a fixed
+# per-session token cost.  The default ``core`` tier lists the normal-path macros plus the
+# primitives the shipped role contracts call directly, and a small ``tool_advanced`` proxy that
+# describes or invokes any advanced primitive through the same validation and handlers.
+# ``TRI_ORCH_TOOL_TIER=full`` restores the complete catalog.
+# ---------------------------------------------------------------------------
+TOOL_TIER_ENV = "TRI_ORCH_TOOL_TIER"
+VALID_TOOL_TIERS = ("core", "full")
+ADVANCED_TOOL_NAMES: frozenset[str] = frozenset({
+    "native_action_update",
+    "board_channel_list",
+    "worker_status_update",
+    "workspace_create",
+    "workspace_cleanup",
+    "workspace_discard",
+    "inbox_send",
+    "artifact_capture",
+    "verification_record",
+    "session_bind",
+})
+
+# Low-frequency workflow_prepare_dispatch fields accepted inside ``options`` and omitted from the
+# core-tier advertised schema.  They remain valid top-level arguments for existing callers.
+PREPARE_DISPATCH_OPTION_KEYS: frozenset[str] = frozenset({
+    "workspace_base_mode",
+    "git_backend",
+    "copy_env",
+    "dep_mode",
+    "pending_agent_path",
+    "agent_id",
+    "worker_status",
+    "current_task",
+    "stall_threshold_sec",
+    "verifier_agent_id",
+    "save_step",
+    "goal",
+    "acceptance_criteria",
+    "commands",
+    "step_kind",
+    "handoff_required",
+    "expected_step_revision",
+    "advance_evidence",
+    "advance_agent_id",
+    "observation",
+    "key",
+    "subject",
+    "effort_plan",
+})
+OPTION_FOLDED_TOOLS: dict[str, frozenset[str]] = {
+    "workflow_prepare_dispatch": PREPARE_DISPATCH_OPTION_KEYS,
+}
+
+TOOL_ADVANCED_DEFINITION: dict[str, Any] = {
+    "name": "tool_advanced",
+    "description": (
+        "Describe (omit arguments) or call (pass arguments) an advanced primitive hidden from the "
+        "default tool list. Same validation and write discipline as a direct call; never retry writes."
+    ),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "tool": {"type": "string", "enum": sorted(ADVANCED_TOOL_NAMES)},
+            "arguments": {"type": "object"},
+        },
+        "required": ["tool"],
+        "additionalProperties": False,
+    },
+}
+TOOL_DEFINITIONS.append(TOOL_ADVANCED_DEFINITION)
+
 ALL_RPC_DEFINITIONS: list[dict[str, Any]] = TOOL_DEFINITIONS + INTERNAL_RPC_DEFINITIONS
 
 
 def get_tool_definitions() -> list[dict[str, Any]]:
-    """Return the same formal tool catalog for HTTP and MCP."""
+    """Return the complete formal tool catalog (HTTP, full MCP tier, and contract tests)."""
     return [dict(item) for item in TOOL_DEFINITIONS]
+
+
+def resolve_tool_tier(value: str | None = None) -> str:
+    """Return the MCP exposure tier from ``value`` or ``TRI_ORCH_TOOL_TIER`` (default ``core``)."""
+    raw = os.environ.get(TOOL_TIER_ENV, "") if value is None else value
+    tier = raw.strip().lower() or "core"
+    if tier not in VALID_TOOL_TIERS:
+        raise ValueError(f"{TOOL_TIER_ENV} must be one of {VALID_TOOL_TIERS}, got {raw!r}")
+    return tier
+
+
+def _slim_folded_schema(definition: dict[str, Any], option_keys: frozenset[str]) -> dict[str, Any]:
+    schema = definition["inputSchema"]
+    properties = {key: value for key, value in schema["properties"].items() if key not in option_keys}
+    properties["options"] = {
+        "type": "object",
+        "description": "Optional low-frequency fields: " + ", ".join(sorted(option_keys)) + ".",
+    }
+    return {**definition, "inputSchema": {**schema, "properties": properties}}
+
+
+def get_mcp_tool_definitions(tier: str | None = None) -> list[dict[str, Any]]:
+    """Return the catalog advertised in MCP tools/list for the resolved exposure tier."""
+    if resolve_tool_tier(tier) == "full":
+        return get_tool_definitions()
+    advertised: list[dict[str, Any]] = []
+    for item in TOOL_DEFINITIONS:
+        if item["name"] in ADVANCED_TOOL_NAMES:
+            continue
+        option_keys = OPTION_FOLDED_TOOLS.get(item["name"])
+        advertised.append(_slim_folded_schema(item, option_keys) if option_keys else dict(item))
+    return advertised
+
+
+def _fold_options(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Merge a folded ``options`` object into top-level arguments, rejecting conflicts."""
+    option_keys = OPTION_FOLDED_TOOLS.get(tool_name)
+    if option_keys is None or "options" not in args:
+        return args
+    options = args["options"]
+    if options is None:
+        return {key: value for key, value in args.items() if key != "options"}
+    if not isinstance(options, dict):
+        raise ValueError(f"{tool_name}.options must be a JSON object")
+    unknown = options.keys() - option_keys
+    if unknown:
+        raise ValueError(f"Unknown {tool_name}.options keys: {sorted(unknown)}")
+    duplicated = options.keys() & args.keys()
+    if duplicated:
+        raise ValueError(f"{tool_name} fields given both top-level and in options: {sorted(duplicated)}")
+    merged = {key: value for key, value in args.items() if key != "options"}
+    merged.update(options)
+    return merged
 
 
 class RpcDispatcher:
@@ -955,6 +1114,7 @@ class RpcDispatcher:
             "workspace_merge_preview": self._handle_workspace_merge_preview,
             "workspace_merge": self._handle_workspace_merge,
             "workspace_cleanup": self._handle_workspace_cleanup,
+            "workspace_discard": self._handle_workspace_discard,
             "inbox_send": self._handle_inbox_send,
             "inbox_get": self._handle_inbox_get,
             "inbox_ack": self._handle_inbox_ack,
@@ -971,6 +1131,7 @@ class RpcDispatcher:
             "workflow_closeout_run": self._handle_workflow_closeout_run,
             "session_bind": self._handle_session_bind,
             "session_hook_check": self._handle_session_hook_check,
+            "tool_advanced": self._handle_tool_advanced,
         }
 
     @property
@@ -986,7 +1147,53 @@ class RpcDispatcher:
     ) -> dict[str, Any]:
         """Validate tool_name and invoke the corresponding handler."""
         args = self.validate_arguments(tool_name, arguments)
-        return self._handlers[tool_name](args)
+        result = self._handlers[tool_name](args)
+        self.record_activity(tool_name, args)
+        return result
+
+    # Tool argument naming the *calling* worker (never the target of a coordinator action).
+    _CALLER_FIELDS: dict[str, tuple[str, ...]] = {
+        "board_post": ("sender",),
+        "board_read": ("reader_name",),
+        "board_status": ("reader_name",),
+        "inbox_wait": ("recipient",),
+        "inbox_ack": ("recipient",),
+        "workflow_author_turn": ("author", "recipient"),
+        "workflow_verifier_turn": ("verifier",),
+        "verification_record": ("verifier",),
+    }
+    _STEP_ROLE_FOR_TOOL: dict[str, str] = {
+        "workflow_author_turn": "owner",
+        "workflow_verifier_turn": "verifier",
+        "artifact_capture": "verifier",
+        "verification_record": "verifier",
+    }
+
+    def record_activity(self, tool_name: str, args: dict[str, Any]) -> None:
+        """Treat a worker's own MCP call as liveness: refresh its heartbeat if it is working.
+
+        Only the identity the caller states for itself counts (board sender/reader, inbox recipient,
+        the bound author/verifier of the step it is acting on).  Status never changes and failures
+        are swallowed: this is a stall-alert noise reducer, not a gate.
+        """
+        try:
+            run_id = args.get("run_id") if isinstance(args.get("run_id"), str) else None
+            names = [args[f] for f in self._CALLER_FIELDS.get(tool_name, ()) if isinstance(args.get(f), str) and args[f].strip()]
+            step_role = self._STEP_ROLE_FOR_TOOL.get(tool_name)
+            if step_role and isinstance(args.get("step_id"), str) and not names:
+                step = self.workflow.get_step(args["step_id"])
+                run_id = run_id or step["run_id"]
+                names.append(step[step_role])
+            if tool_name == "inbox_ack" and run_id is None and isinstance(args.get("message_id"), str):
+                with self.db.read_connection() as conn:
+                    row = conn.execute("SELECT run_id FROM inbox_messages WHERE id=?", (args["message_id"],)).fetchone()
+                run_id = row["run_id"] if row else None
+            if not run_id:
+                return
+            for name in dict.fromkeys(name.strip() for name in names):
+                self.db.touch_worker_activity(run_id, name)
+        except Exception:  # noqa: BLE001 - liveness hints must never fail the business call
+            return
 
     def validate_arguments(self, tool_name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
         """Reject missing/unknown fields at the common HTTP/MCP boundary."""
@@ -998,6 +1205,7 @@ class RpcDispatcher:
             args = arguments
         else:
             raise ValueError("Tool arguments must be a JSON object")
+        args = _fold_options(tool_name, args)
         schema = next(tool["inputSchema"] for tool in ALL_RPC_DEFINITIONS if tool["name"] == tool_name)
         properties = schema["properties"]
         unknown = args.keys() - properties.keys()
@@ -1013,6 +1221,22 @@ class RpcDispatcher:
 
     # Alias for callers using call_tool()
     call_tool = dispatch
+
+    def _handle_tool_advanced(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Describe or invoke one advanced-tier primitive through the normal validation path."""
+        name = self._require_str(args, "tool").strip()
+        if name not in ADVANCED_TOOL_NAMES:
+            raise ValueError(f"tool_advanced only proxies advanced-tier tools: {sorted(ADVANCED_TOOL_NAMES)}")
+        if "arguments" not in args or args["arguments"] is None:
+            definition = next(tool for tool in TOOL_DEFINITIONS if tool["name"] == name)
+            return {
+                "tool": name,
+                "description": definition.get("description", ""),
+                "inputSchema": definition["inputSchema"],
+            }
+        if not isinstance(args["arguments"], dict):
+            raise ValueError("tool_advanced.arguments must be a JSON object")
+        return self.dispatch(name, args["arguments"])
 
     def _emit(
         self, event: str, data: dict[str, Any], *, run_id: str | None = None
@@ -1315,7 +1539,10 @@ class RpcDispatcher:
         )
         self._sync_run_agent_models(run_id)
         self._emit("run_updated", {"run_id": run["id"], "run": run}, run_id=run["id"])
-        return {**run, "cli_executables": _discover_cli_executables()}
+        result = {**run, "cli_executables": _discover_cli_executables()}
+        if args.get("status") in {"archived", "failed"}:
+            result["residuals"] = self.run_residuals(run_id)
+        return result
 
     def _handle_run_list(self, args: dict[str, Any]) -> dict[str, Any]:
         runs = self.db.list_runs(
@@ -1380,7 +1607,27 @@ class RpcDispatcher:
                 {"run_id": run_id, "message": full_msg},
                 run_id=run_id,
             )
+        wake = self._mention_wake_route(run_id, sender, args.get("mentions"))
+        if wake is not None:
+            pointer = {**pointer, **wake}
         return pointer
+
+    def _mention_wake_route(self, run_id: str, sender: str, mentions: Any) -> dict[str, Any] | None:
+        """Reserved host-wake switch: say how @mentioned bound workers get woken (advisory only)."""
+        if not isinstance(mentions, list) or not mentions:
+            return None
+        targets = []
+        for name in dict.fromkeys(m for m in mentions if isinstance(m, str) and m.strip() and m != sender):
+            worker = self.db.get_worker_by_name(run_id, name)
+            if worker is not None and worker.get("agent_id"):
+                targets.append({"name": name, "agent_id": worker["agent_id"]})
+        if not targets:
+            return None
+        status = host_features.host_wake_status()
+        route = {"wake_route": status["route"], "wake_targets": targets}
+        if status["route"] == host_features.ROUTE_RELAY:
+            route["wake_hint"] = "Coordinator relays: followup_task when idle, send_message when running."
+        return route
 
     def _handle_board_read(self, args: dict[str, Any]) -> dict[str, Any]:
         run_id = self._require_str(args, "run_id")
@@ -1431,6 +1678,7 @@ class RpcDispatcher:
         name = self._require_str(args, "name")
         role = self._require_str(args, "role")
         raw_threshold = args.get("stall_threshold_sec")
+        effort_plan = normalize_effort_plan(args["effort_plan"]) if args.get("effort_plan") is not None else None
         worker = self.board.worker_register(
             run_id,
             name,
@@ -1445,8 +1693,10 @@ class RpcDispatcher:
                 int(raw_threshold) if raw_threshold is not None else None
             ),
         )
+        if effort_plan is not None:
+            self.db.set_worker_effort(run_id, worker["name"], plan=effort_plan)
         refreshed = self._sync_run_agent_models(run_id)
-        worker = refreshed.get(worker["name"], worker)
+        worker = refreshed.get(worker["name"]) or self.db.get_worker_by_name(run_id, worker["name"]) or worker
         self._emit(
             "worker_updated",
             {"run_id": worker["run_id"], "worker": worker},
@@ -1674,6 +1924,57 @@ class RpcDispatcher:
             )
         return res
 
+    def _handle_workspace_discard(self, args: dict[str, Any]) -> dict[str, Any]:
+        workspace_id = self._require_str(args, "workspace_id")
+        reason = self._require_str(args, "reason")
+        if args.get("dry_run", False):
+            return {**self.workspace_mgr.workspace_discard_check(workspace_id), "dry_run": True}
+        res = self.workspace_mgr.workspace_discard(workspace_id, reason)
+        ws = self.db.get_workspace(workspace_id)
+        if ws is not None:
+            self._emit("workspace_updated", {"run_id": ws["run_id"], "workspace": ws}, run_id=ws["run_id"])
+        return res
+
+    def run_residuals(self, run_id: str) -> dict[str, Any]:
+        """Leftovers that a finished run still holds: unremoved workspaces and unresolved native actions."""
+        workspaces = []
+        for ws in self.db.list_workspaces(run_id=run_id):
+            if ws["status"] == "cleaned" and not Path(ws["path"]).exists():
+                continue
+            try:
+                check = self.workspace_mgr.workspace_discard_check(ws["id"])
+            except Exception as exc:  # report, never fail the status update
+                check = {"discardable": False, "reason": f"Inspection error: {exc}"}
+            workspaces.append({
+                "workspace_id": ws["id"],
+                "worker_name": ws["worker_name"],
+                "mode": ws["mode"],
+                "status": ws["status"],
+                "path": ws["path"],
+                "exists": Path(ws["path"]).exists(),
+                "discardable": bool(check.get("discardable")),
+                "reason": check.get("reason", ""),
+                "next_step": (
+                    "workspace_cleanup / GC" if ws["status"] == "merged"
+                    else "workspace_discard" if check.get("discardable")
+                    else "inspect manually; unmerged work is never deleted automatically"
+                ),
+            })
+        with self.db.read_connection() as conn:
+            actions = [dict(row) for row in conn.execute(
+                "SELECT action_id, recipient, action_type, status, updated_at FROM native_actions "
+                "WHERE run_id=? AND status IN ('claimed','invoking','needs_reconciliation') ORDER BY updated_at",
+                (run_id,),
+            )]
+        for action in actions:
+            action["guidance"] = (
+                "Observe the host first (list_agents for spawn_agent), then native_action_update(action='reconcile') "
+                "with that observation; never replay. If the original session can no longer be observed, leave it "
+                "fenced: it blocks only discarding this run's workspace for that recipient."
+            )
+        return {"workspaces": workspaces, "native_actions": actions,
+                "clean": not workspaces and not actions}
+
     # ------------------------------------------------------------------
     # M6 / M8 Macro RPC & M9 Session Hook Handlers
     # ------------------------------------------------------------------
@@ -1693,6 +1994,7 @@ class RpcDispatcher:
             raise ValueError("sender must be a non-empty string")
         key_field = "message_key" if args.get("message_key") else "key"
         explicit_key = self._require_str(args, key_field).strip() if key_field in args else None
+        effort_plan = normalize_effort_plan(args["effort_plan"]) if args.get("effort_plan") is not None else None
 
         # Fence expired leases before entering the composite transaction so a rollback never erases fences.
         self.native_actions.expire()
@@ -1862,6 +2164,8 @@ class RpcDispatcher:
                     current_task=str(args.get("current_task") or args.get("title") or ""),
                     stall_threshold_sec=int(raw_threshold) if raw_threshold is not None else None,
                 )
+                if effort_plan is not None:
+                    worker = self.db.set_worker_effort(run_id, target_worker_name, plan=effort_plan)
 
                 # In workflow5 (or when verifier_agent_id is given), ensure lazy/companion verifier is registered when creating a step.
                 if dispatch_action != "request_verify" and verifier_name:
@@ -2209,6 +2513,11 @@ class RpcDispatcher:
         cancel = bool(args.get("cancel", False))
         action_id = args.get("action_id")
         group_id = args.get("group_id")
+        observed_effort = (
+            normalize_effort_observation(args["observed_effort"]) if args.get("observed_effort") is not None else None
+        )
+        if observed_effort is not None and group_id:
+            raise ValueError("observed_effort applies to a single native action, not a group record")
         members = args.get("members")
 
         is_single = isinstance(action_id, str) and bool(action_id.strip())
@@ -2299,6 +2608,8 @@ class RpcDispatcher:
                 agent_id=args.get("agent_id"),
                 cancel=cancel,
             )
+            if observed_effort is not None and updated.get("status") == "confirmed":
+                self.db.set_worker_effort(run_id, updated["recipient"], observation=observed_effort)
             refreshed = self._sync_run_agent_models(run_id)
             if updated.get("action_type") == "spawn_agent":
                 w = refreshed.get(updated["recipient"]) or self.db.get_worker_by_name(run_id, updated["recipient"])
@@ -3185,9 +3496,20 @@ class RpcDispatcher:
                         and art_scope_by_id.get(v["artifact_id"]) == "integrated"
                         for v in verifications
                     )
+                    # Cheap binding check only (this runs inside the <=1.5s Stop hook); complete /
+                    # workflow_closeout_run re-validates the reused candidate against the live tree.
+                    reuse = (step_info.get("checkpoint") or {}).get("integrated_reuse") or {}
+                    reuse_current = not has_integrated_pass and bool(reuse) and all(
+                        reuse.get(key) == step_info.get(key)
+                        for key in ("packet_version", "attempt", "contract_revision", "verifier_agent_id")
+                    )
                     if has_integrated_pass:
                         actionable_transitions.append(
                             f"integrated_review -> {step_info['step_key']}: 集成验收已通过，等待 complete / workflow_closeout_run"
+                        )
+                    elif reuse_current:
+                        actionable_transitions.append(
+                            f"integrated_review -> {step_info['step_key']}: 无工作区，候选 PASS 复用为集成 PASS（complete 时重新核对），等待 complete / workflow_closeout_run"
                         )
                     elif not has_review_inflight:
                         actionable_transitions.append(

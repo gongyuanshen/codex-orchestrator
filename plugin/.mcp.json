@@ -33,7 +33,9 @@
         "TRI_ORCH_RESULT_TTL_SEC",
         "TRI_ORCH_RESULT_MAX_FILES",
         "TRI_ORCH_WORKSPACE_RETENTION_SEC",
-        "TRI_ORCH_GIT_BACKEND"
+        "TRI_ORCH_GIT_BACKEND",
+        "TRI_ORCH_TOOL_TIER",
+        "TRI_ORCH_HOST_WAKE"
       ],
       "startup_timeout_sec": 60,
       "tool_timeout_sec": 300

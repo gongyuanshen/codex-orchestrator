@@ -200,9 +200,18 @@ def collect_storage_report(
             safety = mgr.workspace_gc_safety(ws["id"])
             added_count = int(safety["added_count"])
             modified_count = int(safety["modified_count"])
+            discard = (
+                mgr.workspace_discard_check(ws["id"])
+                if ws["status"] != "merged" and not safety["safe_to_clean"]
+                else None
+            )
             if run_status in {"completed", "archived"} and safety["safe_to_clean"]:
                 category = "cleanable"
                 reason = str(safety["reason"])
+            elif discard is not None and discard["discardable"]:
+                # Never merged and identical to its baseline: safe to discard on explicit request.
+                category = "discardable"
+                reason = str(discard["reason"])
             else:
                 category = "dirty_review"
                 if run_status not in {"completed", "archived"}:
@@ -235,6 +244,8 @@ def collect_storage_report(
     cleanable_bytes = sum(item["bytes"] for item in items if item["category"] == "cleanable")
     cleanable_count = sum(1 for item in items if item["category"] == "cleanable")
     dirty_review_count = sum(1 for item in items if item["category"] == "dirty_review")
+    discardable_count = sum(1 for item in items if item["category"] == "discardable")
+    discardable_bytes = sum(item["bytes"] for item in items if item["category"] == "discardable")
     active_count = sum(1 for item in items if item["category"] == "active")
 
     return {
@@ -245,6 +256,8 @@ def collect_storage_report(
             "cleanable_bytes": int(cleanable_bytes),
             "cleanable_count": int(cleanable_count),
             "dirty_review_count": int(dirty_review_count),
+            "discardable_count": int(discardable_count),
+            "discardable_bytes": int(discardable_bytes),
             "active_count": int(active_count),
             "items": items,
         },
