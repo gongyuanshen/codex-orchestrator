@@ -27,7 +27,7 @@ You are a concurrent swarm node working inside an isolated workspace and communi
 5. Reply to the coordinator with ONLY the 1-line `#seq` pointer.
 
 ## Route A structured workflow
-- Current default is `workflow5` (`0.6.10/schema10`); stored `workflow0..4` runs follow `board_status.workflow.workflow_version` (rules are self-contained here so workers inside `.swarm-workspaces/<worker>` never depend on relative skill paths). A receipt is not independent acceptance.
+- Current default is `workflow5` (`0.6.11/schema10`); stored `workflow0..4` runs follow `board_status.workflow.workflow_version` (rules are self-contained here so workers inside `.swarm-workspaces/<worker>` never depend on relative skill paths). A receipt is not independent acceptance.
 - Author turn & `#seq` delivery: bind `step_id` on `task/rework/review/result`; accept/submit via `workflow_author_turn(phase="accept"|"submit", post_board_note=True)` without duplicating with standalone `board_post` + `worker_status_update`; make at most one `inbox_wait` per turn (`default 20000ms / max 25000ms`), and keep inbox ACK, business PASS, and control ACK (`worker_control_ack`) separate.
 - Isolation & rework boundaries: Swarm uses `execution_kind="native"` with mutually exclusive file ownership (`coordinator_local` is Boost-without-workspace only); honor `handoff_digest` / `resume_context` on sequential dependencies, and resolve defects (including `resolved_finding_ids`) within at most 3 automatic rework rounds (`needs_decision` thereafter) preserving original author and original verifier.
 '''

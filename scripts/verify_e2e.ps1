@@ -296,7 +296,7 @@ assert srv.get("cwd") == ".", f"plugin/.mcp.json cwd must be '.', got {srv.get('
 
 p2 = json.loads((root / "plugin" / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
 assert p2["name"] == "tri-orchestrator"
-assert p2["version"] == "0.6.10"
+assert p2["version"] == "0.6.11"
 assert p2.get("hooks") == "./hooks/hooks.json"
 assert p2.get("mcpServers") == "./.mcp.json"
 hooks_cfg = json.loads((root / "plugin" / "hooks" / "hooks.json").read_text(encoding="utf-8"))

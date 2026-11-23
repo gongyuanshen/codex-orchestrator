@@ -1,6 +1,6 @@
-# Route A shared contract (`workflow5`, `0.6.10/schema10`)
+# Route A shared contract (`workflow5`, `0.6.11/schema10`)
 
-Boost, Teamwork and Swarm all follow this file (new runs: `workflow5`, `0.6.10/schema10`; normal path only). Open a `reference/` file **only when its trigger happens**:
+Boost, Teamwork and Swarm all follow this file (new runs: `workflow5`, `0.6.11/schema10`; normal path only). Open a `reference/` file **only when its trigger happens**:
 
 | Trigger | Read |
 | :--- | :--- |
