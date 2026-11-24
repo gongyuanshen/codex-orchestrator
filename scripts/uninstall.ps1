@@ -173,22 +173,65 @@ $dataDir = if (-not [string]::IsNullOrWhiteSpace($env:TRI_ORCH_DATA_DIR)) {
 } else {
     ""
 }
-$pidFile = if ($dataDir) { Join-Path $dataDir "daemon.pid.json" } else { "" }
-if ($pidFile -and (Test-Path $pidFile -PathType Leaf)) {
-    try {
-        $pidInfo = Read-Utf8Text $pidFile | ConvertFrom-Json
-        if ($pidInfo.PSObject.Properties['pid'] -and $pidInfo.pid) {
-            $proc = Get-Process -Id ([int]$pidInfo.pid) -ErrorAction SilentlyContinue
-            if ($proc) {
-                Write-Host "[uninstall] Stopping running daemon PID $($proc.Id)..."
-                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                Wait-Process -Id $proc.Id -Timeout 5 -ErrorAction SilentlyContinue
-            }
-        }
-        Remove-Item -Path $pidFile -Force -ErrorAction SilentlyContinue
-    } catch {
-        Write-Warning "[uninstall] Could not parse/stop daemon from ${pidFile}: $_"
+function Stop-RecordedDaemon {
+    param([string]$PidFile, [string]$DataDir)
+    $record = Read-Utf8Text $PidFile | ConvertFrom-Json
+    $expectedDir = [IO.Path]::GetFullPath($DataDir).TrimEnd('\')
+    if ($record.pid -le 0 -or $record.port -lt 1 -or $record.port -gt 65535 -or $record.started_at -le 0 -or
+        -not [IO.Path]::IsPathRooted($record.data_dir) -or
+        [IO.Path]::GetFullPath($record.data_dir).TrimEnd('\') -ine $expectedDir) {
+        throw "Invalid daemon identity in $PidFile"
     }
+
+    # The handle must be opened before the probe and retained through termination: a PID can be reused.
+    try { $process = [Diagnostics.Process]::GetProcessById([int]$record.pid) }
+    catch [ArgumentException] {
+        $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+        if ($listeners | Where-Object Port -eq $record.port) { throw "PID is absent but port $($record.port) is in use" }
+        return # No process and no listener: only the stale record remains.
+    }
+    try {
+        [void]$process.get_Handle()
+        $socket = Get-NetTCPConnection -State Listen -LocalPort ([uint16]$record.port) -OwningProcess $process.Id -ErrorAction Stop | Select-Object -First 1
+        $address = $socket.LocalAddress
+        if ($address -eq '0.0.0.0') { $address = '127.0.0.1' }
+        if ($address -eq '::') { $address = '::1' }
+        $uri = [UriBuilder]::new('http', $address, [int]$record.port, '/api/health').Uri
+        Add-Type -AssemblyName System.Net.Http
+        $handler = [Net.Http.HttpClientHandler]::new()
+        $handler.UseProxy = $false
+        $handler.AllowAutoRedirect = $false
+        $client = [Net.Http.HttpClient]::new($handler)
+        try {
+            $client.Timeout = [TimeSpan]::FromSeconds(5)
+            $health = $client.GetStringAsync($uri).GetAwaiter().GetResult() | ConvertFrom-Json
+        } finally { $client.Dispose() }
+        if ($health.ok -isnot [bool] -or -not $health.ok -or $health.status -cne 'ok' -or
+            $health.pid -ne $process.Id -or $health.port -ne $record.port -or
+            $health.started_at -ne $record.started_at -or -not [IO.Path]::IsPathRooted($health.data_dir) -or
+            [IO.Path]::GetFullPath($health.data_dir).TrimEnd('\') -ine $expectedDir) {
+            throw "Daemon health identity mismatch: PID $($record.pid), data $expectedDir, started_at $($record.started_at)"
+        }
+
+        Write-Host "[uninstall] Stopping verified daemon PID $($process.Id)..."
+        $process.Kill()
+        if (-not $process.WaitForExit(5000)) { throw "Timed out stopping daemon PID $($process.Id)" }
+    } finally { $process.Dispose() }
+}
+
+$pidFile = if ($dataDir) { Join-Path $dataDir "daemon.pid.json" } else { "" }
+if ($pidFile -and (Test-Path -LiteralPath $pidFile -PathType Leaf)) {
+    # Cooperate with the shim's daemon.lock byte zero; do not unlink a replacement instance's metadata.
+    $lock = [IO.File]::Open((Join-Path $dataDir 'daemon.lock'), 'OpenOrCreate', 'ReadWrite', 'ReadWrite')
+    try {
+        $lock.Lock(0, 1)
+        if (Test-Path -LiteralPath $pidFile -PathType Leaf) {
+            Stop-RecordedDaemon $pidFile $dataDir
+            Remove-Item -LiteralPath $pidFile -Force
+        }
+    } catch {
+        throw "[uninstall] Could not verify/stop daemon; preserving ${pidFile}: $_"
+    } finally { $lock.Dispose() }
 }
 
 # 2. Remove Codex plugin and marketplace registration

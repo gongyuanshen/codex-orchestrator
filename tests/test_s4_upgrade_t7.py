@@ -121,7 +121,7 @@ def _rehearse(tmp_path: Path, target: Path, data: Path, codex_home: Path):
     )
     assert prepared["status"] == "prepared"
     assert prepared["target_identity"]["version"] == "0.6.0"
-    assert prepared["source_identity"]["version"] == "0.6.12"
+    assert prepared["source_identity"]["version"] == "0.6.13"
     assert prepared["database_before"]["schema_version"] == 8
     applied = upgrade("apply")
     assert applied["status"] == "applied_service_stopped"

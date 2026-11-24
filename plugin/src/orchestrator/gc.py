@@ -178,8 +178,14 @@ def collect_storage_report(
     workspace_mgr: WorkspaceManager | None = None,
 ) -> dict[str, Any]:
     """Inspect runtime data_dir footprint and categorize all tracked workspaces."""
+    return _storage_report(db, settings, workspace_mgr or WorkspaceManager(db, settings), {})
+
+
+def _storage_report(
+    db: Database, settings: Settings, mgr: WorkspaceManager,
+    preview_checks: dict[str, tuple[dict[str, Any], dict[str, Any] | None]],
+) -> dict[str, Any]:
     runtime = _collect_runtime_report(settings)
-    mgr = workspace_mgr or WorkspaceManager(db, settings)
     runs_by_id = {run["id"]: run for run in db.list_runs(limit=None)}
 
     items: list[dict[str, Any]] = []
@@ -205,32 +211,24 @@ def collect_storage_report(
             added_count = 0
             modified_count = 0
         else:
-            safety = mgr.workspace_gc_safety(ws["id"])
-            added_count = int(safety["added_count"])
-            modified_count = int(safety["modified_count"])
-            discard = (
-                mgr.workspace_discard_check(ws["id"])
-                if ws["status"] != "merged" and not safety["safe_to_clean"]
-                else None
-            )
-            if run_status in {"completed", "archived"} and safety["safe_to_clean"]:
-                category = "cleanable"
-                reason = str(safety["reason"])
-            elif discard is not None and discard["discardable"]:
-                # Never merged and identical to its baseline: safe to discard on explicit request.
-                category = "discardable"
-                reason = str(discard["reason"])
+            if ws["id"] in preview_checks:
+                safety, discard = preview_checks[ws["id"]]
             else:
-                category = "dirty_review"
-                if discard is not None:
-                    reason = discard["reason"]
-                elif run_status not in {"completed", "archived"}:
-                    reason = (
-                        f"Run status is {run_status!r} (must be 'completed' or 'archived'); "
-                        f"{safety['reason']}"
-                    )
-                else:
-                    reason = str(safety["reason"])
+                safety, discard = mgr.workspace_storage_checks(ws)
+            if discard is not None:
+                category = "discardable" if discard["discardable"] else "dirty_review"
+                reason = discard["reason"]
+                counts = discard if safety is None else safety
+            else:
+                assert safety is not None  # a merged workspace always gets the GC verdict
+                finished = run_status in {"completed", "archived"}
+                category = "cleanable" if finished and safety["safe_to_clean"] else "dirty_review"
+                reason = str(safety["reason"])
+                if not finished:
+                    reason = f"Run status is {run_status!r} (must be 'completed' or 'archived'); {reason}"
+                counts = safety
+            added_count = counts["added_count"]
+            modified_count = counts["modified_count"]
 
         items.append(
             {
@@ -353,6 +351,7 @@ def run_gc(
         )
         freed_bytes += result_freed
 
+    preview_checks = {}
     if clean_workspaces:
         runs_by_id = {run["id"]: run for run in db.list_runs(limit=None)}
         retention_sec = int(settings.workspace_retention_sec)
@@ -390,7 +389,12 @@ def run_gc(
                 )
                 continue
 
-            safety = workspace_mgr.workspace_gc_safety(ws["id"])
+            if dry_run:
+                safety, discard = workspace_mgr.workspace_storage_checks(ws, gc_details=True)
+                assert safety is not None
+                preview_checks[ws["id"]] = safety, discard
+            else:
+                safety = workspace_mgr.workspace_gc_safety(ws["id"])
             if run_status not in {"completed", "archived"} or not safety["safe_to_clean"]:
                 reason = (
                     f"Run status is {run_status!r} (must be 'completed' or 'archived'); {safety['reason']}"
@@ -457,7 +461,7 @@ def run_gc(
             cleaned_workspaces.append(ws["id"])
             freed_bytes += ws_bytes
 
-    report_after = collect_storage_report(db, settings, workspace_mgr=workspace_mgr)
+    report_after = _storage_report(db, settings, workspace_mgr, preview_checks)
     return {
         "ok": True,
         "dry_run": bool(dry_run),

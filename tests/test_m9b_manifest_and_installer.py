@@ -199,7 +199,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     assert manifest_path.is_file()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["name"] == "tri-orchestrator"
-    assert manifest["version"] == "0.6.12"
+    assert manifest["version"] == "0.6.13"
     assert manifest["hooks"] == "./hooks/hooks.json"
     assert manifest["skills"] == "./skills/"
     assert manifest["mcpServers"] == "./.mcp.json"
@@ -253,7 +253,7 @@ def test_single_manifest_convergence_and_sixth_cli_entrypoint() -> None:
     spec.loader.exec_module(upgrade_mod)
     assert upgrade_mod.package_identity(PLUGIN_DIR) == {
         "name": "tri-orchestrator",
-        "version": "0.6.12",
+        "version": "0.6.13",
     }
     assert "pipeline_runner_v1" not in UPGRADE_PY.read_text(encoding="utf-8")
 
@@ -383,7 +383,7 @@ def test_real_install_hooks_list_trust_and_uninstall_e2e(tmp_path: Path) -> None
         / "cache"
         / "tri-orchestrator"
         / "tri-orchestrator"
-        / "0.6.12"
+        / "0.6.13"
         / ".venv"
         / "Scripts"
     )
@@ -990,3 +990,49 @@ def test_install_ps1_features_section_idempotent(tmp_path: Path) -> None:
         spawn_def = next(st for st in collab_tool["tools"] if st.get("name") == "spawn_agent")
         spawn_props = spawn_def.get("parameters", {}).get("properties", {})
         assert "task_name" in spawn_props and "fork_turns" in spawn_props and "agent_type" in spawn_props
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows daemon identity and process handles")
+def test_uninstall_checks_live_daemon_identity_before_stopping_or_removing_data(tmp_path):
+    from orchestrator.config import Settings
+    from orchestrator.mcp_shim import ensure_daemon_running
+    from orchestrator.windows_daemon import WindowsDaemonProcess
+
+    ps = _resolve_powershell()
+    assert ps is not None
+    cfg = Settings(data_dir=tmp_path / "中文 data", port=_free_loopback_port())
+    codex_home = tmp_path / "codex-home"
+    env = dict(os.environ, TRI_ORCH_DATA_DIR=str(cfg.data_dir), CODEX_HOME=str(codex_home),
+               LOCALAPPDATA=str(tmp_path), CODEX_CLI_PATH="", PATH=os.environ["SystemRoot"] + r"\System32")
+    args = [ps, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+            "-File", str(UNINSTALL_PS1), "-CodexHome", str(codex_home), "-RemoveDataDir"]
+
+    live = ensure_daemon_running(cfg)
+    assert live["spawned"]
+    daemon = WindowsDaemonProcess(live["pid"], [])
+    try:
+        original = cfg.pid_path.read_bytes()
+        info = json.loads(original)
+        with subprocess.Popen([sys._base_executable, "-c", "import time; time.sleep(120)"],
+                              creationflags=subprocess.CREATE_NO_WINDOW) as other:
+            try:
+                for wrong in ({"pid": other.pid}, {"pid": 2**31 - 1}, {"started_at": info["started_at"] - 1},
+                              {"data_dir": str(tmp_path / "wrong")}):
+                    evidence = json.dumps(info | wrong).encode()
+                    cfg.pid_path.write_bytes(evidence)
+                    refused = subprocess.run(args, env=env, capture_output=True, timeout=30)
+                    assert refused.returncode != 0 and b"preserving" in refused.stderr, refused
+                    assert cfg.pid_path.read_bytes() == evidence
+                    assert other.poll() is None and daemon.poll() is None
+                cfg.pid_path.write_bytes(original)
+                stopped = subprocess.run(args, env=env, capture_output=True, timeout=30)
+                assert stopped.returncode == 0, stopped.stderr
+                assert daemon.poll() is not None and other.poll() is None
+                assert not cfg.data_dir.exists()
+            finally:
+                if other.poll() is None:
+                    other.terminate()
+    finally:
+        if daemon.poll() is None:
+            daemon.terminate()
+            daemon.wait(timeout=5)

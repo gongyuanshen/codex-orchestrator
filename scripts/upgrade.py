@@ -10,6 +10,7 @@ import ast
 from contextlib import closing, contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -187,7 +188,7 @@ def package_files(root: Path) -> dict[str, str]:
 
 def package_identity(root: Path) -> dict:
     value = json.loads((root / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
-    if value.get("name") != "tri-orchestrator" or not isinstance(value.get("version"), str):
+    if not isinstance(value, dict) or value.get("name") != "tri-orchestrator" or not isinstance(value.get("version"), str):
         raise UpgradeError(f"Unexpected plugin identity: {root}")
     return {"name": value["name"], "version": value["version"]}
 
@@ -520,6 +521,38 @@ def verify(
     return report
 
 
+def _rotation_created_at(bundle: Path) -> float:
+    """Only prepare()'s own package pair and database backup establish ownership."""
+    manifest_path = bundle / "prepared.json"
+    state_path = bundle / "state-before.db"
+    for path in (bundle, manifest_path, state_path):
+        if _is_reparse_or_symlink(path):
+            raise UpgradeError(f"symlink_or_junction: {path}")
+
+    if not manifest_path.is_file() or not state_path.is_file():
+        raise UpgradeError("missing prepared.json or state-before.db")
+    manifest = load_prepared(bundle)
+    if not isinstance(manifest, dict) or manifest.get("status") != "prepared":
+        raise UpgradeError("invalid prepared.json status")
+    created_at = manifest.get("created_at")
+    if type(created_at) not in (int, float) or not math.isfinite(created_at) or created_at <= 0:
+        raise UpgradeError("invalid prepared.json created_at")
+
+    for directory, identity, files in (("staged", "source_identity", "source_files"),
+                                       ("package-before", "target_identity", "target_files")):
+        package = bundle / directory
+        metadata = package / ".codex-plugin" / "plugin.json"
+        if any(_is_reparse_or_symlink(path) for path in (package, metadata.parent, metadata)):
+            raise UpgradeError(f"symlink_or_junction: {metadata}")
+        if not metadata.is_file():
+            raise UpgradeError(f"missing plugin metadata: {metadata}")
+        inventory = manifest.get(files)
+        if (manifest.get(identity) != package_identity(package) or not isinstance(inventory, dict)
+                or inventory.get(".codex-plugin/plugin.json") != digest(metadata.read_bytes())):
+            raise UpgradeError(f"prepared.json does not identify its {directory} package")
+    return created_at
+
+
 def prune(
     backup_root: Path | None = None,
     *,
@@ -565,22 +598,36 @@ def prune(
             eligible: list[tuple[tuple[float, float, str], Path]] = []
             for entry in sorted(root_path.iterdir(), key=lambda p: p.name):
                 if _is_reparse_or_symlink(entry):
-                    if (entry / "prepared.json").is_file() or (entry / "upgrade-bundle" / "prepared.json").is_file():
-                        skipped_backups.append({"path": str(entry), "reason": "symlink_or_junction"})
+                    skipped_backups.append({"path": str(entry), "reason": "symlink_or_junction"})
                     continue
                 if not entry.is_dir():
                     continue
-                if (entry / "prepared.json").is_file():
-                    bundle_dir = entry
-                elif (entry / "upgrade-bundle" / "prepared.json").is_file():
+                bundle_dir = entry
+                marker = entry / "prepared.json"
+                if not marker.exists() and not _is_reparse_or_symlink(marker):
                     bundle_dir = entry / "upgrade-bundle"
-                else:
+                    if _is_reparse_or_symlink(bundle_dir):
+                        skipped_backups.append({"path": str(entry), "reason": "symlink_or_junction"})
+                        continue
+                    if not bundle_dir.is_dir():
+                        skipped_backups.append({"path": str(entry), "reason": "no_upgrade_bundle"})
+                        continue
+
+                if _overlaps_active(bundle_dir):
+                    skipped_backups.append({"path": str(bundle_dir), "reason": "active_plugin_overlap"})
                     continue
 
-                if _overlaps_active(entry):
-                    skipped_backups.append({"path": str(entry), "reason": "active_plugin_overlap"})
+                try:
+                    created_at = _rotation_created_at(bundle_dir)
+                    mtime = bundle_dir.lstat().st_mtime
+                except (OSError, ValueError, OverflowError, RecursionError, UpgradeError) as exc:
+                    skipped_backups.append({"path": str(bundle_dir), "reason": f"invalid_upgrade_backup: {exc}"})
                     continue
 
+                if any(_is_reparse_or_symlink(bundle_dir / name) for name in
+                       ("verified.json", "applied.json", "apply-failed.json", "apply-started.json", "rolled-back.json")):
+                    skipped_backups.append({"path": str(bundle_dir), "reason": "symlink_or_junction"})
+                    continue
                 is_verified = (bundle_dir / "verified.json").is_file()
                 is_applied = (bundle_dir / "applied.json").is_file()
                 is_failed = (bundle_dir / "apply-failed.json").is_file()
@@ -588,30 +635,22 @@ def prune(
                 is_rolled_back = (bundle_dir / "rolled-back.json").is_file()
 
                 if is_failed and not is_verified:
-                    skipped_backups.append({"path": str(entry), "reason": "apply_failed"})
+                    skipped_backups.append({"path": str(bundle_dir), "reason": "apply_failed"})
                     continue
                 if is_started and not is_applied and not is_rolled_back and not is_verified:
-                    skipped_backups.append({"path": str(entry), "reason": "apply_in_progress"})
+                    skipped_backups.append({"path": str(bundle_dir), "reason": "apply_in_progress"})
                     continue
                 if verified_only and not is_verified:
-                    skipped_backups.append({"path": str(entry), "reason": "not_verified"})
+                    skipped_backups.append({"path": str(bundle_dir), "reason": "not_verified"})
                     continue
 
-                try:
-                    prepared_data = json.loads((bundle_dir / "prepared.json").read_text(encoding="utf-8"))
-                    created_at = float(prepared_data.get("created_at") or 0.0)
-                except Exception:
-                    created_at = 0.0
-                try:
-                    mtime = float(entry.lstat().st_mtime)
-                except OSError:
-                    mtime = 0.0
-                eligible.append(((created_at, mtime, entry.name), entry))
+                # A wrapper may also contain backups owned by other tools.
+                eligible.append(((created_at, mtime, entry.name), bundle_dir))
 
             eligible.sort(key=lambda item: item[0], reverse=True)
             retained: list[Path] = []
             for _, cand in eligible:
-                if protect_current and current_resolved is not None and cand.resolve() == current_resolved:
+                if protect_current and current_resolved is not None and cand.resolve().is_relative_to(current_resolved):
                     retained.append(cand)
             for _, cand in eligible:
                 if cand in retained:

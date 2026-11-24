@@ -7,7 +7,7 @@ Tri Orchestrator 是一个在本机运行的 Codex 插件。它把一项任务�
 需要 Git、uv、Python 3.12 或更高版本，以及支持 `codex plugin`、`multi_agent` 和 `multi_agent_v2` 的 Codex CLI。首次安装执行：
 
 ```sh
-codex plugin marketplace add gongyuanshen/codex-orchestrator@v0.6.12
+codex plugin marketplace add gongyuanshen/codex-orchestrator@v0.6.13
 codex plugin add tri-orchestrator@tri-orchestrator
 codex features enable multi_agent
 codex features enable multi_agent_v2
@@ -15,14 +15,14 @@ codex plugin list --marketplace tri-orchestrator
 codex mcp list
 ```
 
-最后两条命令分别检查插件和它的工具服务：插件应为 `0.6.12`，`tri_orchestrator` 应为已启用。**打开新的 Codex 会话**使用插件；第一次调用工具时后台会自动启动。
+最后两条命令分别检查插件和它的工具服务：插件应为 `0.6.13`，`tri_orchestrator` 应为已启用。**打开新的 Codex 会话**使用插件；第一次调用工具时后台会自动启动。
 
 ### 可选：安装六个专用角色
 
 只装插件也能使用三种模式：没有专用角色时，技能会在派单时给出角色要求。要让 Codex 使用独立的角色配置，从与插件相同标签的**完整仓库源码**运行安装脚本。插件发行 ZIP 和 Python wheel 不包含这些脚本。
 
 ```sh
-git clone --branch v0.6.12 --depth 1 https://github.com/gongyuanshen/codex-orchestrator.git
+git clone --branch v0.6.13 --depth 1 https://github.com/gongyuanshen/codex-orchestrator.git
 cd codex-orchestrator
 ```
 
@@ -78,19 +78,19 @@ $boost 新建 hello.txt，文件内容为一行 hello world。只改这一个文
 
 ## 从旧版升级
 
-**从 v0.6.11 到 v0.6.12 不需要迁移数据库**：两版都是 schema 10，保留 `state.db`。插件缓存、后台进程和专用角色是三份不同的状态，不能只看市场里显示的版本。
+**从 v0.6.12 到 v0.6.13 不需要迁移数据库**：两版都是 schema 10，保留 `state.db`。插件缓存、后台进程和专用角色是三份不同的状态，不能只看市场里显示的版本。
 
 1. **停写并确认要停的进程。** 等活跃任务结束，关闭使用旧插件的会话。先记录 `http://127.0.0.1:18790/api/health` 返回的 `pid`、`data_dir`、`schema_version`，与数据目录中 `daemon.pid.json` 的 PID 和地址核对，只停止匹配的后台。停服后备份数据目录；安装器的配置备份不包含任务数据库。数据库早于 schema 10 的，先执行下方的离线迁移。
 2. **更新插件。** 固定在旧标签时，依次运行下面三条命令。若原来跟踪默认分支，改用 `codex plugin marketplace upgrade tri-orchestrator`，然后运行第三条；若登记的是本地源码市场，则检出目标标签并重跑该版本的安装脚本。
 
    ```sh
    codex plugin marketplace remove tri-orchestrator
-   codex plugin marketplace add gongyuanshen/codex-orchestrator@v0.6.12
+   codex plugin marketplace add gongyuanshen/codex-orchestrator@v0.6.13
    codex plugin add tri-orchestrator@tri-orchestrator
    ```
 
 3. **同步角色。** 只在装过专用角色时需要：从新标签的完整源码执行前面对应平台的角色安装命令。检查四个钩子的信任状态。
-4. **确认新后台。** 用 `codex plugin list --marketplace tri-orchestrator` 看缓存版本，打开新会话并调用一次插件工具，再读 `/api/health`。本版应返回 `software_version` 为 `0.6.12`、`schema_version` 为 `10`，`data_dir` 仍是原目录。`stale_role_contracts` 列出带旧版本标记的角色；空列表不代表六个角色都已安装。
+4. **确认新后台。** 用 `codex plugin list --marketplace tri-orchestrator` 看缓存版本，打开新会话并调用一次插件工具，再读 `/api/health`。本版应返回 `software_version` 为 `0.6.13`、`schema_version` 为 `10`，`data_dir` 仍是原目录。`stale_role_contracts` 列出带旧版本标记的角色；空列表不代表六个角色都已安装。
 
 ### 旧数据库：离线迁移与回滚
 
@@ -162,6 +162,13 @@ uv run --locked --project ./plugin tri-orchestrator-daemon --gc
 | `CODEX_HOME`、`CODEX_BIN` | 前者默认为 `~/.codex`；后者可指定宿主盲审使用的 Codex CLI 路径。 |
 
 后台配置在进程启动时读取。只开一个新会话会复用健康的旧后台；要更换端口、数据目录或默认工作区后端，先结束活跃任务、按升级步骤核对并停止旧后台，再从设好变量的环境启动。
+
+## v0.6.13 的变化
+
+- **工作区清理不再漏看 Git 分支和 stash。** 克隆里仍有唯一副本就保留。非 Git 快照沿用创建时的忽略规则；合入前若目标文件已变，会停止而不是覆盖。存储报告和清理预演减少了重复读盘，真正删除前仍会复查。
+- **派单、验收和收尾按本轮事实判断。** Solo 本地接单不再误报失败；重复上报不会覆盖已登记的回执；验收定位到正确的候选或集成目录，只认当前版本的结果。有尚未确认的宿主动作时，收尾不会把成员提前标成已停止。
+- **升级和卸载只处理身份已核实的对象。** 轮转前校验备份内的新旧插件、数据库和元数据，保留同目录的其他文件；Windows 卸载先确认监听端口的进程确属该后台，身份不符就停止卸载。
+- 本版保留 schema 10。Windows 完整套件与 Linux/macOS 的两项 POSIX 专项是不同的验收；后者可在仓库的 **POSIX release checks** 记录中查看。
 
 ## v0.6.12 的变化
 

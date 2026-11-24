@@ -1,0 +1,29 @@
+name: POSIX release checks
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  posix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: '0.12.19'
+          enable-cache: false
+      - name: Verify FIFO rejection and process group timeout
+        run: |
+          uv run --locked --python 3.12 pytest -q -ra --junitxml="$RUNNER_TEMP/posix.xml" \
+            'tests/test_m9b_manifest_and_installer.py::test_install_sh_rejects_nonregular_config_before_writing[fifo]' \
+            tests/test_verify_process.py::test_posix_timeout_and_cancel_real_group
+          python3 -c 'import os, xml.etree.ElementTree as E; cases = E.parse(os.path.join(os.environ["RUNNER_TEMP"], "posix.xml")).findall(".//testcase"); assert len(cases) == 2 and not any(c.find("skipped") is not None for c in cases), "Both POSIX tests must actually run"'

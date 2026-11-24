@@ -16,8 +16,9 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -412,6 +413,7 @@ class _TriIgnoreRule:
 @dataclass(frozen=True, slots=True)
 class _TriIgnoreMatcher:
     rules: tuple[_TriIgnoreRule, ...] = ()
+    text: str = ""
 
     def matches(self, rel_posix: str, *, is_dir: bool) -> bool:
         if not self.rules:
@@ -432,13 +434,15 @@ class _TriIgnoreMatcher:
         return self.matches(rel_posix, is_dir=False)
 
 
-def _load_triignore(project_root: Path) -> _TriIgnoreMatcher:
-    """Load optional .triignore patterns from project_root."""
+def _read_triignore(project_root: Path) -> str:
     ignore_path = project_root / TRIIGNORE_FILENAME
     if not ignore_path.is_file() or _is_reparse_or_symlink(ignore_path):
-        return _TriIgnoreMatcher()
+        return ""
+    return ignore_path.read_text(encoding="utf-8-sig", errors="replace")
+
+
+def _parse_triignore(text: str) -> _TriIgnoreMatcher:
     rules: list[_TriIgnoreRule] = []
-    text = ignore_path.read_text(encoding="utf-8-sig", errors="replace")
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -461,7 +465,24 @@ def _load_triignore(project_root: Path) -> _TriIgnoreMatcher:
                 regex=regex,
             )
         )
-    return _TriIgnoreMatcher(tuple(rules))
+    return _TriIgnoreMatcher(tuple(rules), text)
+
+
+def _snapshot_triignore(ws: dict[str, Any], project_root: Path) -> _TriIgnoreMatcher:
+    manifest = ws.get("snapshot_manifest") or {}
+    if "triignore" in manifest:
+        return _parse_triignore(manifest["triignore"])
+    # Older snapshots stored the ignore file's hash, not its text. Never trust changed rules.
+    expected = (manifest.get("files") or {}).get(TRIIGNORE_FILENAME)
+    if expected is None:
+        return _TriIgnoreMatcher()
+    for root in (Path(ws["path"]), project_root):
+        path = root / TRIIGNORE_FILENAME
+        if path.is_file() and not _is_reparse_or_symlink(path):
+            data = path.read_bytes()
+            if hashlib.sha256(data).hexdigest() == expected:
+                return _parse_triignore(data.decode("utf-8-sig", errors="replace"))
+    raise WorkspaceError(f"Cannot recover the original .triignore for snapshot {ws['id']} (SHA-256 {expected})")
 
 
 def _filter_snapshot_baseline(
@@ -490,7 +511,7 @@ def _scan_snapshot_files(
     if not root.exists():
         return manifest
     excluded_root = frozenset(exclude_root_files)
-    matcher = triignore if triignore is not None else _load_triignore(root)
+    matcher = triignore if triignore is not None else _parse_triignore(_read_triignore(root))
 
     for dirpath, dirnames, filenames in os.walk(root):
         parent = Path(dirpath)
@@ -870,6 +891,24 @@ class WorkspaceManager:
             raise WorkspaceCleanupGuardError(f"Linked worktree at {ws['path']} has missing or invalid backend metadata")
         return False
 
+    def _require_preserved_clone_refs(self, ws: dict[str, Any]) -> None:
+        if self._uses_git_worktree(ws):
+            return  # Its branches and stash already live in the source repository.
+        path, root = Path(ws["path"]), self.workspace_source_root(ws)
+        branches = _run_git(path, "for-each-ref", "--format=%(refname)%09%(objectname)",
+                            "refs/heads", check=True).stdout.splitlines()
+        stashes = _run_git(path, "stash", "list", "--format=%gd%x09%H", check=True).stdout.splitlines()
+        source_stashes = (set(_run_git(root, "stash", "list", "--format=%H", check=True).stdout.splitlines())
+                          if stashes else set())
+        for entry in [*stashes, *branches]:
+            ref, commit = entry.split("\t", 1)
+            if ref == f"refs/heads/{ws['branch_name']}" or commit in source_stashes:
+                continue  # HEAD has a separate base/merge proof (including cherry-picks).
+            saved = _run_git(root, "for-each-ref", "--count=1", "--format=%(refname)", f"--contains={commit}")
+            if saved.returncode or not saved.stdout.strip():
+                detail = saved.stderr.strip() or "no source ref contains this commit"
+                raise WorkspaceCleanupGuardError(f"Cannot prove clone {ref} ({commit}) is preserved: {detail}")
+
     def _fetch_workspace_branch_to_ref(
         self,
         repo_root: Path,
@@ -992,7 +1031,8 @@ class WorkspaceManager:
                 _append_git_exclude_entries(source.git_common_dir, [EXCLUDE_ENTRY])
 
             if not use_git_clone:
-                triignore = _load_triignore(base_root)
+                triignore_text = _read_triignore(base_root)
+                triignore = _parse_triignore(triignore_text)
                 estimated_bytes, estimated_files = _estimate_snapshot_size(
                     base_root,
                     copy_env=copy_env,
@@ -1096,6 +1136,7 @@ class WorkspaceManager:
                         "project_root": str(base_root),
                         "copy_env": bool(copy_env),
                         "files": baseline_files,
+                        "triignore": triignore_text,
                         "copied_bytes": copied_bytes,
                         "file_count": file_count,
                     }
@@ -1205,7 +1246,7 @@ class WorkspaceManager:
         # Snapshot mode
         manifest = ws.get("snapshot_manifest") or {}
         project_root = self.workspace_source_root(ws)
-        triignore = _load_triignore(project_root)
+        triignore = _snapshot_triignore(ws, project_root)
         baseline: dict[str, str] = _filter_snapshot_baseline(
             dict(manifest.get("files") or {}),
             triignore=triignore,
@@ -1324,7 +1365,7 @@ class WorkspaceManager:
         # Snapshot mode diff
         manifest = ws.get("snapshot_manifest") or {}
         project_root = self.workspace_source_root(ws)
-        triignore = _load_triignore(project_root)
+        triignore = _snapshot_triignore(ws, project_root)
         baseline: dict[str, str] = _filter_snapshot_baseline(
             dict(manifest.get("files") or {}),
             triignore=triignore,
@@ -1525,7 +1566,7 @@ class WorkspaceManager:
         # Snapshot mode 3-way preview
         manifest = ws.get("snapshot_manifest") or {}
         project_root = self.workspace_source_root(ws)
-        triignore = _load_triignore(project_root)
+        triignore = _snapshot_triignore(ws, project_root)
         baseline: dict[str, str] = _filter_snapshot_baseline(
             dict(manifest.get("files") or {}),
             triignore=triignore,
@@ -1634,7 +1675,7 @@ class WorkspaceManager:
                               strategy: str) -> dict[str, Any]:
         source = Path(ws["path"])
         manifest = ws.get("snapshot_manifest") or {}
-        triignore = _load_triignore(root)
+        triignore = _snapshot_triignore(ws, root)
         baseline = _filter_snapshot_baseline(dict(manifest.get("files") or {}), triignore=triignore)
         excluded = frozenset(ENV_FILENAMES)
         approved = _scan_snapshot_files(source, exclude_root_files=excluded, triignore=triignore)
@@ -1677,7 +1718,11 @@ class WorkspaceManager:
                           "project_root": str(root), "source_manifest": approved,
                           "before_manifest": before, "desired_manifest": desired,
                           "operations": changes, "staging_dir": str(staging), "strategy": strategy}
-            service.begin_merge(step["id"], checkpoint)
+            with self.db.transaction():
+                if "triignore" not in manifest:
+                    # The merge may overwrite the last copy of the original rules in a legacy snapshot.
+                    self.db.update_workspace(ws["id"], snapshot_manifest={**manifest, "triignore": triignore.text})
+                service.begin_merge(step["id"], checkpoint)
             begun_merge = True
             for rel in changes:
                 target = self._merge_file(root, rel)
@@ -1697,7 +1742,7 @@ class WorkspaceManager:
                      "source_manifest": approved, "target_manifest": desired}
             with self.db.transaction():
                 self.db.update_workspace(ws["id"], status="merged", snapshot_manifest={
-                    **ws["snapshot_manifest"], "files": approved})
+                    **ws["snapshot_manifest"], "files": approved, "triignore": triignore.text})
                 service.finish_merge(step["id"], proof)
             merge_finished = True
             return {"workspace_id": ws["id"], "mode": "snapshot", "merged": True,
@@ -1792,12 +1837,14 @@ class WorkspaceManager:
             raise WorkspaceConflictError("Merge checkpoint identity mismatch")
         proof = {"merge_id": checkpoint["merge_id"], "mode": ws["mode"], "project_root": str(root)}
         if ws["mode"] == "snapshot":
-            current = _scan_snapshot_files(root, exclude_root_files=frozenset(ENV_FILENAMES))
+            triignore = _snapshot_triignore(ws, root)
+            current = _scan_snapshot_files(root, exclude_root_files=ENV_FILENAMES, triignore=triignore)
             if current != checkpoint["desired_manifest"]:
                 state = "not_applied" if current == checkpoint["before_manifest"] else "partially_applied_or_changed"
                 raise WorkspaceConflictError(f"Merge reconciliation needs a decision: {state}; no files replayed")
             proof.update(source_manifest=checkpoint["source_manifest"], target_manifest=current)
-            updates = {"snapshot_manifest": {**ws["snapshot_manifest"], "files": checkpoint["source_manifest"]}}
+            updates = {"snapshot_manifest": {**ws["snapshot_manifest"], "files": checkpoint["source_manifest"],
+                                             "triignore": triignore.text}}
         else:
             if self._current_branch_or_head(root) != checkpoint["target_branch"] and checkpoint["target_branch"] != "HEAD":
                 raise WorkspaceConflictError("Git target branch differs from merge checkpoint")
@@ -2040,7 +2087,7 @@ class WorkspaceManager:
         with self._lock:
             manifest = ws.get("snapshot_manifest") or {}
             project_root = self.workspace_source_root(ws)
-            triignore = _load_triignore(project_root)
+            triignore = _snapshot_triignore(ws, project_root)
             baseline: dict[str, str] = _filter_snapshot_baseline(
                 dict(manifest.get("files") or {}),
                 triignore=triignore,
@@ -2098,6 +2145,7 @@ class WorkspaceManager:
                 "project_root": str(project_root),
                 "copy_env": bool(manifest.get("copy_env", True)),
                 "files": ws_files,
+                "triignore": triignore.text,
             }
             self.db.update_workspace(
                 workspace_id,
@@ -2189,6 +2237,7 @@ class WorkspaceManager:
                                 f"Refusing cleanup for workspace {workspace_id}: HEAD {current_head} "
                                 f"differs from merged commit {ws['merged_commit']}; merge again"
                             )
+                        self._require_preserved_clone_refs(ws)
                     elif any(ws_path.iterdir()):
                         raise WorkspaceCleanupGuardError(
                             f"Refusing cleanup for workspace {workspace_id}: missing .git metadata in non-empty directory"
@@ -2218,7 +2267,25 @@ class WorkspaceManager:
         +A:0 / ~M:0 / -D:0, and Git merged-commit proof + branch/HEAD invariants)
         without bypassing ``WorkspaceCleanupGuardError`` boundaries.
         """
-        ws = self._require_workspace(workspace_id)
+        return self._workspace_gc_safety(self._require_workspace(workspace_id), self.workspace_status)
+
+    def workspace_storage_checks(
+        self, ws: dict[str, Any], *, gc_details: bool = False,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Read-only verdicts for one storage inventory row, never used as removal authority."""
+        if ws["status"] == "merged":
+            return self._workspace_gc_safety(ws, self.workspace_status), None
+        # GC and explicit discard have different guard reasons but inspect the same checkout.
+        read_status = cache(self.workspace_status)
+        discard = self._workspace_discard_check(ws, read_status)
+        if ws["mode"] == "snapshot" and "added_count" in discard and not gc_details:
+            return None, discard
+        return self._workspace_gc_safety(ws, read_status), discard
+
+    def _workspace_gc_safety(
+        self, ws: dict[str, Any], read_status: Callable[[str], dict[str, Any]],
+    ) -> dict[str, Any]:
+        workspace_id = ws["id"]
         ws_path = Path(ws["path"])
         is_reparse = _is_reparse_or_symlink(ws_path)
         exists = ws_path.exists() or is_reparse
@@ -2330,7 +2397,7 @@ class WorkspaceManager:
 
         if ws["mode"] == "snapshot":
             try:
-                status_info = self.workspace_status(workspace_id)
+                status_info = read_status(workspace_id)
             except (WorkspaceError, OSError, NotFoundError) as exc:
                 logger.warning("Snapshot GC inspection failed for %s: %s", workspace_id, exc)
                 return {
@@ -2428,7 +2495,7 @@ class WorkspaceManager:
             }
 
         try:
-            status_info = self.workspace_status(workspace_id)
+            status_info = read_status(workspace_id)
             added_set: set[str] = set()
             modified_set: set[str] = set()
             deleted_set: set[str] = set()
@@ -2506,6 +2573,7 @@ class WorkspaceManager:
                     f"~M:{len(modified_files)}, -D:{len(deleted_files)})"
                 )
             else:
+                self._require_preserved_clone_refs(ws)
                 safe = True
                 reason = "Merged git_clone workspace is clean (+A:0, ~M:0)"
 
@@ -2624,7 +2692,12 @@ class WorkspaceManager:
 
     def workspace_discard_check(self, workspace_id: str) -> dict[str, Any]:
         """Read-only: may this workspace be discarded?  Never mutates disk or state.db."""
-        ws = self._require_workspace(workspace_id)
+        return self._workspace_discard_check(self._require_workspace(workspace_id), self.workspace_status)
+
+    def _workspace_discard_check(
+        self, ws: dict[str, Any], read_status: Callable[[str], dict[str, Any]],
+    ) -> dict[str, Any]:
+        workspace_id = ws["id"]
         ws_path = Path(ws["path"])
         is_reparse = _is_reparse_or_symlink(ws_path)
         exists = ws_path.exists() or is_reparse
@@ -2684,7 +2757,7 @@ class WorkspaceManager:
                            added_count=0, modified_count=0, deleted_count=0)
 
         try:
-            status_info = self.workspace_status(workspace_id)
+            status_info = read_status(workspace_id)
         except (WorkspaceError, WorkspaceCleanupGuardError, OSError, NotFoundError) as exc:
             return verdict(False, f"Inspection error: {exc}")
         if ws["mode"] == "snapshot":
@@ -2730,6 +2803,10 @@ class WorkspaceManager:
                 f"Working tree has {len(changed)} uncommitted change(s); never discard unmerged work",
                 **counts,
             )
+        try:
+            self._require_preserved_clone_refs(ws)
+        except (WorkspaceError, OSError) as exc:
+            return verdict(False, f"Git inspection error: {exc}", **counts)
         return verdict(True, "Git checkout is at its base commit with a clean tree", **counts)
 
     def workspace_discard(self, workspace_id: str, reason: str) -> dict[str, Any]:

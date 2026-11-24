@@ -228,3 +228,65 @@ def test_open_findings_and_idle_observation_do_not_hide_real_gate_owner(flow):
     step = verify(s, step, 'integrated')
     assert s.recorded_integrated_gate(step, {**step['checkpoint'], 'findings': [{'status': 'open'}]}) is None
     assert s.recorded_integrated_gate(dict(step, verifier_agent_id='other'), step['checkpoint']) is None
+
+
+def test_old_explicit_integrated_pass_does_not_block_revised_candidate(flow):
+    db, s, run, *_ = flow
+    local = dict(agent_id='/root/a', evidence='Synchronous phase completed before contract revision')
+    old = verify(s, advance(s, _solo_candidate_pass(flow), 'begin_integrated_review'), 'integrated')
+    step = advance(s, old, 'local_revision_boundary', **local)
+    step = s.step_save(run['id'], 'a', 'a', 'va', execution_kind='coordinator_local',
+                       step_id=step['id'], expected_revision=step['revision'])
+    assert step['contract_revision'] == old['contract_revision'] + 1
+    step = advance(s, step, 'dispatch', **local)
+    step = advance(s, advance(s, step, 'accept'), 'submit')
+    step = advance(s, verify(s, step, 'candidate'), 'begin_integrated_review')
+    assert s.recorded_integrated_gate(step, step['checkpoint']) == 'reused'
+    assert advance(s, step, 'complete')['state'] == 'done'
+    s.require_completion(run['id'])
+    assert len(_integrated_records(db, step['id'])) == 1
+
+
+def test_unsettled_native_action_blocks_closeout_and_final_commit_until_reconciled(flow):
+    from orchestrator.native_actions import NativeActionStore
+    from orchestrator.rpc_handlers import RpcDispatcher
+
+    db, s, run, *_ = flow
+    run_id = run['id']
+    board = BoardService(db)
+    rpc = RpcDispatcher(db, board, s.workspaces)
+    store = NativeActionStore(db)
+    step = advance(s, advance(s, _solo_candidate_pass(flow), 'begin_integrated_review'), 'complete')
+    board.board_post(run_id, 'human', mentions=['va'], msg_type='human', body_md='Check this follow-up')
+    item = next(i for i in store.project(run_id)['next_actions'] if i['source_type'] == 'human')
+    row = store.update(action='claim', **{k: item[k] for k in
+                       ('run_id', 'source_type', 'source_id', 'recipient', 'action_type', 'source_digest')})
+
+    def worker_states():
+        return {w['name']: w['status'] for w in db.list_workers(run_id=run_id)}
+
+    initial_states = worker_states()
+    def reject(status):
+        assert row['status'] == status
+        for close in (lambda: rpc.dispatch('workflow_closeout_run', {'run_id': run_id}),
+                      lambda: db.update_run(run_id, status='completed')):
+            with pytest.raises(WorkflowConflictError, match=row['action_id']) as exc:
+                close()
+            assert status in str(exc.value)
+            assert db.get_run(run_id)['status'] == 'active'
+            assert worker_states() == initial_states
+            assert s.get_step(step['id']) == step
+            assert store.get(row['action_id']) == row
+
+    reject('claimed')
+    row = store.update(action='begin', action_id=row['action_id'], expected_revision=row['revision'],
+                       claim_token=row['claim_token'])
+    reject('invoking')
+    store.recover()
+    row = store.get(row['action_id'])
+    reject('needs_reconciliation')
+    result = store.update(action='reconcile', action_id=row['action_id'], expected_revision=row['revision'],
+                          outcome='confirmed', evidence_ref='host:inspection', evidence_digest='a'*64,
+                          result='Original human follow-up was delivered')
+    assert result['status'] == 'confirmed'
+    assert rpc.dispatch('workflow_closeout_run', {'run_id': run_id})['run']['status'] == 'completed'

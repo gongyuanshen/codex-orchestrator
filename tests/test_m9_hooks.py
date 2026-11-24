@@ -119,7 +119,7 @@ class _MockRpcServer:
 
 def test_m9_manifests_entrypoints_and_spike_report_validity() -> None:
     pyproject = tomllib.loads((PLUGIN_DIR / "pyproject.toml").read_text(encoding="utf-8"))
-    assert pyproject["project"]["version"] == "0.6.12"
+    assert pyproject["project"]["version"] == "0.6.13"
     scripts = pyproject["project"]["scripts"]
     assert scripts["tri-orchestrator-hook"] == "orchestrator.hook_runner:main"
     assert scripts["tri-orchestrator-challenge"] == "orchestrator.challenge_runner:main"
@@ -128,7 +128,7 @@ def test_m9_manifests_entrypoints_and_spike_report_validity() -> None:
         (PLUGIN_DIR / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8")
     )
     assert codex_manifest["name"] == "tri-orchestrator"
-    assert codex_manifest["version"] == "0.6.12"
+    assert codex_manifest["version"] == "0.6.13"
     assert codex_manifest["hooks"] == "./hooks/hooks.json"
 
     # M9b single-manifest convergence: root plugin/plugin.json must not exist so Codex loads .codex-plugin/plugin.json
@@ -864,7 +864,7 @@ def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
     assert upgrade_mod.supported_schema(PLUGIN_DIR) == 10
     assert upgrade_mod.package_identity(PLUGIN_DIR) == {
         "name": "tri-orchestrator",
-        "version": "0.6.12",
+        "version": "0.6.13",
     }
 
     backup_dir = tmp_path / "backup"
@@ -901,7 +901,7 @@ def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
                 "status": "ok",
                 "ok": True,
                 "pid": os.getpid(),
-                "software_version": "0.6.12",
+                "software_version": "0.6.13",
                 "schema_version": 10,
                 "data_dir": str(data_dir.resolve()),
                 "port": self.server.server_port,  # type: ignore[attr-defined]
@@ -922,7 +922,7 @@ def test_upgrade_script_verifies_schema9_capabilities(tmp_path: Path) -> None:
                 {
                     "data_dir": str(data_dir.resolve()),
                     "port": srv.server_port,
-                    "source_identity": {"name": "tri-orchestrator", "version": "0.6.12"},
+                    "source_identity": {"name": "tri-orchestrator", "version": "0.6.13"},
                     "supported_schema": 10,
                 }
             ),

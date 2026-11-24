@@ -1020,6 +1020,13 @@ class WorkflowService:
                 raise WorkflowConflictError('Use explicit workspace merge reconciliation against actual target content; no state-only success')
             raise WorkflowConflictError(f'Action {action} is not permitted from {state}')
 
+    def verification_target(self, step: dict, scope: str) -> tuple[Path, dict | None]:
+        source = self._source_root(step)
+        if scope == 'candidate' and step['workspace_id']:
+            workspace = self.db.get_workspace(step['workspace_id'])
+            return Path(workspace['path']), workspace
+        return source, None
+
     def capture(self, step_id: str, scope: str = 'candidate', paths: list[str] | None = None,
                 verification_commands: list[dict] | None = None, env_profile: str = 'none',
                 max_parallel: int | None = None) -> dict:
@@ -1052,10 +1059,10 @@ class WorkflowService:
             run = self._run(step['run_id'])
             self._packet(step)
             self._bindings(step)
-            root, mode, baseline = self._source_root(step), 'snapshot', {}
-            if scope == 'candidate' and step['workspace_id']:
-                ws = self.db.get_workspace(step['workspace_id'])
-                root, mode, baseline = Path(ws['path']), ws['mode'], ws['snapshot_manifest'].get('files', {})
+            root, ws = self.verification_target(step, scope)
+            mode, baseline = 'snapshot', {}
+            if ws is not None:
+                mode, baseline = ws['mode'], ws['snapshot_manifest'].get('files', {})
                 # A merge may affect any source path, so its candidate gate covers the full source scan.
                 if paths is not None:
                     raise ValueError('Workspace candidates capture the complete workspace, not a partial scope')
@@ -1324,15 +1331,15 @@ class WorkflowService:
         if any(f['status'] == 'open' for f in checkpoint.get('findings', [])):
             return None
         with self.db.read_connection() as conn:
-            row = conn.execute('''SELECT v.verdict,v.verifier_agent_id,a.contract_revision,
+            row = conn.execute('''SELECT v.verdict,v.verifier_agent_id,
                 json_extract(a.descriptor_json,'$.integrated_generation') AS generation
                 FROM verification_records v JOIN workflow_artifacts a ON a.id=v.artifact_id
-                WHERE v.step_id=? AND a.scope='integrated' AND v.packet_version=? AND v.attempt=?
+                WHERE v.step_id=? AND a.scope='integrated' AND v.packet_version=? AND v.attempt=? AND a.contract_revision=?
                 ORDER BY v.created_at DESC,v.rowid DESC LIMIT 1''',
-                (step['id'], step['packet_version'], step['attempt'])).fetchone()
+                (step['id'], step['packet_version'], step['attempt'], step['contract_revision'])).fetchone()
         if row:
             if (row['verdict'] == 'PASS' and row['generation'] == checkpoint.get('integrated_generation')
-                    and all(row[k] == step[k] for k in ('verifier_agent_id', 'contract_revision'))):
+                    and row['verifier_agent_id'] == step['verifier_agent_id']):
                 return 'verified'
             return None
         reuse = checkpoint.get('integrated_reuse')
@@ -1346,19 +1353,17 @@ class WorkflowService:
         if any(f['status'] == 'open' for f in step['checkpoint'].get('findings', [])):
             raise WorkflowConflictError('Unresolved challenger findings block acceptance')
         with self.db.read_connection() as conn:
-            rows = conn.execute('''SELECT v.* FROM verification_records v JOIN workflow_artifacts a ON a.id=v.artifact_id
-              WHERE v.step_id=? AND a.scope=? ORDER BY v.created_at DESC,v.rowid DESC''', (step['id'], scope)).fetchall()
-        for row in rows:
+            row = conn.execute('''SELECT v.* FROM verification_records v JOIN workflow_artifacts a ON a.id=v.artifact_id
+                WHERE v.step_id=? AND a.scope=? AND v.packet_version=? AND v.attempt=? AND a.contract_revision=?
+                ORDER BY v.created_at DESC,v.rowid DESC LIMIT 1''', (step['id'], scope, step['packet_version'],
+                step['attempt'], step['contract_revision'])).fetchone()
+        if row is not None:
             v = _decode(row)
-            if v['packet_version'] != step['packet_version'] or v['attempt'] != step['attempt']:
-                continue
             if v['verdict'] != 'PASS' or v['verifier_agent_id'] != step['verifier_agent_id']:
                 raise WorkflowConflictError('The current independent verification is not PASS')
             artifact = self._artifact(v['artifact_id'])
             if scope == 'integrated' and artifact['descriptor'].get('integrated_generation') != step['checkpoint'].get('integrated_generation'):
                 raise WorkflowConflictError('No current integrated independent PASS after reverify')
-            if artifact['contract_revision'] != step['contract_revision']:
-                raise WorkflowConflictError('The workflow contract changed after verification')
             if not self._covers(self._required_capture_scope(step, scope), artifact['descriptor']['paths']):
                 raise WorkflowConflictError('Approved artifact scope does not cover the current delivery')
             if {x['criterion'] for x in v['criteria_results']} != set(step['criteria']):
@@ -1376,7 +1381,7 @@ class WorkflowService:
             return artifact
         if scope == 'integrated' and step['checkpoint'].get('integrated_reuse'):
             return self._reused_integrated(step)
-        raise WorkflowConflictError(f'No current {scope} independent PASS')
+        raise WorkflowConflictError(f'No current {scope} independent PASS for this contract')
 
     # ------------------------------------------------------------------
     # Workspace-less integrated reuse (workflow5).
@@ -1498,6 +1503,9 @@ class WorkflowService:
                 checkpoint['observed_before_manifest'] = capture_content(source_root)['manifest']
                 if checkpoint['mode'] == 'snapshot':
                     before, after = checkpoint['observed_before_manifest'], checkpoint['desired_manifest']
+                    if before != checkpoint['before_manifest']:
+                        raise WorkflowConflictError(
+                            'Snapshot target differs from its verified scan before apply; check .triignore or concurrent edits')
                     changes = {p for p in set(before) | set(after) if before.get(p) != after.get(p)}
                 else:
                     from orchestrator.artifacts import git
@@ -1561,26 +1569,39 @@ class WorkflowService:
 
     require_cleanup = require_integrated
 
-    def require_completion(self, run_id: str) -> None:
-        self._run(run_id)
+    def require_settled_work(self, run_id: str) -> None:
         with self.db.read_connection() as conn:
-            rows = conn.execute('SELECT * FROM workflow_steps WHERE run_id=?', (run_id,)).fetchall()
+            native = conn.execute('''SELECT action_id,status FROM native_actions WHERE run_id=?
+                AND status IN ('claimed','invoking','needs_reconciliation') ORDER BY updated_at,action_id LIMIT 1''',
+                (run_id,)).fetchone()
+            if native:
+                raise WorkflowConflictError(f"Unsettled native action {native['action_id']} ({native['status']})")
             unresolved = conn.execute('''SELECT id FROM inbox_messages WHERE run_id=? AND
                 (status='accepted' OR (status='pending' AND kind!='notice')) LIMIT 1''', (run_id,)).fetchone()
-        if not rows or unresolved:
+            if unresolved:
+                raise WorkflowConflictError('Missing workflow steps or unresolved inbox work')
+            if conn.execute("SELECT 1 FROM worker_controls WHERE run_id=? AND status='pending' LIMIT 1", (run_id,)).fetchone():
+                raise WorkflowConflictError('Acknowledge pending controls before completion')
+
+    def completion_steps(self, run_id: str) -> list[dict]:
+        self.require_settled_work(run_id)
+        steps = self._steps(run_id)
+        if not steps:
             raise WorkflowConflictError('Missing workflow steps or unresolved inbox work')
+        return steps
+
+    def require_completion(self, run_id: str) -> None:
+        self._run(run_id)
+        steps = self.completion_steps(run_id)
         criteria = set(self._criteria(self.db.get_task_packet(run_id)['acceptance_criteria']))
         covered = set()
-        for row in rows:
-            step = _decode(row)
+        for step in steps:
             if step['state'] != 'done':
                 raise WorkflowConflictError(f'Workflow step is not complete: {step["step_key"]}')
             self._valid_verification(step, 'integrated')
             covered.update(step['criteria'])
         if covered != criteria:
             raise WorkflowConflictError('Workflow steps do not cover all frozen acceptance criteria')
-        if any(x['status'] == 'pending' for x in self.db.list_worker_controls(run_id)):
-            raise WorkflowConflictError('Acknowledge pending controls before completion')
 
     def summary(self, run_id: str) -> dict:
         run = self.db.get_run(run_id)

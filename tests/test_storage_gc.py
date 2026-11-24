@@ -241,6 +241,111 @@ def test_historical_excluded_baseline_entries_do_not_trigger_dirty_guard(tmp_pat
         db.close()
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_source_triignore_change_cannot_hide_snapshot_edit(tmp_path: Path, legacy: bool) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".triignore").write_text("*.log\n", encoding="utf-8")
+    (project / "model.py").write_text("initial", encoding="utf-8")
+    _, db, mgr, run_id = _setup_env(tmp_path, project)
+    try:
+        ws = mgr.workspace_create(run_id, "author")
+        if legacy:
+            manifest = dict(ws["snapshot_manifest"])
+            del manifest["triignore"]
+            db.update_workspace(ws["id"], snapshot_manifest=manifest)
+        (Path(ws["path"]) / "model.py").write_text("only copy", encoding="utf-8")
+        db.connect().execute("UPDATE runs SET status='archived' WHERE id=?", (run_id,))
+        before = mgr.workspace_discard_check(ws["id"])
+        (project / ".triignore").write_text("*.log\nmodel.py\n", encoding="utf-8")
+        after = mgr.workspace_discard_check(ws["id"])
+        assert before == after and not after["discardable"] and after["modified_count"] == 1
+        assert mgr.workspace_status(ws["id"])["modified_files"] == ["model.py"]
+        assert mgr.workspace_merge_preview(ws["id"])["files_changed"] == ["model.py"]
+        with pytest.raises(WorkspaceCleanupGuardError, match="never discard"):
+            mgr.workspace_discard(ws["id"], "regression")
+    finally:
+        db.close()
+
+
+def test_legacy_snapshot_retains_original_rules_after_merging_triignore_edit(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".triignore").write_text("*.log\n", encoding="utf-8")
+    (project / "model.py").write_text("initial", encoding="utf-8")
+    _, db, mgr, run_id = _setup_env(tmp_path, project)
+    try:
+        ws = mgr.workspace_create(run_id, "author")
+        path = Path(ws["path"])
+        manifest = dict(ws["snapshot_manifest"])
+        del manifest["triignore"]
+        db.update_workspace(ws["id"], snapshot_manifest=manifest)
+        (path / ".triignore").write_text("model.py\n", encoding="utf-8")
+        assert mgr.workspace_merge(ws["id"])["merged"]
+        (path / "model.py").write_text("unmerged after approved edit", encoding="utf-8")
+        check = mgr.workspace_gc_safety(ws["id"])
+        assert not check["safe_to_clean"] and check["modified_files"] == ["model.py"]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("saved", ["stash", "branch"])
+def test_exclusive_git_refs_block_unmerged_and_merged_deletion(tmp_path: Path, saved: str) -> None:
+    project = _init_git_repo(tmp_path / "project")
+    settings, db, mgr, run_id = _setup_env(tmp_path, project)
+    try:
+        ws = mgr.workspace_create(run_id, "author", git_backend="clone")
+        path = Path(ws["path"])
+        if saved == "branch":
+            _git(path, "checkout", "-b", "side")
+        (path / "app.py").write_text("only copy", encoding="utf-8")
+        if saved == "stash":
+            _git(path, "stash", "push")
+            ref = _git(path, "rev-parse", "refs/stash")
+            # Saving only the latest stash in the source must not hide an older clone-only entry.
+            (path / "app.py").write_text("another change", encoding="utf-8")
+            _git(path, "stash", "push")
+            _git(project, "fetch", str(path), "refs/stash:refs/heads/saved-newer")
+            label = "stash@{1}"
+        else:
+            _git(path, "commit", "-am", "unique work")
+            _git(path, "checkout", ws["branch_name"])
+            ref, label = "refs/heads/side", "refs/heads/side"
+
+        db.connect().execute("UPDATE runs SET status='archived' WHERE id=?", (run_id,))
+        discard = mgr.workspace_discard_check(ws["id"])
+        assert not discard["discardable"] and label in discard["reason"]
+        with pytest.raises(WorkspaceCleanupGuardError, match="Cannot prove clone"):
+            mgr.workspace_discard(ws["id"], "regression")
+        assert mgr.workspace_merge(ws["id"])["merged"]
+        preview = run_gc(db, mgr, settings, include_all_completed=True, clean_results=False, dry_run=True)
+        assert ws["id"] not in preview["cleaned_workspaces"]
+        assert label in preview["skipped_dirty_workspaces"][0]["reason"]
+        with pytest.raises(WorkspaceCleanupGuardError, match="Cannot prove clone"):
+            mgr.workspace_cleanup(ws["id"])
+        assert path.is_dir()
+        _git(project, "fetch", str(path), f"{ref}:refs/heads/saved")
+        assert mgr.workspace_gc_safety(ws["id"])["safe_to_clean"]
+    finally:
+        db.close()
+
+
+def test_linked_worktree_stash_survives_discard(tmp_path: Path) -> None:
+    project = _init_git_repo(tmp_path / "project")
+    _, db, mgr, run_id = _setup_env(tmp_path, project)
+    try:
+        ws = mgr.workspace_create(run_id, "author", git_backend="worktree", copy_env=False)
+        path = Path(ws["path"])
+        (path / "app.py").write_text("shared stash", encoding="utf-8")
+        _git(path, "stash", "push")
+        commit = _git(path, "rev-parse", "refs/stash")
+        db.connect().execute("UPDATE runs SET status='archived' WHERE id=?", (run_id,))
+        assert mgr.workspace_discard(ws["id"], "unused")["discarded"]
+        assert _git(project, "rev-parse", "refs/stash") == commit
+    finally:
+        db.close()
+
+
 def test_snapshot_preflight_size_limit_rejects_without_copying(tmp_path: Path) -> None:
     proj = tmp_path / "big_proj"
     proj.mkdir()
@@ -503,3 +608,66 @@ def test_gc_rmdir_empty_workspaces_parent_and_module_cli_subprocess(tmp_path: Pa
     assert payload["ok"] is True
     assert payload["cleaned_workspaces"] == [ws["id"]]
     assert not ws_root.exists()
+
+
+def test_report_and_gc_preview_share_one_snapshot_comparison(tmp_path: Path, monkeypatch) -> None:
+    from unittest.mock import Mock
+    from orchestrator import workspace_mgr
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "blob.bin").write_bytes(b"x" * (1024 * 1024))
+    settings, db, mgr, run_id = _setup_env(tmp_path, project)
+    try:
+        ws = mgr.workspace_create(run_id, "author", copy_env=False)
+        with db.transaction() as conn:
+            conn.execute("UPDATE runs SET status='failed' WHERE id=?", (run_id,))
+        digest = Mock(wraps=workspace_mgr._sha256_file)
+        monkeypatch.setattr(workspace_mgr, "_sha256_file", digest)
+        item, = collect_storage_report(db, settings, workspace_mgr=mgr)["workspaces"]["items"]
+        report_hashes = digest.call_count
+        digest.reset_mock()
+        preview = run_gc(db, mgr, settings, dry_run=True)
+        assert item["category"] == "discardable"
+        assert item["reason"] == "Snapshot is identical to its baseline (+A:0, ~M:0, -D:0)"
+        assert preview["report_after"]["workspaces"]["items"] == [item]
+        assert preview["cleaned_workspaces"] == []
+        skipped, = preview["skipped_dirty_workspaces"]
+        assert skipped["workspace_id"] == ws["id"]
+        assert skipped["reason"] == (
+            "Run status is 'failed' (must be 'completed' or 'archived'); "
+            "Workspace status is 'active', not 'merged' (+A:0, ~M:0)"
+        )
+        assert (report_hashes, digest.call_count) == (2, 2)
+    finally:
+        db.close()
+
+
+def test_gc_rechecks_after_preview_and_planning(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
+    settings, db, mgr, run_id = _setup_env(tmp_path, project)
+    try:
+        ws = mgr.workspace_create(run_id, "author", copy_env=False)
+        assert mgr.workspace_merge(ws["id"])["merged"]
+        with db.transaction() as conn:
+            conn.execute("UPDATE runs SET status='archived' WHERE id=?", (run_id,))
+        assert run_gc(db, mgr, settings, dry_run=True, include_all_completed=True)["cleaned_workspaces"] == [ws["id"]]
+        target = Path(ws["path"]) / "main.py"
+        cleanup = mgr.workspace_gc_cleanup
+
+        def change_before_removal(workspace_id):
+            target.write_text("VALUE = 2\n", encoding="utf-8")
+            return cleanup(workspace_id)
+
+        monkeypatch.setattr(mgr, "workspace_gc_cleanup", change_before_removal)
+        result = run_gc(db, mgr, settings, include_all_completed=True)
+        assert result["cleaned_workspaces"] == []
+        skipped, = result["skipped_dirty_workspaces"]
+        assert "Unmerged snapshot changes" in skipped["reason"]
+        assert skipped["modified_files"] == ["main.py"]
+        assert target.read_text(encoding="utf-8") == "VALUE = 2\n"
+        assert db.get_workspace(ws["id"])["status"] == "merged"
+    finally:
+        db.close()

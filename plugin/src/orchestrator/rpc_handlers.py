@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -2475,6 +2476,12 @@ class RpcDispatcher:
                 assert worker is not None
                 if resolved_ws_id is not None:
                     ws = self.db.get_workspace(resolved_ws_id)
+                if dispatch_action == "request_verify":
+                    scope = "candidate" if step["state"] == "candidate_review" else "integrated"
+                    root, _ = self.workflow.verification_target(step, scope)
+                    hint_path = str(root)
+                else:
+                    hint_path = ws["path"] if ws else None
         except BaseException:
             if created_ws is not None:
                 self.workspace_mgr.remove_workspace_checkout(created_ws)
@@ -2503,7 +2510,7 @@ class RpcDispatcher:
                 "target_agent_path": target_agent_path,
                 "step_id": step["id"],
                 "message_id": msg["id"],
-                "workspace_path": ws["path"] if ws else None,
+                "workspace_path": hint_path,
                 "next_mcp_tool": "native_action_record_call",
             }
         else:
@@ -2513,7 +2520,7 @@ class RpcDispatcher:
                 "target_agent_path": target_agent_path,
                 "step_id": step["id"],
                 "message_id": msg["id"],
-                "workspace_path": ws["path"] if ws else None,
+                "workspace_path": hint_path,
                 "next_mcp_tool": "native_action_record_call",
             }
 
@@ -2624,24 +2631,21 @@ class RpcDispatcher:
         ).encode("utf-8")
 
         receipt_dir = self.db.settings.data_dir / "receipts" / safe_run
-        receipt_path = receipt_dir / f"{safe_target}-{rev_tag}.json"
-        tmp_path = receipt_dir / f".{safe_target}-{rev_tag}.{uuid.uuid4().hex}.tmp"
+        receipt_path = None
         try:
             receipt_dir.mkdir(parents=True, exist_ok=True)
-            with tmp_path.open("wb") as fh:
+            # Only the ledger publishes this exclusive file, after its revision check succeeds.
+            with tempfile.NamedTemporaryFile(dir=receipt_dir, prefix=f"{safe_target}-", suffix=".json", delete=False) as fh:
+                receipt_path = Path(fh.name)
                 fh.write(payload_bytes)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp_path, receipt_path)
-            written_bytes = receipt_path.read_bytes()
+            evidence_digest = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
         except OSError as exc:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            if receipt_path is not None:
+                receipt_path.unlink(missing_ok=True)
             raise RuntimeError(f"Failed to write native action receipt to disk: {exc}") from exc
 
-        evidence_digest = hashlib.sha256(written_bytes).hexdigest()
         evidence_ref = str(receipt_path.resolve())
 
         if isinstance(raw_response, dict):
@@ -2652,20 +2656,21 @@ class RpcDispatcher:
             if isinstance(raw_response, str):
                 result_str = f"{raw_response} | error: {args['error_text'].strip()}"
 
+        op = "reconcile" if reconcile else "record"
         if is_single:
-            op = "reconcile" if reconcile else "record"
-            updated = self.native_actions.update(
-                action=op,
-                action_id=action_id.strip(),
-                claim_token=args.get("claim_token"),
-                expected_revision=args["expected_revision"],
-                outcome=outcome,
-                evidence_ref=evidence_ref,
-                evidence_digest=evidence_digest,
-                result=result_str,
-                agent_id=args.get("agent_id"),
-                cancel=cancel,
-            )
+            target = dict(action=op, action_id=clean_id, claim_token=args.get("claim_token"),
+                          expected_revision=expected_rev, agent_id=args.get("agent_id"))
+        else:
+            target = dict(action=op + "_group", group_id=clean_group_id, members=members)
+        try:
+            updated = self.native_actions.update(**target, outcome=outcome, evidence_ref=evidence_ref,
+                                                 evidence_digest=evidence_digest, result=result_str, cancel=cancel)
+        except (ValueError, NotFoundError):
+            # A rejected CAS/validation did not publish this attempt's evidence.
+            receipt_path.unlink()
+            raise
+
+        if is_single:
             if observed_effort is not None and updated.get("status") == "confirmed":
                 self.db.set_worker_effort(run_id, updated["recipient"], observation=observed_effort)
             refreshed = self._sync_run_agent_models(run_id)
@@ -2681,32 +2686,21 @@ class RpcDispatcher:
             )
             return updated
 
-        op_group = "reconcile_group" if reconcile else "record_group"
-        updated_group = self.native_actions.update(
-            action=op_group,
-            group_id=group_id.strip(),
-            members=members,
-            outcome=outcome,
-            evidence_ref=evidence_ref,
-            evidence_digest=evidence_digest,
-            result=result_str,
-            cancel=cancel,
-        )
         self._sync_run_agent_models(run_id)
         self._emit(
             "native_action_updated",
             {
                 "run_id": run_id,
-                "group_id": updated_group["group_id"],
+                "group_id": updated["group_id"],
                 "members": [
                     {"action_id": m["action_id"], "status": m["status"]}
-                    for m in updated_group["members"]
+                    for m in updated["members"]
                 ],
             },
             run_id=run_id,
         )
         return {
-            **updated_group,
+            **updated,
             "evidence_ref": evidence_ref,
             "evidence_digest": evidence_digest,
         }
@@ -3118,20 +3112,7 @@ class RpcDispatcher:
         if run["status"] != "active":
             raise WorkflowConflictError(f"Run is not active (status={run['status']!r})")
 
-        with self.db.read_connection() as conn:
-            step_rows = [dict(row) for row in conn.execute(
-                "SELECT * FROM workflow_steps WHERE run_id=? ORDER BY created_at,id", (run_id,)
-            )]
-            unresolved = conn.execute(
-                "SELECT id FROM inbox_messages WHERE run_id=? AND (status='accepted' OR (status='pending' AND kind!='notice')) LIMIT 1",
-                (run_id,),
-            ).fetchone()
-        if not step_rows or unresolved is not None:
-            raise WorkflowConflictError("Missing workflow steps or unresolved inbox work")
-        if any(c["status"] == "pending" for c in self.db.list_worker_controls(run_id)):
-            raise WorkflowConflictError("Acknowledge pending controls before closeout")
-
-        steps_by_id = {r["id"]: self.workflow.get_step(r["id"]) for r in step_rows}
+        steps_by_id = {s["id"]: s for s in self.workflow.completion_steps(run_id)}
         # Pre-validate all steps before mutating state or cleaning workspaces.
         for step in steps_by_id.values():
             if step["state"] == "done":
@@ -3190,6 +3171,7 @@ class RpcDispatcher:
 
         advanced: list[str] = []
         with self.db.transaction():
+            self.workflow.require_settled_work(run_id)
             for sid in ordered_ids:
                 step = steps_by_id[sid]
                 if step["state"] == "ready_to_merge":
@@ -3233,13 +3215,26 @@ class RpcDispatcher:
 
         stopped_workers: list[str] = []
         stopped_entries: list[tuple[str, dict[str, Any]]] = []
-        for w in self.db.list_workers(run_id=run_id):
-            if w["status"] in {"waiting", "working"}:
-                updated_w = self.db.update_worker_status(
-                    status="stopped", run_id=run_id, worker_name=w["name"],
+        board_pointer: dict[str, Any] | None = None
+        raw_summary = args.get("summary")
+        with self.db.transaction():
+            completed_run = self.db.update_run(run_id, status="completed")
+            for w in self.db.list_workers(run_id=run_id):
+                if w["status"] in {"waiting", "working"}:
+                    updated_w = self.db.update_worker_status(
+                        status="stopped", run_id=run_id, worker_name=w["name"],
+                    )
+                    stopped_workers.append(w["name"])
+                    stopped_entries.append((w["name"], updated_w))
+            if isinstance(raw_summary, str) and raw_summary.strip():
+                board_pointer = self.board.board_post(
+                    run_id,
+                    sender="coordinator",
+                    sender_role="coordinator",
+                    msg_type="info",
+                    summary=f"Run closeout: {raw_summary.strip()}"[:160],
+                    body_md=raw_summary.strip(),
                 )
-                stopped_workers.append(w["name"])
-                stopped_entries.append((w["name"], updated_w))
 
         refreshed = self._sync_run_agent_models(run_id)
         for worker_name, updated_w in stopped_entries:
@@ -3249,22 +3244,11 @@ class RpcDispatcher:
                 run_id=run_id,
             )
 
-        board_pointer: dict[str, Any] | None = None
-        raw_summary = args.get("summary")
-        if isinstance(raw_summary, str) and raw_summary.strip():
-            board_pointer = self.board.board_post(
-                run_id,
-                sender="coordinator",
-                sender_role="coordinator",
-                msg_type="info",
-                summary=f"Run closeout: {raw_summary.strip()}"[:160],
-                body_md=raw_summary.strip(),
-            )
+        if board_pointer is not None:
             full_msg = self.board.get_message(int(board_pointer["seq"]))
             if full_msg is not None:
                 self._emit("board_message", {"run_id": run_id, "message": full_msg}, run_id=run_id)
 
-        completed_run = self.db.update_run(run_id, status="completed")
         self._emit("run_updated", {"run_id": run_id, "run": completed_run}, run_id=run_id)
         return {
             "run": completed_run,

@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import shutil
 import socket
 import sqlite3
@@ -339,12 +340,24 @@ def _seed_upgrade_backup(
     wrapped: bool = False,
 ) -> Path:
     bundle = (path / "upgrade-bundle") if wrapped else path
-    bundle.mkdir(parents=True, exist_ok=True)
-    (bundle / "prepared.json").write_text(
-        json.dumps({"status": "prepared", "created_at": created_at, "target_plugin": str(path / "unused")}),
-        encoding="utf-8",
-    )
-    (bundle / "payload.bin").write_bytes(b"x" * 1024)
+    with TemporaryDirectory(dir=path.parent) as staging:
+        source, target, data = (Path(staging) / name for name in ("source", "target", "data"))
+        for plugin in (source, target):
+            (plugin / ".codex-plugin").mkdir(parents=True)
+            (plugin / ".codex-plugin" / "plugin.json").write_text(
+                '{"name":"tri-orchestrator","version":"0.6.2"}', encoding="utf-8"
+            )
+            (plugin / "src" / "orchestrator").mkdir(parents=True)
+            (plugin / "src" / "orchestrator" / "db.py").write_text("SCHEMA_VERSION = 10\n", encoding="utf-8")
+        data.mkdir()
+        with closing(sqlite3.connect(data / "state.db")) as db:
+            db.executescript(
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY); INSERT INTO schema_migrations VALUES(10);"
+                "CREATE TABLE runs(id TEXT, mode TEXT, status TEXT);"
+            )
+        manifest = _load_upgrade_mod().prepare(source, target, data, bundle)
+    manifest["created_at"] = created_at
+    (bundle / "prepared.json").write_text(json.dumps(manifest), encoding="utf-8")
     if started:
         (bundle / "apply-started.json").write_text("{}", encoding="utf-8")
     if applied:
@@ -353,7 +366,7 @@ def _seed_upgrade_backup(
         (bundle / "verified.json").write_text("{}", encoding="utf-8")
     if failed:
         (bundle / "apply-failed.json").write_text("{}", encoding="utf-8")
-    return path
+    return bundle
 
 
 def test_upgrade_py_prune_rotates_backups_and_preserves_failed_and_active(tmp_path: Path) -> None:
@@ -428,6 +441,45 @@ def test_upgrade_py_prune_rotates_backups_and_preserves_failed_and_active(tmp_pa
     assert not b2.exists()
     assert b3.exists() and b4.exists() and b5.exists()
     assert b_fail.exists() and b_inflight.exists() and (unrelated / "keep.txt").is_file()
+
+
+def test_rotation_checks_ownership_before_counting_or_deleting(tmp_path: Path) -> None:
+    upgrade = _load_upgrade_mod()
+    root = tmp_path / "backups"
+    root.mkdir()
+    old = _seed_upgrade_backup(root / "wrapped-old", created_at=10, wrapped=True)
+    sibling = old.parent / "other-application-data"
+    sibling.write_bytes(b"keep me")
+    keep = [_seed_upgrade_backup(root / str(i), created_at=i) for i in (20, 30, 40)]
+
+    foreign = root / "foreign"
+    shutil.copytree(keep[0], foreign)
+    marker = foreign / "prepared.json"
+    manifest = json.loads(marker.read_text(encoding="utf-8"))
+    manifest["created_at"] = 1
+    manifest["source_identity"]["name"] = "another-app"
+    marker.write_text(json.dumps(manifest), encoding="utf-8")
+    broken = root / "broken"
+    broken.mkdir()
+    (broken / "prepared.json").write_bytes(b"{")
+    incomplete = root / "missing-db"
+    shutil.copytree(keep[0], incomplete)
+    (incomplete / "state-before.db").unlink()
+    alias = root / "foreign-wrapper"
+    alias.mkdir()
+    assert _create_dir_link(alias / "upgrade-bundle", keep[0])
+
+    for dry_run in (True, False):
+        report = upgrade.prune(backup_root=root, keep_backups=3, dry_run=dry_run)
+        assert report["pruned_backups"] == [str(old)]
+        assert set(report["kept_backups"]) == set(map(str, keep))
+        skipped = {Path(item["path"]): item["reason"] for item in report["skipped_backups"]}
+        assert all(skipped[path] for path in (foreign, broken, incomplete, alias))
+        assert skipped[alias] == "symlink_or_junction"
+        assert old.exists() == dry_run
+        assert sibling.read_bytes() == b"keep me"
+        assert (broken / "prepared.json").read_bytes() == b"{"
+        assert all(p.is_dir() for p in (foreign, incomplete, alias, *keep))
 
 
 def test_upgrade_py_prune_plugin_backup_staging_and_junction_safety(tmp_path: Path) -> None:

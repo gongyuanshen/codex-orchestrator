@@ -74,7 +74,7 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
     assert {path.parent.name for path in skill_paths} == {"boost", "teamwork", "swarm"}
     for path in (ROOT / "agents").glob("*.toml"):
         text = path.read_text(encoding="utf-8")
-        assert "workflow5" in text and "0.6.12/schema10" in text, path
+        assert "workflow5" in text and "0.6.13/schema10" in text, path
         assert "workflow0..4" in text, path
         assert "board_status.workflow.workflow_version" in text, path
     for path in skill_paths:
@@ -84,9 +84,9 @@ def test_all_roles_and_modes_load_all_supported_strict_contracts():
         assert "../route-a-workflow.md" in text, path
         assert "workflow5" in text, path
         corpus = mode_corpus(path.parent.name)
-        assert "0.6.12/schema10" in corpus and "workflow0..4" in corpus, path
+        assert "0.6.13/schema10" in corpus and "workflow0..4" in corpus, path
         assert "board_status.workflow.workflow_version" in corpus, path
-    assert "workflow5" in shared_text() and "0.6.12/schema10" in shared_text()
+    assert "workflow5" in shared_text() and "0.6.13/schema10" in shared_text()
     assert "reference/legacy-resume.md" in shared_text()
     shared = shared_corpus()
     assert 'artifact_id=candidate["id"]' in shared

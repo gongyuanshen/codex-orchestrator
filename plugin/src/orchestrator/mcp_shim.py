@@ -584,8 +584,22 @@ def _classify_rpc_invalidation(
     return False, False
 
 
+def _is_local_dispatch(arguments: dict[str, Any]) -> bool:
+    return str(arguments.get("dispatch_action") or "").strip() == "accept_local"
+
+
+def _valid_dispatch_result(arguments: dict[str, Any], result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if _is_local_dispatch(arguments):
+        step = result.get("step")
+        return (isinstance(step, dict) and isinstance(step.get("id"), str)
+                and bool(step["id"].strip()) and step.get("state") == "implementing")
+    return all(isinstance(result.get(key), str) and result[key].strip() for key in ("action_id", "message_id"))
+
+
 def _dispatch_recovery(arguments: dict[str, Any], outcome: str) -> dict[str, Any]:
-    if arguments.get("dispatch_action") == "accept_local":
+    if _is_local_dispatch(arguments):
         return {"dispatch_outcome": outcome, "dispatch_context": {"run_id": arguments.get("run_id"), "step_key": arguments.get("step_key")},
                 "recovery_instructions": "Inspect board_status for this step_key before continuing; do not replay accept_local."}
     raw_run_id = arguments.get("run_id")
@@ -662,9 +676,7 @@ async def _forward_rpc(
 
     result = body.get("result")
     malformed_dispatch_success = is_dispatch and resp.is_success and (
-        body.get("ok") is not True
-        or not isinstance(result, dict)
-        or not all(isinstance(result.get(field), str) and result[field] for field in ("action_id", "message_id"))
+        body.get("ok") is not True or not _valid_dispatch_result(arguments, result)
     )
     if resp.status_code >= 400 or not body.get("ok", False) or malformed_dispatch_success:
         err_msg = body.get("detail") or body.get("error") or (

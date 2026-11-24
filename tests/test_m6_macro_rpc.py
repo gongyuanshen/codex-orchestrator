@@ -216,23 +216,27 @@ def test_native_action_record_call_persists_exact_sha256_and_rejects_disk_failur
 
     # Restore directory capability and confirm cleanly.
     receipts_blocker.unlink()
-    recorded = dispatcher.dispatch(
-        "native_action_record_call",
-        {
-            "run_id": run_id,
-            "action_id": prep["action_id"],
-            "claim_token": prep["claim_token"],
-            "expected_revision": prep["expected_revision"],
-            "outcome": "confirmed",
-            "raw_response": {"agent_id": "/root/author_1", "agent_path": "/root/author_1"},
-        },
-    )
+    request = {
+        "run_id": run_id,
+        "action_id": prep["action_id"],
+        "claim_token": prep["claim_token"],
+        "expected_revision": prep["expected_revision"],
+        "outcome": "confirmed",
+        "raw_response": {"agent_id": "/root/author_1", "agent_path": "/root/author_1"},
+    }
+    recorded = dispatcher.dispatch("native_action_record_call", request)
     assert recorded["status"] == "confirmed"
     receipt_file = Path(recorded["evidence_ref"])
     assert receipt_file.is_absolute() and receipt_file.is_file()
     exact_sha256 = hashlib.sha256(receipt_file.read_bytes()).hexdigest()
     assert recorded["evidence_digest"] == exact_sha256
-    assert len(recorded["evidence_digest"]) == 64
+    original = receipt_file.read_bytes()
+    with pytest.raises(InboxConflictError, match="Stale native action revision"):
+        dispatcher.dispatch("native_action_record_call", request)
+    assert dispatcher.native_actions.get(prep["action_id"]) == recorded
+    assert receipt_file.read_bytes() == original
+    assert hashlib.sha256(original).hexdigest() == exact_sha256
+    assert list(receipt_file.parent.iterdir()) == [receipt_file]
 
     # Also verify grouped record_call automatic receipt persistence & SHA-256 matching.
     run_grp = dispatcher.dispatch(
@@ -286,27 +290,28 @@ def test_native_action_record_call_persists_exact_sha256_and_rejects_disk_failur
             ],
         },
     )
-    rec_grp = dispatcher.dispatch(
-        "native_action_record_call",
-        {
-            "run_id": gid_run,
-            "group_id": begun_grp["group_id"],
-            "members": [
-                {
-                    "action_id": m["action_id"],
-                    "expected_revision": m["revision"],
-                    "claim_token": m["claim_token"],
-                }
-                for m in begun_grp["members"]
-            ],
-            "outcome": "confirmed",
-            "raw_response": {"batch_delivered": 2},
-        },
-    )
+    group_request = {
+        "run_id": gid_run,
+        "group_id": begun_grp["group_id"],
+        "members": [
+            {"action_id": m["action_id"], "expected_revision": m["revision"], "claim_token": m["claim_token"]}
+            for m in begun_grp["members"]
+        ],
+        "outcome": "confirmed",
+        "raw_response": {"batch_delivered": 2},
+    }
+    rec_grp = dispatcher.dispatch("native_action_record_call", group_request)
     grp_file = Path(rec_grp["evidence_ref"])
     assert grp_file.is_file()
     assert rec_grp["evidence_digest"] == hashlib.sha256(grp_file.read_bytes()).hexdigest()
-    assert all(m["status"] == "confirmed" for m in rec_grp["members"])
+    with pytest.raises(InboxConflictError, match="Stale native action revision"):
+        dispatcher.dispatch("native_action_record_call", group_request)
+    assert list(grp_file.parent.iterdir()) == [grp_file]
+    for member in rec_grp["members"]:
+        assert member["status"] == "confirmed"
+        assert dispatcher.native_actions.get(member["action_id"]) == member
+        assert member["evidence_ref"] == str(grp_file)
+        assert member["evidence_digest"] == hashlib.sha256(grp_file.read_bytes()).hexdigest()
 
 
 def test_workflow_author_turn_accept_submit_and_env_profile_never_stores_env_values(macro_env, monkeypatch):

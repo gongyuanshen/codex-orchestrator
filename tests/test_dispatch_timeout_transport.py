@@ -22,6 +22,64 @@ def _mcp_handler(settings, monkeypatch):
     return shim.create_mcp_server(settings)["on_call_tool"]
 
 
+@pytest.mark.parametrize("missing_ticket", [None, "action_id", "message_id"])
+def test_dispatch_success_contract_over_daemon_http(tmp_path, monkeypatch, missing_ticket):
+    from test_daemon_web import _RunningServer, _free_port
+
+    settings = Settings(host="127.0.0.1", port=_free_port(), data_dir=tmp_path / "runtime")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text("VALUE = 1", encoding="utf-8")
+    with _RunningServer(settings) as server:
+        rpc = server.app.state.dispatcher
+        run_id = rpc.dispatch("run_create", {
+            "mode": "boost", "title": "Dispatch contract", "project_root": str(project),
+        })["id"]
+        rpc.dispatch("task_packet_save", {
+            "run_id": run_id, "title": "Dispatch contract", "goal": "Check the HTTP result",
+            "file_ownership": {"author": ["main.py"]}, "acceptance_criteria": ["AC-1"],
+        })
+        args = dict(run_id=run_id, owner="author", verifier="verifier", step_key="one")
+        if missing_ticket is None:
+            args.update(dispatch_action="accept_local", agent_id="/root", advance_evidence="Reviewed packet")
+        else:
+            args.update(dispatch_action="dispatch", task_name="author", message_key="ticket")
+            dispatch = rpc.dispatch
+
+            def drop_ticket(name, arguments):
+                result = dispatch(name, arguments)
+                result.pop(missing_ticket)  # Lose one field only after the real dispatch commits.
+                return result
+
+            monkeypatch.setattr(rpc, "dispatch", drop_ticket)
+
+        handler = _mcp_handler(settings, monkeypatch)
+
+        async def call():
+            try:
+                return await handler(None, types.CallToolRequestParams(
+                    name="workflow_prepare_dispatch", arguments=args,
+                ))
+            finally:
+                await shim.aclose_rpc_clients()
+
+        result = asyncio.run(call())
+        payload = json.loads(result.content[0].text)
+        with rpc.db.read_connection() as conn:
+            steps = conn.execute("SELECT id,state FROM workflow_steps WHERE run_id=?", (run_id,)).fetchall()
+            assert len(steps) == 1
+            for table in ("inbox_messages", "native_actions"):
+                count = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE run_id=?", (run_id,)).fetchone()[0]
+                assert count == (0 if missing_ticket is None else 1)
+        if missing_ticket is None:
+            assert not result.is_error, payload
+            assert tuple(steps[0]) == (payload["step"]["id"], "implementing")
+            assert payload["step"]["state"] == "implementing"
+        else:
+            assert result.is_error and payload["dispatch_outcome"] == "unknown"
+            assert payload["status_code"] == 200 and "Malformed" in payload["error"]
+
+
 def test_dispatch_read_timeout_reports_correlation_once_over_http(tmp_path, monkeypatch):
     requests = []
     release = threading.Event()

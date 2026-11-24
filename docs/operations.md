@@ -75,12 +75,12 @@ uv run --locked --project ./plugin python scripts/upgrade.py verify --backup-dir
 | 存储路径 | 内容组成 | 生命周期与清理边界 |
 | :--- | :--- | :--- |
 | **`%LOCALAPPDATA%\tri-orchestrator`**（Windows）<br>`~/.local/share/tri-orchestrator`（POSIX）<br>（`TRI_ORCH_DATA_DIR`） | - `state.db`：SQLite WAL 状态机库<br>- `daemon.log` / `shim.log`：运行日志（`RotatingFileHandler` 自动轮转）<br>- `results/`：超大 MCP 返回体缓存 JSON<br>- `receipts/`：派发与验收 SHA-256 回执 | `state.db` 与 `receipts/` 长期留存以保留审计轨迹；`results/` 下缓存文件超过 `TRI_ORCH_RESULT_TTL_SEC`（默认 `86400` 秒）或超出最近 `TRI_ORCH_RESULT_MAX_FILES`（默认 `50` 份）时自动清理。 |
-| **`<execution_root 或 source_root>/.swarm-workspaces/`** | 每个隔离写入子代理一个子目录（`git_clone` 或 `snapshot` 复制目录） | 任务结束调用 `workflow_closeout_run` / `workspace_cleanup` 时回收；已合入且无未提交改动的过期工作区超过 `TRI_ORCH_WORKSPACE_RETENTION_SEC`（默认 `86400` 秒）由 GC 清理。可检测到的未合入改动会阻止清理；被 Git 或快照规则忽略的文件不算改动，不要把它们的唯一副本放在临时工作区。 |
-| **`~/.codex/backups/`** 与<br>`~/.codex/plugins/cache/tri-orchestrator/` | - `tri-orchestrator-baseline`：首次安装前配置基线<br>- `tri-orchestrator-2*`：历次安装配置与角色备份<br>- `plugin-backup-*`：插件重装/升级残留 staging 目录 | 安装脚本仅备份 `config.toml` 与必要角色 TOML（绝不拷贝 `.venv`），永久保留唯一 `tri-orchestrator-baseline` 与最近 `N=3` 个时间戳备份（`-KeepBackups` / `--keep-backups` 可覆盖）；`scripts/upgrade.py verify` / `prune` 轮转清理已验证完成的旧升级备份与过期 `plugin-backup-*` staging 目录。 |
+| **`<execution_root 或 source_root>/.swarm-workspaces/`** | 每个隔离写入子代理一个子目录（`git_clone` 或 `snapshot` 复制目录） | 任务结束调用 `workflow_closeout_run` / `workspace_cleanup` 时回收；已合入且无未提交改动的过期工作区超过 `TRI_ORCH_WORKSPACE_RETENTION_SEC`（默认 `86400` 秒）由 GC 清理。可检测到的未合入改动会阻止清理；Git 忽略的文件、创建快照时已排除的文件不算改动，不要把它们的唯一副本放在临时工作区。之后修改主项目的 `.triignore` 不会隐藏已记录的快照文件。 |
+| **`~/.codex/backups/`** 与<br>`~/.codex/plugins/cache/tri-orchestrator/` | - `tri-orchestrator-baseline`：首次安装前配置基线<br>- `tri-orchestrator-2*`：历次安装配置与角色备份<br>- `plugin-backup-*`：插件重装/升级残留 staging 目录 | 安装脚本仅备份 `config.toml` 与必要角色 TOML（绝不拷贝 `.venv`），永久保留唯一 `tri-orchestrator-baseline` 与最近 `N=3` 个时间戳备份（`-KeepBackups` / `--keep-backups` 可覆盖）；升级包只有在清单身份、包内插件信息和数据库备份结构可核实后才计入轮转；无法识别或解析的目录列在 `skipped_backups`。包装目录内只回收升级包本身；旧 `plugin-backup-*` staging 目录仍按插件缓存规则单独轮转。 |
 
 ### 3. 三种存储清理与 GC 触发方式
 
-> **作废从未合入的残留工作区（v0.6.11）**：GC 与 `workspace_cleanup` 只回收**已合入**的工作区。run 失败、归档或完成后，如果某个工作区从未合入且与基线完全一致（快照 +A:0 / ~M:0 / -D:0；Git 检出停在基线提交、分支未变、工作树干净），且该成员的原生动作已全部对账、作者也不在 `working` 状态，就可以用 `workspace_discard(workspace_id, reason)` 作废（`dry_run=True` 只做检查）。只要有任何改动、未决动作或作者仍在工作，一律拒绝，"未合入不删"护栏不变。控制台「存储与清理」面板把这类工作区单独列为「已废弃（可安全作废）」，提供需要二次确认的「作废」按钮；自动 GC 不会删除它们。`run_update(status="archived"|"failed")` 的返回值附带 `residuals`：残留工作区（含能否作废及原因）和未对账的原生动作。概况页的「原生转交」区在有 `needs_reconciliation` 时会显示对账步骤。
+> **作废从未合入的残留工作区（v0.6.11）**：GC 与 `workspace_cleanup` 只回收**已合入**的工作区。run 失败、归档或完成后，如果某个工作区从未合入且与基线完全一致（快照 +A:0 / ~M:0 / -D:0；Git 检出停在基线提交、分支未变、工作树干净，且独立克隆没有仅存本地的 stash 或分支提交），且该成员的原生动作已全部对账、作者也不在 `working` 状态，就可以用 `workspace_discard(workspace_id, reason)` 作废（`dry_run=True` 只做检查）。只要有任何改动、未决动作或作者仍在工作，一律拒绝，"未合入不删"护栏不变。控制台「存储与清理」面板把这类工作区单独列为「已废弃（可安全作废）」，提供需要二次确认的「作废」按钮；自动 GC 不会删除它们。`run_update(status="archived"|"failed")` 的返回值附带 `residuals`：残留工作区（含能否作废及原因）和未对账的原生动作。概况页的「原生转交」区在有 `needs_reconciliation` 时会显示对账步骤。
 
 1. **后台定时自动 GC**：守护进程内嵌周期 GC 任务（默认每隔 `TRI_ORCH_GC_INTERVAL_SEC=3600` 秒执行一次），仅清理过期 `results/` 缓存以及所属轮次已完成/归档、状态为 `merged` 且静态无未合入变更、超过保留期的隔离工作区。
 2. **Web 控制台「存储与清理」面板**：打开 `http://127.0.0.1:18790` 点击顶栏「**存储与清理**」按钮，可实时查看运行时目录各子项占用、逐条区分 `.swarm-workspaces` 状态（「可安全清理」、「含未合入变更待核查」、「进行中」），并一键执行安全清理。
@@ -118,7 +118,7 @@ python -m orchestrator.gc --dry-run
 
 > `/api/rpc` 另保留 1 个内部接口 `session_hook_check` 供本地 `tri-orchestrator-hook` 调用，不暴露于模型 `tools/list`。
 >
-> **工具分级暴露**：默认只展示常规工作流需要的工具。手动注册、步骤修订、挑战者审查和归档等低频原语经 `tool_advanced(tool=..., arguments=...)` 调用；省略 `arguments` 可查看完整参数。见[高级工具表](../plugin/skills/reference/advanced-tools.md)。HTTP、完整目录与代理共用校验；`TRI_ORCH_TOOL_TIER=full` 恢复全部公开 schema。单步 Solo 在创建任务包后用 `accept_local` 开工、`submit_local_for_verify` 提交并准备独立验收、`workflow_closeout_run` 收尾；这三次不包含真实的宿主唤醒、回执和协调者抽查。
+> **工具分级暴露**：默认只展示常规工作流需要的工具。手动注册、步骤修订、挑战者审查和归档等低频原语经 `tool_advanced(tool=..., arguments=...)` 调用；省略 `arguments` 可查看完整参数。见[高级工具表](../plugin/skills/reference/advanced-tools.md)。HTTP、完整目录与代理共用校验；`TRI_ORCH_TOOL_TIER=full` 恢复全部公开 schema。单步 Solo 在创建任务包后用 `accept_local` 开工、`submit_local_for_verify` 提交并准备独立验收、`workflow_closeout_run` 收尾；这三次不包含真实的宿主唤醒、回执和协调者抽查。若收尾报出未决宿主动作 ID，请先核实并登记原动作的结果，再收尾，不要重新派单。
 
 | 分类 | 工具列表 |
 | :--- | :--- |
@@ -180,6 +180,8 @@ codex plugin marketplace remove tri-orchestrator
 powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1
 # 可选参数：-RestoreConfigBackup -RemoveDataDir
 ```
+
+停服前，脚本会比对本机监听进程与健康响应中的 PID、数据目录和启动标识。身份不符时会中止卸载并保留 PID 文件；可先核对报错中的记录，不要按残留 PID 手动强停。
 
 脚本只移除能核实由安装器写入且未被编辑的角色。若安装前有同名角色，符合移除条件时会恢复备份；自行编辑过或无法确认来源的角色会保留。
 

@@ -197,7 +197,7 @@ def test_workflow5_macro_rpc_primary_path_and_reconciliation_fence(mode: str) ->
     text = mode_corpus(mode)
     for required in (
         "workflow5",
-        "0.6.12/schema10",
+        "0.6.13/schema10",
         "workflow_prepare_dispatch",
         "task_name",
         "/root/<task_name>",
@@ -250,7 +250,7 @@ def test_shared_workflow_and_agent_tomls_streamline_legacy_and_adopt_role_focuse
         data = tomllib.loads(raw)
         instructions = data["developer_instructions"]
         assert "workflow5" in instructions, path
-        assert "0.6.12/schema10" in instructions, path
+        assert "0.6.13/schema10" in instructions, path
         assert "board_status.workflow.workflow_version" in instructions, path
         assert "skills/route-a-workflow.md" not in instructions, f"{path} must not require broken relative path"
         assert "self-contained" in instructions, path

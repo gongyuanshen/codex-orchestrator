@@ -53,7 +53,7 @@ def test_modes_and_inline_roles_inherit_verification_collector(mode):
     assert "workflow5" in skill and "workflow_verifier_turn" in skill
     for term in (
         "workflow5",
-        "0.6.12/schema10",
+        "0.6.13/schema10",
         "workflow_verifier_turn",
         "tri-orchestrator-verify",
         "tri-orchestrator-challenge",

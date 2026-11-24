@@ -448,6 +448,12 @@ def test_t3_nested_snapshot_uses_slice_paths_through_workflow5_closeout(env, mon
         )
 
     assert verify("candidate", workspace, candidate)["step"]["state"] == "ready_to_merge"
+    ignore = execution / ".triignore"
+    ignore.write_text(relative + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="scan before apply"):
+        rpc("workspace_merge", workspace_id=author["workspace"]["id"])
+    assert edited.read_text(encoding="utf-8") == "old"  # No write, no reconciliation needed.
+    ignore.unlink()
     merged = rpc("workspace_merge", workspace_id=author["workspace"]["id"])
     assert merged["files_changed"] == [relative]
     assert candidate == workspace / relative

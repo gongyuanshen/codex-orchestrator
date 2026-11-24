@@ -209,6 +209,8 @@ def test_workflow5_direct_spawn_author_and_lazy_verifier_full_rework_and_freeze_
             ],
         },
     )
+    manifest = json.loads(Path(cand0["manifest_path"]).read_text(encoding="utf-8"))
+    assert Path(ver_prep["native_call_hint"]["workspace_path"]) == Path(manifest["artifact"]["root"]) == ws_dir
     out0 = tmp_path / "collect-cand0"
     collect(Path(cand0["manifest_path"]), out0)
     dispatcher.dispatch(
@@ -347,6 +349,8 @@ def test_workflow5_direct_spawn_author_and_lazy_verifier_full_rework_and_freeze_
             ],
         },
     )
+    manifest = json.loads(Path(cand1["manifest_path"]).read_text(encoding="utf-8"))
+    assert Path(rever_prep["native_call_hint"]["workspace_path"]) == Path(manifest["artifact"]["root"]) == ws_dir
     out1 = tmp_path / "collect-cand1"
     collect(Path(cand1["manifest_path"]), out1)
     dispatcher.dispatch(
@@ -412,6 +416,8 @@ def test_workflow5_direct_spawn_author_and_lazy_verifier_full_rework_and_freeze_
             ],
         },
     )
+    manifest = json.loads(Path(int_art["manifest_path"]).read_text(encoding="utf-8"))
+    assert Path(int_prep["native_call_hint"]["workspace_path"]) == Path(manifest["artifact"]["root"]) == project
     out_int = tmp_path / "collect-int"
     collect(Path(int_art["manifest_path"]), out_int)
     dispatcher.dispatch(

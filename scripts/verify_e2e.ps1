@@ -45,44 +45,6 @@ if ($DaemonPort -le 0) {
     $DaemonPort = if (-not [string]::IsNullOrWhiteSpace($env:TRI_ORCH_PORT)) { [int]$env:TRI_ORCH_PORT } else { 18790 }
 }
 
-$ExpectedTools = @(
-    "run_create",
-    "run_update",
-    "run_list",
-    "task_packet_save",
-    "task_packet_get",
-    "board_post",
-    "board_read",
-    "board_status",
-    "board_channel_list",
-    "worker_control_ack",
-    "worker_register",
-    "worker_heartbeat",
-    "worker_status_update",
-    "workspace_create",
-    "workspace_diff",
-    "workspace_status",
-    "workspace_merge_preview",
-    "workspace_merge",
-    "workspace_cleanup",
-    "native_action_update",
-    "inbox_send",
-    "inbox_get",
-    "inbox_ack",
-    "inbox_wait",
-    "workflow_step_save",
-    "workflow_step_advance",
-    "artifact_capture",
-    "verification_record",
-    "workflow_review",
-    "workflow_prepare_dispatch",
-    "native_action_record_call",
-    "workflow_author_turn",
-    "workflow_verifier_turn",
-    "workflow_closeout_run",
-    "session_bind"
-)
-
 function Format-Win32Arg {
     param([string]$Arg)
     if ($Arg -eq "") { return '""' }
@@ -296,7 +258,7 @@ assert srv.get("cwd") == ".", f"plugin/.mcp.json cwd must be '.', got {srv.get('
 
 p2 = json.loads((root / "plugin" / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
 assert p2["name"] == "tri-orchestrator"
-assert p2["version"] == "0.6.12"
+assert p2["version"] == "0.6.13"
 assert p2.get("hooks") == "./hooks/hooks.json"
 assert p2.get("mcpServers") == "./.mcp.json"
 hooks_cfg = json.loads((root / "plugin" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
@@ -380,7 +342,7 @@ import json, os, pathlib, queue, subprocess, sys, tempfile, threading, time
 
 cached_dir = pathlib.Path(sys.argv[1]).resolve()
 uv_exe = sys.argv[2]
-expected = set(sys.argv[3].split(","))
+tier = sys.argv[3]
 repo_root = pathlib.Path(sys.argv[4]).resolve()
 temp_cwd = tempfile.gettempdir()
 
@@ -392,6 +354,15 @@ env["PYTHONUTF8"] = "1"
 env["PYTHONIOENCODING"] = "utf-8"
 env.pop("PYTHONPATH", None)
 env.pop("VIRTUAL_ENV", None)
+
+# Compare the cached MCP server with the catalog in the source being released.
+expected = set(json.loads(subprocess.check_output(
+    [uv_exe, "run", "--quiet", "--project", str(repo_root / "plugin"), "python", "-c",
+     "import json; from orchestrator.rpc_handlers import get_mcp_tool_definitions as defs; "
+     "print(json.dumps([t['name'] for t in defs()]))"],
+    cwd=temp_cwd, env=dict(env, TRI_ORCH_TOOL_TIER=tier), text=True, encoding="utf-8",
+)))
+env["TRI_ORCH_TOOL_TIER"] = tier
 
 # Confirm orchestrator resolves strictly inside cached_dir (not repo_root)
 imp = subprocess.run(
@@ -485,7 +456,7 @@ try:
     extra = sorted(tool_names - expected)
     assert not missing, f"Missing MCP tools: {missing}"
     assert len(tool_names) == len(expected), f"Expected {len(expected)} tools, got {len(tool_names)} (extra={extra})"
-    print(f"Detached cache MCP OK (cwd={temp_cwd}, module={mod_path}, {len(tool_names)}/{len(expected)} tools, stdout pure JSON-RPC)")
+    print(f"Detached cache MCP OK (cwd={temp_cwd}, module={mod_path}, {tier} {len(tool_names)}/{len(expected)} tools, stdout pure JSON-RPC)")
 finally:
     try:
         if proc.stdin:
@@ -502,11 +473,13 @@ $mcpEnv = @{
     TRI_ORCH_HOST = $DaemonHost
     TRI_ORCH_PORT = [string]$DaemonPort
 }
-$mcpRes = Invoke-PythonInline -PyRunner $pyRunner -Code $detachedProbePy -ScriptArgs @($cachedPluginDir, $uvExe, ($ExpectedTools -join ","), $RepoRoot) -WorkingDirectory $env:TEMP -EnvOverrides $mcpEnv
-if ($mcpRes.ExitCode -ne 0) {
-    throw "[FAIL] Detached cache MCP handshake failed:`n$($mcpRes.StdOut)`n$($mcpRes.StdErr)"
+foreach ($tier in @('core', 'full')) {
+    $mcpRes = Invoke-PythonInline -PyRunner $pyRunner -Code $detachedProbePy -ScriptArgs @($cachedPluginDir, $uvExe, $tier, $RepoRoot) -WorkingDirectory $env:TEMP -EnvOverrides $mcpEnv
+    if ($mcpRes.ExitCode -ne 0) {
+        throw "[FAIL] Detached cache MCP handshake failed:`n$($mcpRes.StdOut)`n$($mcpRes.StdErr)"
+    }
+    Write-Host "[PASS] $($mcpRes.StdOut.Trim())"
 }
-Write-Host "[PASS] $($mcpRes.StdOut.Trim())"
 
 # 4. Daemon /api/health, Web Dashboard HTTP 200, and SSE stream check
 Write-Host "[verify] 4/5 Checking Daemon HTTP /api/health, Web UI, APIs, and SSE..."
