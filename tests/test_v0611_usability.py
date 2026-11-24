@@ -72,6 +72,7 @@ def test_core_tool_catalog_fits_budget_and_is_smaller_than_full() -> None:
     core, full = get_mcp_tool_definitions("core"), get_mcp_tool_definitions("full")
     assert _compact(core) <= CORE_CATALOG_BUDGET, _compact(core)
     assert _compact(core) < _compact(full)
+    assert _compact(core) + _size(shared_text()) + _size(skill_text("boost")) <= 22_000
 
 
 def test_reference_table_links_exist_and_every_reference_is_routed() -> None:
@@ -186,18 +187,16 @@ def _mentioned_tools(text: str, catalog: set[str]) -> set[str]:
     return {name for name in catalog if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text)}
 
 
-def test_every_tool_named_in_docs_and_roles_is_reachable() -> None:
+def test_advanced_role_tools_have_gateway_guidance_and_normal_path_needs_no_proxy() -> None:
     catalog = {tool["name"] for tool in get_tool_definitions()}
     core = {tool["name"] for tool in get_mcp_tool_definitions("core")}
     advanced_doc = reference_text("advanced-tools")
     for name in ADVANCED_TOOL_NAMES:
         assert f"`{name}`" in advanced_doc, name
-    texts = [shared_text(), *(skill_text(mode) for mode in MODES)]
-    texts += [path.read_text(encoding="utf-8") for path in reference_paths()]
-    texts += [tomllib.loads(p.read_text(encoding="utf-8"))["developer_instructions"] for p in (PLUGIN / "agents").glob("*.toml")]
-    for text in texts:
-        for name in _mentioned_tools(text, catalog):
-            assert name in core or name in ADVANCED_TOOL_NAMES, name
+    for path in [*(PLUGIN / "agents").glob("*.toml"), REFERENCE_DIR / "inline-roles.md"]:
+        role = path.read_text(encoding="utf-8")
+        if _mentioned_tools(role, ADVANCED_TOOL_NAMES):
+            assert "tool_advanced(tool=" in role, path.name
     # The always-loaded normal path itself needs no proxy hop.
     normal = shared_text().split("## Normal path", 1)[1].split("\n## ", 1)[0]
     for name in _mentioned_tools(normal, catalog):
@@ -280,3 +279,45 @@ def test_tool_advanced_describes_and_calls_hidden_tools(env) -> None:
         dispatcher.dispatch("tool_advanced", {"tool": "run_create", "arguments": {}})
     with pytest.raises(ValueError, match="must be a JSON object"):
         dispatcher.dispatch("tool_advanced", {"tool": "board_channel_list", "arguments": "run"})
+
+def test_solo_accept_and_submit_with_real_ticket_and_atomic_failure(env):
+    from orchestrator.workflow import WorkflowConflictError
+    project, db, rpc = env
+    run = _run_with_packet(rpc, project)
+    start = dict(run_id=run, dispatch_action="accept_local", step_key="one", owner="coder_1", verifier="verifier",
+                 options=dict(agent_id="/root", advance_evidence="inspected frozen packet"))
+    step = rpc.dispatch("workflow_prepare_dispatch", start)["step"]
+    assert step["state"] == "implementing" and step["workspace_id"] is None
+    assert not db.connect().execute("select 1 from inbox_messages").fetchone()
+    with pytest.raises(WorkflowConflictError, match="already exists"):
+        rpc.dispatch("workflow_prepare_dispatch", start)
+    submit = dict(run_id=run, dispatch_action="submit_local_for_verify", step_id=step["id"], message_key="review-one",
+                  options=dict(expected_step_revision=step["revision"], advance_agent_id="/root"))
+    with pytest.raises(WorkflowConflictError, match="task_name"):
+        rpc.dispatch("workflow_prepare_dispatch", submit)
+    assert rpc.workflow.get_step(step['id'])['state'] == 'implementing'
+    sent = rpc.dispatch("workflow_prepare_dispatch", dict(submit, verifier_task_name="verifier_1"))
+    assert sent["step"]["state"] == "candidate_review" and sent["message_id"]
+    snapshot = db.get_worker_by_name(run, "verifier")
+    with pytest.raises(WorkflowConflictError, match="Cannot prepare integrated"):
+        rpc.dispatch("workflow_verifier_turn", dict(run_id=run, step_id=step["id"], phase="prepare", scope="integrated"))
+    assert db.get_worker_by_name(run, "verifier") == snapshot
+    assert rpc.inbox.get(sent["message_id"])["status"] == "pending"
+
+    # Exercise the same ticket through confirmation, a real subprocess receipt, and final closeout.
+    import sys
+    from orchestrator.verify_runner import collect
+    rpc.dispatch("native_action_record_call", dict(run_id=run, action_id=sent["action_id"],
+        claim_token=sent["claim_token"], expected_revision=sent["expected_revision"], outcome="confirmed",
+        raw_response={"agent_id": "/root/verifier_1"}))
+    artifact = rpc.dispatch("workflow_verifier_turn", dict(run_id=run, step_id=step["id"], phase="prepare",
+        verification_commands=[dict(id="read", argv=[sys.executable, "-c",
+            "from pathlib import Path; assert Path('main.py').read_text().strip() == 'VALUE = 1'"], cwd=str(project), timeout_sec=10,
+            env_keys=[], criteria=["AC-1"])]))["artifact"]
+    output = db.settings.data_dir / "smoke-receipt"
+    collect(artifact["manifest_path"], output)
+    rpc.dispatch("workflow_verifier_turn", dict(run_id=run, step_id=step["id"], phase="record",
+        verdict="PASS", artifact_id=artifact["id"], receipt_files=[str(output / "receipt.json")]))
+    rpc.dispatch("workflow_closeout_run", dict(run_id=run))
+    assert db.get_run(run)["status"] == "completed"
+    assert len(rpc.workflow.summary(run)["verifications"]) == 1

@@ -334,7 +334,7 @@ def test_storage_gc_and_refresh_actions_and_error_visibility() -> None:
       assert.ok(afterHtml.includes('本次清理已释放 6.00 MB'));
       assert.ok(afterHtml.includes('已清理结果缓存 3 项'));
       assert.ok(afterHtml.includes('已清理安全工作区 1 个'));
-      assert.ok(afterHtml.includes('已跳过含未合入变更工作区 1 个'));
+      assert.ok(afterHtml.includes('已跳过待核查工作区 1 个'));
       assert.ok(!afterHtml.includes('ws-1'));
       assert.ok(afterHtml.includes('ws-2'));
 
@@ -465,3 +465,13 @@ ctx.runTest(`(async () => {
 '''
     result = subprocess.run(["node", "-e", script, str(APP)], capture_output=True, text=True, encoding="utf-8")
     assert result.returncode == 0, result.stderr
+
+
+def test_initial_stage_without_completed_totals_shows_current_work():
+    run_dashboard(r'''(() => {
+      state.workflow = {stage_timings: {stage_order: ['author'], totals_sec: {}, steps: [
+        {step_key: 'stage-one', current_stage: 'author', current_since: 100, stages_sec: {}}
+      ]}};
+      const html = renderStageTimings();
+      assert.ok(html.includes('stage-one') && html.includes('当前：'));
+    })()''')

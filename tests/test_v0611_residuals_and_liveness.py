@@ -117,7 +117,9 @@ def test_unresolved_native_action_and_working_author_block_discard(env):
         conn.execute("UPDATE native_actions SET status='confirmed' WHERE action_id=?", (prep["action_id"],))
         conn.execute("UPDATE workers SET agent_id='/root/coder_1', pending_agent_path=NULL, status='working' "
                      "WHERE run_id=? AND name='coder_1'", (run_id,))
+    from orchestrator.gc import collect_storage_report
     working = mgr.workspace_discard_check(ws_id)
+    assert collect_storage_report(db, db.settings)["workspaces"]["items"][0]["reason"] == working["reason"]
     assert working["discardable"] is False and "still recorded as working" in working["reason"]
     db.update_worker_status(run_id=run_id, worker_name="coder_1", status="stopped")
     assert mgr.workspace_discard_check(ws_id)["discardable"] is True
@@ -132,11 +134,15 @@ def test_git_clone_discard_requires_head_at_base_and_clean_tree(tmp_path):
         run = db.create_run(mode="swarm", title="git", project_root=repo)
         committed = mgr.workspace_create(run["id"], "committer", copy_env=False)
         untouched = mgr.workspace_create(run["id"], "idle", copy_env=False)
+        linked = mgr.workspace_create(run["id"], "linked", copy_env=False, git_backend="worktree")
+        _git(repo, "worktree", "lock", linked["path"])
         assert committed["mode"] == "git_clone"
         path = Path(committed["path"])
         (path / "app.py").write_text("changed = True\n", encoding="utf-8")
         _git(path, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-am", "work")
         _finish(db, run["id"], "archived")
+        locked = mgr.workspace_discard_check(linked["id"])
+        assert not locked["discardable"] and "locked" in locked["reason"]
         refused = mgr.workspace_discard_check(committed["id"])
         assert refused["discardable"] is False and "commits beyond base" in refused["reason"]
         (Path(untouched["path"]) / "scratch.txt").write_text("x", encoding="utf-8")
@@ -304,3 +310,24 @@ def test_effort_columns_are_added_to_existing_databases(tmp_path):
         assert reopened.migrate() == 10
     finally:
         reopened.close()
+
+def test_other_storage_is_counted_not_pruned_and_health_reports_only_old_managed_roles(env, monkeypatch, tmp_path):
+    from orchestrator.gc import run_gc
+    from orchestrator.daemon import _stale_role_contracts
+    _, db, mgr, _ = env
+    unknown = db.settings.data_dir / 'historical-task'
+    unknown.mkdir()
+    (unknown / 'old').write_bytes(b'1234')
+    backup = db.settings.data_dir / 'state.db.bak'
+    backup.write_bytes(b'abc')
+    runtime = run_gc(db, mgr, db.settings)['report_after']['runtime']
+    assert backup.read_bytes() == b'abc' and (unknown / 'old').read_bytes() == b'1234'
+    sizes = {i['name']: i['bytes'] for i in runtime['unaccounted_items']}
+    assert sizes['historical-task'] == 4 and sizes['state.db.bak'] == 3
+    assert runtime['unaccounted_bytes'] == sum(sizes.values())
+    monkeypatch.setenv('CODEX_HOME', str(tmp_path))
+    agents = tmp_path / 'agents'
+    agents.mkdir()
+    (agents / 'coder.toml').write_text('Current default is `workflow5` (`0.6.10/schema10`)')
+    (agents / 'planner.toml').write_text('custom role')
+    assert _stale_role_contracts() == ['coder']

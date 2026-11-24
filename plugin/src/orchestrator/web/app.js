@@ -163,6 +163,7 @@
     workerModelRetryTimer: null,
 
     healthOk: null,
+    roleDrift: [],
     healthPort: null,
     healthPid: null,
     sseState: 'idle',
@@ -550,7 +551,7 @@
   const STORAGE_CATEGORY_META = {
     cleanable: { label: '可安全清理', tone: 'tint-success', order: 1 },
     discardable: { label: '已废弃（可安全作废）', tone: 'tint-cyan', order: 1 },
-    dirty_review: { label: '含未合入变更待核查', tone: 'tint-warning', order: 0 },
+    dirty_review: { label: '需人工核查', tone: 'tint-warning', order: 0 },
     active: { label: '进行中', tone: 'tint-primary', order: 2 },
   };
 
@@ -1086,11 +1087,11 @@
       const dotClass = state.sseState === 'error' ? 'dot-pending' : 'dot-ok';
       const content = `
         <span class="status-dot ${dotClass}"></span>
-        <span class="status-text tabular">${escapeHtml(`${prefix}${portPart}`)}</span>
+        <span class="status-text tabular">${escapeHtml(`${prefix}${portPart}${state.roleDrift.length ? ' · 角色需同步' : ''}`)}</span>
       `;
       if (el.healthBadge.innerHTML !== content) el.healthBadge.innerHTML = content;
       const pidInfo = state.healthPid ? ` · PID ${state.healthPid}` : '';
-      el.healthBadge.title = `守护进程运行中${portPart}${pidInfo} · ${sseLabel}`;
+      el.healthBadge.title = `守护进程运行中${portPart}${pidInfo} · ${sseLabel}` + (state.roleDrift.length ? ` · 从对应版本重跑安装脚本以同步：${state.roleDrift.join("、")}` : "");
     } else if (state.healthOk === false) {
       const content = `
         <span class="status-dot dot-error"></span>
@@ -1139,6 +1140,7 @@
       const data = await apiRequest('/api/health');
       const ok = data?.status ? data.status === 'ok' || data.ok === true : true;
       state.healthOk = ok;
+      state.roleDrift = data?.stale_role_contracts || [];
       state.healthPort = data?.port || null;
       state.healthPid = data?.pid || null;
       renderHealthPill();
@@ -3639,12 +3641,12 @@
     const timings = state.workflow?.stage_timings;
     if (!timings || !Array.isArray(timings.stage_order)) return '';
     const totals = timings.totals_sec || {};
-    const chips = timings.stage_order.filter((stage) => totals[stage]).map((stage) => `<span class="metric-chip">${escapeHtml(STAGE_LABELS[stage] || stage)} ${escapeHtml(formatStageSeconds(totals[stage]))}</span>`).join('');
-    if (!chips) return '<p class="muted-caption">阶段耗时：尚无已结束的阶段。</p>';
+    const chips = timings.stage_order.filter((stage) => totals[stage] != null).map((stage) => `<span class="metric-chip">${escapeHtml(STAGE_LABELS[stage] || stage)} ${escapeHtml(formatStageSeconds(totals[stage]))}</span>`).join('');
+    if (!chips && !timings.steps?.some((step) => step.current_stage || step.done_at != null)) return '<p class="muted-caption">阶段耗时：尚无已结束的阶段。</p>';
     const rows = (timings.steps || []).map((step) => {
-      const parts = timings.stage_order.filter((stage) => step.stages_sec?.[stage]).map((stage) => `${STAGE_LABELS[stage] || stage} ${formatStageSeconds(step.stages_sec[stage])}`);
+      const parts = timings.stage_order.filter((stage) => step.stages_sec?.[stage] != null).map((stage) => `${STAGE_LABELS[stage] || stage} ${formatStageSeconds(step.stages_sec[stage])}`);
       const current = step.current_stage ? ` · 当前：${STAGE_LABELS[step.current_stage] || step.current_stage}（自 ${formatLocalTime(step.current_since)}）` : '';
-      return `<li>${escapeHtml(step.step_key)}：${escapeHtml(parts.join(' / ') || '无已结束阶段')}${escapeHtml(current)}</li>`;
+      return `<li>${escapeHtml(step.step_key)}：${escapeHtml(parts.join(' / ') || '无已结束阶段')}${escapeHtml(current)}${step.done_at != null ? ` · 已完成：${escapeHtml(formatLocalTime(step.done_at))}` : ''}</li>`;
     }).join('');
     return `<p class="overview-footnote">阶段耗时 · 记录跨度 ${escapeHtml(formatStageSeconds(timings.logged_span_sec))}（按流程转换日志统计，仅供定位慢点，不参与门禁）</p><div class="workflow-delivery tabular">${chips}</div><details class="workflow-more" data-overview-detail="stage-timings" ${state.overviewExpanded.has('stage-timings') ? 'open' : ''}><summary>按步骤查看阶段耗时</summary><ul>${rows}</ul></details>`;
   }
@@ -5548,7 +5550,7 @@
       const summaryParts = [
         `已清理结果缓存 ${cleanedResults} 项`,
         `已清理安全工作区 ${cleanedWs} 个`,
-        skippedDirty.length > 0 ? `已跳过含未合入变更工作区 ${skippedDirty.length} 个（保留磁盘文件待核查）` : '',
+        skippedDirty.length > 0 ? `已跳过待核查工作区 ${skippedDirty.length} 个（保留磁盘文件待核查）` : '',
       ].filter(Boolean);
       banners.push(`
         <div class="banner banner-${variant}" role="status">
@@ -5608,6 +5610,11 @@
             <div class="storage-metric-value mono tabular">${escapeHtml(formatBytes(runtime.receipts_bytes ?? 0))}</div>
             <div class="storage-metric-sub">工作流验收与归档记录</div>
           </div>
+          <div class="storage-metric-card">
+            <div class="storage-metric-label">其他顶层文件和目录（只读盘点）</div>
+            <div class="storage-metric-value mono tabular">${escapeHtml(formatBytes(runtime.unaccounted_bytes ?? 0))}</div>
+            <details><summary>查看明细</summary><ul>${(runtime.unaccounted_items || []).map(i => `<li>${escapeHtml(i.name)} · ${escapeHtml(formatBytes(i.bytes))}</li>`).join('')}</ul></details>
+          </div>
         </div>
       </section>
     `;
@@ -5626,7 +5633,7 @@
             const wsStatusLabel = labelWsStatus(item.status);
             const runStatusLabel = labelRunStatus(item.run_status);
             const isDirty = cat === 'dirty_review';
-            const changeBadges = (isDirty || added > 0 || modified > 0)
+            const changeBadges = (added > 0 || modified > 0)
               ? `<span class="chip-tag ${isDirty ? 'tint-warning' : 'tint-muted'} mono tabular">新增 ${escapeHtml(String(added))} · 修改 ${escapeHtml(String(modified))}</span>`
               : '';
 
@@ -5634,7 +5641,7 @@
               <article class="storage-ws-item ${isDirty ? 'is-dirty-review' : ''}" role="listitem" data-workspace-id="${escapeHtml(item.workspace_id || '')}" data-category="${escapeHtml(cat)}">
                 <div class="storage-ws-row-top">
                   <div class="storage-ws-badges">
-                    <span class="pill-badge ${catMeta.tone}">${escapeHtml(catMeta.label)}</span>
+                    <span class="pill-badge ${catMeta.tone}">${escapeHtml(isDirty && (added || modified) ? '含未合入变更待核查' : catMeta.label)}</span>
                     <span class="storage-ws-worker mono">${escapeHtml(workerLabel)}</span>
                     <span class="chip-tag tint-muted">${escapeHtml(modeLabel)}</span>
                     <span class="chip-tag ${getWsStatusTone(item.status)}">${escapeHtml(wsStatusLabel)}</span>
@@ -5650,7 +5657,7 @@
                 <div class="storage-ws-meta">
                   <span class="mono">run ${escapeHtml(shortId(item.run_id || ''))}（${escapeHtml(runStatusLabel)}）</span>
                   ${item.reason ? `<span>${escapeHtml(item.reason)}</span>` : ''}
-                  ${isDirty ? '<span class="storage-dirty-note">含未合入改动，不自动删除，请先核查并合入或手工处理</span>' : ''}
+                  ${isDirty ? '<span class="storage-dirty-note">不自动删除，请先核查上述原因</span>' : ''}
                   ${cat === 'discardable' ? `<span>从未合入且与基线完全一致；作废前会再次核对。</span><button type="button" class="btn btn-ghost btn-xs" data-storage-action="discard-workspace" data-workspace-id="${escapeHtml(item.workspace_id || '')}" ${state.storageDiscardBusy ? 'disabled' : ''}>作废</button>` : ''}
                 </div>
               </article>

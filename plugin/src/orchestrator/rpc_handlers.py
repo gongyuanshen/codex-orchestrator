@@ -22,7 +22,7 @@ from orchestrator import codex_bridge, host_features
 from orchestrator.board import BoardService, _strip_artifact_manifests, _strip_step_manifests
 from orchestrator.native_actions import NativeActionStore, digest as native_digest
 from orchestrator.inbox import INBOX_TOOL_DEFINITIONS, InboxConflictError, InboxStore
-from orchestrator.workflow import ENV_PROFILES, WorkflowConflictError, WorkflowService
+from orchestrator.workflow import ENV_PROFILES, StaleVerificationEvidence, WorkflowConflictError, WorkflowService
 from orchestrator.db import (
     VALID_MSG_TYPES,
     VALID_RUN_MODES,
@@ -225,39 +225,38 @@ class EventBus:
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "run_create",
-        "description": "Create an orchestration run (boost/teamwork/swarm) and auto-register its project root.",
+        "description": "Create a run and register its project root.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "mode": {
                     "type": "string",
                     "enum": sorted(VALID_RUN_MODES),
-                    "description": "Orchestration workflow mode.",
                 },
-                "title": {"type": "string", "description": "Short run title."},
+                "title": {"type": "string"},
                 "project_root": {
                     "type": "string",
-                    "description": "Absolute project directory path (auto-registers project if needed).",
+                    "description": "Absolute project root.",
                 },
                 "project_id": {
                     "type": "string",
-                    "description": "Existing project ID (alternative to project_root).",
+                    "description": "Instead of project_root.",
                 },
-                "project_name": {"type": "string", "description": "Optional display name."},
+                "project_name": {"type": "string"},
                 "is_git": {"type": "boolean", "description": "Optional git repo override."},
                 "status": {
                     "type": "string",
                     "enum": sorted(VALID_RUN_STATUSES),
                     "default": "active",
                 },
-                "metadata": {"type": "object", "description": "Optional JSON metadata."},
+                "metadata": {"type": "object"},
                 "session_id": {
                     "type": "string",
                     "minLength": 1,
-                    "description": "Optional root host session ID to bind for lifecycle hooks.",
+                    "description": "Root host session for hooks.",
                 },
-                "turn_id": {"type": "string", "description": "Codex turn that triggered this run."},
-                "trigger_prompt": {"type": "string", "description": "Prompt that triggered this run."},
+                "turn_id": {"type": "string", "description": "Triggering Codex turn."},
+                "trigger_prompt": {"type": "string", "description": "Triggering prompt."},
                 "execution_root": {"type": "string", "description": "Execution directory at or below the registered project root."},
             },
             "required": ["mode", "title"],
@@ -281,7 +280,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "run_list",
-        "description": "List orchestration runs, optionally filtered by project_id, status, or mode.",
+        "description": "List matching runs.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -316,7 +315,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "task_packet_get",
-        "description": "Retrieve the latest (or specific version) task packet for a run.",
+        "description": "Get the latest or specified task packet.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -714,14 +713,14 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
     },
     {
         "name": "workflow_prepare_dispatch",
-        "description": "Atomically prepare workspace, worker registration, step save/advance, inbox delivery, and native claim+begin in one SQLite transaction.",
+        "description": "Prepare native dispatch; Solo accept_local starts the local author, submit_local_for_verify submits and prepares the review ticket.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "run_id": {"type": "string"},
                 "dispatch_action": {
                     "type": "string",
-                    "enum": ["dispatch", "start_rework", "request_verify"],
+                    "enum": ["dispatch", "start_rework", "request_verify", "accept_local", "submit_local_for_verify"],
                     "default": "dispatch",
                 },
                 "create_workspace": {"type": "boolean", "default": False},
@@ -780,7 +779,7 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
                     "additionalProperties": False,
                 },
                 "sender": {"type": "string", "default": "coordinator"},
-                "message_key": {"type": "string", "description": "Unique key for this dispatch attempt. Choose it before sending; recover a lost response via inbox_get(run_id, sender, message_key)."},
+                "message_key": {"type": "string", "description": "Choose before dispatch. On timeout use inbox_get(run_id, sender, message_key), never replay."},
                 "key": {"type": "string", "description": "Alias for message_key."},
                 "kind": {"type": "string", "enum": ["task", "rework", "review", "result", "notice"]},
                 "subject": {"type": "string"},
@@ -834,7 +833,7 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
     },
     {
         "name": "workflow_author_turn",
-        "description": "Atomically bundle author inbox acknowledgement and workflow step accept/submit in one transaction.",
+        "description": "Acknowledge the author ticket and accept or submit its step atomically.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -891,7 +890,7 @@ TOOL_DEFINITIONS.extend(INBOX_TOOL_DEFINITIONS + [
     },
     {
         "name": "workflow_closeout_run",
-        "description": "Single guarded RPC to complete all integrated_review steps, clean up workspaces, stop workers, and mark run completed.",
+        "description": "Revalidate gates, complete steps, clean merged workspaces, stop workers and close run.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -954,6 +953,13 @@ INTERNAL_RPC_DEFINITIONS: list[dict[str, Any]] = [
 TOOL_TIER_ENV = "TRI_ORCH_TOOL_TIER"
 VALID_TOOL_TIERS = ("core", "full")
 ADVANCED_TOOL_NAMES: frozenset[str] = frozenset({
+    "worker_register",
+    "workflow_step_save",
+    "workflow_step_advance",
+    "workflow_review",
+    "worker_heartbeat",
+    "inbox_ack",
+    "run_update",
     "native_action_update",
     "board_channel_list",
     "worker_status_update",
@@ -1188,6 +1194,9 @@ class RpcDispatcher:
                 with self.db.read_connection() as conn:
                     row = conn.execute("SELECT run_id FROM inbox_messages WHERE id=?", (args["message_id"],)).fetchone()
                 run_id = row["run_id"] if row else None
+            if tool_name == "workflow_review":
+                run_id = self.workflow.get_step(args["step_id"])["run_id"]
+                names = [w["name"] for w in self.db.list_workers(run_id=run_id) if w["agent_id"] == args["agent_id"]]
             if not run_id:
                 return
             for name in dict.fromkeys(name.strip() for name in names):
@@ -1607,7 +1616,7 @@ class RpcDispatcher:
                 {"run_id": run_id, "message": full_msg},
                 run_id=run_id,
             )
-        wake = self._mention_wake_route(run_id, sender, args.get("mentions"))
+        wake = self._mention_wake_route(run_id, sender, pointer["mentions"])
         if wake is not None:
             pointer = {**pointer, **wake}
         return pointer
@@ -1979,9 +1988,51 @@ class RpcDispatcher:
     # M6 / M8 Macro RPC & M9 Session Hook Handlers
     # ------------------------------------------------------------------
 
+    def _accept_local(self, run_id: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Start synchronous work without creating an author inbox or native action."""
+        allowed = {"run_id", "dispatch_action", "step_key", "owner", "verifier", "agent_id", "advance_evidence",
+                   "criteria", "complexity", "dependencies"}
+        if extra := args.keys() - allowed:
+            raise ValueError(f"Unsupported accept_local arguments: {sorted(extra)}")
+        owner, verifier, agent_id, step_key, evidence = (
+            self._require_str(args, k).strip() for k in ("owner", "verifier", "agent_id", "step_key", "advance_evidence")
+        )
+        with self.db.transaction() as conn:
+            run = self.workflow._run(run_id)
+            if run["workflow_version"] != 5 or run["mode"] != "boost":
+                raise WorkflowConflictError("accept_local requires workflow5 Boost")
+            if conn.execute("SELECT 1 FROM workflow_steps WHERE run_id=? AND step_key=?", (run_id, step_key)).fetchone():
+                raise WorkflowConflictError("Step key already exists; inspect board_status before resuming")
+            for name, role, binding in ((owner, "coder", agent_id), (verifier, "verifier", None)):
+                worker = self.db.get_worker_by_name(run_id, name)
+                if worker is None:
+                    self.board.worker_register(run_id, name, role, agent_id=binding)
+                elif worker["role"] != role or (binding and binding != worker["agent_id"]):
+                    raise WorkflowConflictError(f"Local turn conflicts with existing {name} role or binding")
+            step = self.workflow.step_save(run_id, step_key, owner, verifier, execution_kind="coordinator_local",
+                **{k: args[k] for k in ("criteria", "complexity", "dependencies") if k in args})
+            step = self.workflow.step_advance(step["id"], "dispatch", step["revision"], agent_id=agent_id, evidence=evidence)
+            step = _strip_step_manifests(self.workflow.step_advance(step["id"], "accept", step["revision"]))
+        self._emit("workflow_updated", {"run_id": run_id, "step": step}, run_id=run_id)
+        return {"step": step}
+
     def _handle_workflow_prepare_dispatch(self, args: dict[str, Any]) -> dict[str, Any]:
         run_id = self._require_str(args, "run_id").strip()
         dispatch_action = str(args.get("dispatch_action") or "dispatch").strip()
+        if dispatch_action == "accept_local":
+            return self._accept_local(run_id, args)
+        submit_local = dispatch_action == "submit_local_for_verify"
+        if submit_local:
+            allowed = {"run_id", "dispatch_action", "step_id", "expected_step_revision", "advance_agent_id",
+                       "task_name", "verifier_task_name", "message_key", "key", "instruction", "session_id"}
+            if extra := args.keys() - allowed:
+                raise ValueError(f"Unsupported submit_local_for_verify arguments: {sorted(extra)}")
+            self._require_str(args, "step_id")
+            self._require_str(args, "advance_agent_id")
+            self._require_str(args, "message_key" if "message_key" in args else "key")
+            if type(args.get("expected_step_revision")) is not int:
+                raise ValueError("submit_local_for_verify requires expected_step_revision")
+            dispatch_action = "request_verify"
         if dispatch_action not in {"dispatch", "start_rework", "request_verify"}:
             raise ValueError(
                 f"Invalid dispatch_action {dispatch_action!r}; expected dispatch, start_rework, or request_verify"
@@ -2037,6 +2088,13 @@ class RpcDispatcher:
                         existing_step = candidate_step
                     except NotFoundError:
                         existing_step = None
+
+                if submit_local:
+                    if (run["workflow_version"] != 5 or not existing_step or existing_step["workspace_id"]
+                            or existing_step["checkpoint"].get("execution_kind") != "coordinator_local"
+                            or existing_step["owner_agent_id"] != args["advance_agent_id"]):
+                        raise WorkflowConflictError("Local submit requires the original workflow5 coordinator-local owner")
+                    existing_step = self.workflow.step_advance(existing_step["id"], "submit", args["expected_step_revision"])
 
                 explicit_owner = args.get("owner").strip() if isinstance(args.get("owner"), str) and args.get("owner").strip() else None
                 explicit_verifier = args.get("verifier").strip() if isinstance(args.get("verifier"), str) and args.get("verifier").strip() else None
@@ -2283,7 +2341,7 @@ class RpcDispatcher:
                     )
                 else:
                     assert existing_step is not None
-                    if args.get("expected_step_revision") is not None and existing_step["revision"] != int(args["expected_step_revision"]):
+                    if not submit_local and args.get("expected_step_revision") is not None and existing_step["revision"] != int(args["expected_step_revision"]):
                         raise WorkflowConflictError("Workflow revision conflict")
                     step = existing_step
 
@@ -2776,6 +2834,7 @@ class RpcDispatcher:
         self._emit("workflow_updated", {"run_id": run_id, "step": compact_step}, run_id=run_id)
         self._emit("inbox_updated", {"run_id": run_id, "message": ack_msg}, run_id=run_id)
         if board_pointer is not None:
+            board_pointer.update(self._mention_wake_route(run_id, actor, board_pointer["mentions"]) or {})
             full_msg = self.board.get_message(int(board_pointer["seq"]))
             if full_msg is not None:
                 self._emit("board_message", {"run_id": run_id, "message": full_msg}, run_id=run_id)
@@ -2809,6 +2868,9 @@ class RpcDispatcher:
                     verifier = str(verifier_arg).strip() if isinstance(verifier_arg, str) and verifier_arg.strip() else step["verifier"]
                     if verifier != step["verifier"]:
                         raise WorkflowConflictError("Only the bound independent verifier may execute workflow_verifier_turn")
+
+                    if scope not in {"candidate", "integrated"} or step["state"] != f"{scope}_review":
+                        raise WorkflowConflictError(f"Cannot prepare {scope} verification from {step['state']}")
 
                     # Auto-locate pending/accepted review inbox message if message_id not given.
                     message_id = args.get("message_id")
@@ -3034,6 +3096,7 @@ class RpcDispatcher:
         if ack_msg_final is not None:
             self._emit("inbox_updated", {"run_id": run_id, "message": ack_msg_final}, run_id=run_id)
         if board_pointer is not None:
+            board_pointer.update(self._mention_wake_route(run_id, verifier_name, board_pointer["mentions"]) or {})
             full_msg = self.board.get_message(int(board_pointer["seq"]))
             if full_msg is not None:
                 self._emit("board_message", {"run_id": run_id, "message": full_msg}, run_id=run_id)
@@ -3073,16 +3136,29 @@ class RpcDispatcher:
         for step in steps_by_id.values():
             if step["state"] == "done":
                 self.workflow._valid_verification(step, "integrated")
-            elif step["state"] == "integrated_review":
+            elif (step["state"] == "integrated_review" or
+                    step["state"] == "ready_to_merge" and run["workflow_version"] == 5 and not step["workspace_id"]):
                 if step["handoff_required"]:
                     raise WorkflowConflictError(
                         f"Step {step['step_key']} has handoff_required=True and must complete cross-coordinator handoff before closeout"
                     )
-                self.workflow._valid_verification(step, "integrated")
+                if step["state"] == "ready_to_merge":
+                    try:
+                        candidate = self.workflow._valid_verification(step, "candidate")
+                    except StaleVerificationEvidence as exc:
+                        raise WorkflowConflictError(f"{exc}; request_verify for a fresh integrated review") from exc
+                    if not self.workflow._reuse_eligible(step, candidate):
+                        raise WorkflowConflictError("Candidate is not reusable; request_verify for integrated review")
+                else:
+                    self.workflow._valid_verification(step, "integrated")
             else:
                 raise WorkflowConflictError(
                     f"Step {step['step_key']} is not ready for closeout (state={step['state']!r})"
                 )
+
+        covered = {criterion for step in steps_by_id.values() for criterion in step["criteria"]}
+        if covered != set(self.db.get_task_packet(run_id)["acceptance_criteria"]):
+            raise WorkflowConflictError("Workflow steps do not cover all frozen acceptance criteria")
 
         # Topological sort over step dependencies.
         ordered_ids: list[str] = []
@@ -3113,12 +3189,16 @@ class RpcDispatcher:
                 )
 
         advanced: list[str] = []
-        for sid in ordered_ids:
-            step = self.workflow.get_step(sid)
-            if step["state"] == "integrated_review":
-                step = self.workflow.step_advance(sid, "complete", step["revision"])
-                advanced.append(sid)
-                self._emit("workflow_updated", {"run_id": run_id, "step": _strip_step_manifests(step)}, run_id=run_id)
+        with self.db.transaction():
+            for sid in ordered_ids:
+                step = steps_by_id[sid]
+                if step["state"] == "ready_to_merge":
+                    step = self.workflow.step_advance(sid, "begin_integrated_review", step["revision"])
+                if step["state"] == "integrated_review":
+                    steps_by_id[sid] = self.workflow.step_advance(sid, "complete", step["revision"])
+                    advanced.append(sid)
+        for sid in advanced:
+            self._emit("workflow_updated", {"run_id": run_id, "step": _strip_step_manifests(steps_by_id[sid])}, run_id=run_id)
 
         cleaned_workspaces: list[str] = []
         freed_bytes = 0
@@ -3426,6 +3506,8 @@ class RpcDispatcher:
         should_block = False
         stop_reason = ""
 
+        all_steps_done = bool(wf["steps"]) and all(s["state"] == "done" for s in wf["steps"])
+        awaiting_closeout = all_steps_done and run["status"] == "active"
         if check_stop:
             stop_hook_active = bool(args.get("stop_hook_active", False))
             has_pending_controls = any(
@@ -3452,8 +3534,7 @@ class RpcDispatcher:
             )
             unblocked_actions = [a for a in next_acts if a["source_type"] != "control"]
 
-            art_scope_by_id = {a["id"]: a["scope"] for a in wf.get("artifacts", [])}
-            verifications = wf.get("verifications", [])
+            gates = {item['step_id']: item['gate'] for item in progress['potential_candidates'] if 'gate' in item}
             actionable_transitions: list[str] = []
             for step_info in wf["steps"]:
                 st_id = step_info["id"]
@@ -3480,44 +3561,29 @@ class RpcDispatcher:
                     )
                 elif state == "ready_to_merge":
                     actionable_transitions.append(
-                        f"ready_to_merge -> {step_info['step_key']}: 等待协调者合入"
+                        f"ready_to_merge -> {step_info['step_key']}: " + (
+                            "等待协调者合入" if step_info["workspace_id"] else "无工作区，等待 begin_integrated_review"
+                        )
                     )
                 elif state == "rework" and not has_author_inflight:
                     actionable_transitions.append(
                         f"rework -> {step_info['step_key']}: 等待派发返工 (@{owner_name})"
                     )
-                elif state == "integrated_review":
-                    has_integrated_pass = any(
-                        v["step_id"] == st_id
-                        and v["verdict"] == "PASS"
-                        and v.get("packet_version") == step_info["packet_version"]
-                        and v.get("attempt") == step_info["attempt"]
-                        and v.get("contract_revision") == step_info["contract_revision"]
-                        and art_scope_by_id.get(v["artifact_id"]) == "integrated"
-                        for v in verifications
-                    )
-                    # Cheap binding check only (this runs inside the <=1.5s Stop hook); complete /
-                    # workflow_closeout_run re-validates the reused candidate against the live tree.
-                    reuse = (step_info.get("checkpoint") or {}).get("integrated_reuse") or {}
-                    reuse_current = not has_integrated_pass and bool(reuse) and all(
-                        reuse.get(key) == step_info.get(key)
-                        for key in ("packet_version", "attempt", "contract_revision", "verifier_agent_id")
-                    )
-                    if has_integrated_pass:
+                elif state == "integrated_review" and not has_review_inflight:
+                    if gates.get(st_id) == 'verified':
                         actionable_transitions.append(
                             f"integrated_review -> {step_info['step_key']}: 集成验收已通过，等待 complete / workflow_closeout_run"
                         )
-                    elif reuse_current:
+                    elif gates.get(st_id) == 'reused':
                         actionable_transitions.append(
                             f"integrated_review -> {step_info['step_key']}: 无工作区，候选 PASS 复用为集成 PASS（complete 时重新核对），等待 complete / workflow_closeout_run"
                         )
-                    elif not has_review_inflight:
+                    else:
                         actionable_transitions.append(
                             f"integrated_review -> {step_info['step_key']}: 等待派发集成验收 (@{verifier_name})"
                         )
 
-            all_steps_done = bool(wf["steps"]) and all(s["state"] == "done" for s in wf["steps"])
-            if all_steps_done and run["status"] == "active":
+            if awaiting_closeout:
                 actionable_transitions.append(
                     "workflow_closeout_run -> 所有步骤已完成，等待 closeout 收尾"
                 )
@@ -3563,4 +3629,6 @@ class RpcDispatcher:
             "stop_reason": stop_reason,
             "blocked_key": blocked_key,
             "progress_classification": p_cls,
+            "run_status": run["status"],
+            "awaiting_closeout": awaiting_closeout,
         }

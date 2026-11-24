@@ -1,6 +1,6 @@
 # Resuming stored `workflow0..4` runs (read on demand)
 
-Read this only when `board_status.workflow.workflow_version` of an existing run is not 5. New runs default to `workflow5` (`0.6.11/schema10`); unknown versions are unsupported and there is no public downgrade selector.
+Read this only when `board_status.workflow.workflow_version` of an existing run is not 5. New runs default to `workflow5` (`0.6.12/schema10`); unknown versions are unsupported and there is no public downgrade selector.
 
 - Stored runs continue strictly by `board_status.workflow.workflow_version` without fabricated historical evidence: `workflow0` legacy, `workflow1` foundation, `workflow2` mode bindings, `workflow3` local collector, `workflow4` admission/handoff/grouped actions.
 - `workflow1..4` bootstrap children remain waiting-only until admission and persisted delivery. Use the manual ledger in [transfers-and-recovery](transfers-and-recovery.md) for every wake.

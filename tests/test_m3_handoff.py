@@ -76,7 +76,12 @@ def test_unsubstantiated_challenger_finding_can_be_dismissed_by_original_verifie
     step = s.step_save(run['id'], 'a', 'a', 'va', complexity='high')
     for action in ('dispatch', 'accept', 'submit'):
         step = advance(s, step, action)
-    finding = s.review(step['id'], step['revision'], '/root/c', 'output', 'hypothesis disproven by real verification')
+    from orchestrator.rpc_handlers import RpcDispatcher
+    db.update_worker_heartbeat(run_id=run['id'], worker_name='c', status='working', heartbeat_at=1.0)
+    rpc = RpcDispatcher(db, BoardService(db), s.workspaces)
+    finding = rpc.dispatch('workflow_review', dict(step_id=step['id'], expected_revision=step['revision'],
+        agent_id='/root/c', criterion='output', evidence='hypothesis disproven by real verification'))
+    assert db.get_worker_by_name(run['id'], 'c')['last_heartbeat_at'] > 1.0
     step = verify(s, step, 'candidate', dismissed_finding_ids=[finding['id']],
         review_dimensions=dict.fromkeys(('specification', 'code', 'stress', 'evidence'), 'PASS'))
     assert step['attempt'] == 0

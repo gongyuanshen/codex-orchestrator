@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -31,7 +32,7 @@ from starlette.routing import Route
 from orchestrator.board import BoardService
 from orchestrator import __version__, codex_bridge, gc, host_features
 from orchestrator.config import Settings, get_settings
-from orchestrator.db import Database, NotFoundError, SCHEMA_VERSION, VALID_RUN_MODES, require_runtime_schema
+from orchestrator.db import Database, NotFoundError, SCHEMA_VERSION, VALID_RUN_MODES, VALID_WORKER_ROLES, require_runtime_schema
 from orchestrator.inbox import InboxConflictError, request_wait
 from orchestrator.workflow import WorkflowConflictError
 from orchestrator.rpc_handlers import EventBus, RpcDispatcher
@@ -49,6 +50,25 @@ logger = logging.getLogger(__name__)
 WEB_DIR = Path(__file__).resolve().parent / "web"
 ALLOWED_MANUAL_WORKER_STATUSES = frozenset({"stopped", "killed"})
 _DIRECTORY_OPENER_WAIT_SECONDS = 3.0
+
+
+def _stale_role_contracts() -> list[str]:
+    home = codex_bridge._resolve_codex_home()
+    if home is None:
+        return []
+    stale = []
+    for role in sorted(VALID_WORKER_ROLES):
+        try:
+            content = (home / "agents" / f"{role}.toml").read_text(encoding="utf-8-sig")
+        except FileNotFoundError:
+            continue  # Native role installation is optional.
+        except (OSError, UnicodeError) as exc:
+            logger.warning("Cannot inspect installed role %s: %s", role, exc)
+            continue
+        marker = re.search(r"Current default is `workflow[0-9]+` \(`([0-9.]+/schema[0-9]+)`\)", content)
+        if marker and marker[1] != f"{__version__}/schema{SCHEMA_VERSION}":
+            stale.append(role)
+    return stale
 
 
 def _configure_daemon_logging(settings: Settings) -> None:
@@ -1023,6 +1043,7 @@ def create_app(
                 "started_at": state.started_at,
                 "sse_subscribers": state.event_bus.subscriber_count(),
                 "software_version": __version__,
+                "stale_role_contracts": await asyncio.to_thread(_stale_role_contracts),
                 "schema_version": SCHEMA_VERSION,
                 "host_wake": host_features.host_wake_status(probe=host_features.cached_probe),
                 "capabilities": [

@@ -542,6 +542,7 @@ class TestMacrosAndCliDiscoveryEndToEnd:
         assert v_fail["message"]["status"] == "completed"
         assert db.get_worker_by_name(run_id, "verifier_1")["status"] == "waiting"
         assert "coder_1" in v_fail["board_pointer"]["mentions"]
+        assert {"name": "coder_1", "agent_id": "/root/coder_1"} in v_fail["board_pointer"]["wake_targets"]
 
         # Stop hook MUST block when step sits in rework awaiting coordinator start_rework!
         stop_rework = dispatcher.dispatch(
@@ -734,6 +735,7 @@ class TestMacrosAndCliDiscoveryEndToEnd:
         )
         assert stop_ir_post["should_block_stop"] is True
         assert stop_ir_post["blocked_key"] != stop_ir_pre["blocked_key"]
+        assert "集成验收已通过" in stop_ir_post["stop_reason"]
 
         # Complete step 1 first so dependent step 2 can be admitted, and verify all-done Stop hook!
         dispatcher.dispatch(

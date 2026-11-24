@@ -322,6 +322,7 @@ def test_workflow_author_turn_accept_submit_and_env_profile_never_stores_env_val
         {"mode": "swarm", "title": "Author Macro Turn & Env Profile", "project_root": str(project)},
     )
     run_id = run["id"]
+    dispatcher.dispatch("worker_register", {"run_id": run_id, "name": "coordinator", "role": "coder", "agent_id": "/root"})
     dispatcher.dispatch(
         "task_packet_save",
         {
@@ -403,6 +404,8 @@ def test_workflow_author_turn_accept_submit_and_env_profile_never_stores_env_val
     assert submitted["message"]["status"] == "completed"
     assert submitted["board_pointer"] is not None
     assert "#verify" in submitted["board_pointer"]["summary"]
+    # Only the coordinator is bound before the first lazy verifier spawn.
+    assert submitted["board_pointer"]["wake_targets"] == [{"name": "coordinator", "agent_id": "/root"}]
 
     # Dispatch lazy verifier and capture candidate with windows_minimal_py & posix_minimal_py.
     ver_prep = dispatcher.dispatch(

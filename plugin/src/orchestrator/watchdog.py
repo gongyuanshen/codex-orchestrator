@@ -126,6 +126,11 @@ def classify_run(db: Database, run_id: str, *, now: float | None = None,
             else:
                 potential.append(dict(kind='dispatch_requires_admission', step_id=step['id']))
             continue
+        if state == 'integrated_review':
+            gate = flow.recorded_integrated_gate(step, checkpoint)
+            if gate:
+                potential.append(dict(kind='workflow_gate_required', step_id=step['id'], state=state, gate=gate))
+                continue
         if state in {'rework', 'ready_to_merge', 'handoff'}:
             potential.append(dict(kind='workflow_gate_required', step_id=step['id'], state=state))
             continue

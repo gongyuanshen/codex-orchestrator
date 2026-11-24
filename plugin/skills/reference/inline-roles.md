@@ -1,4 +1,5 @@
 # Inline fallback role contracts (read on demand)
+If a named primitive is absent in the core catalog, use `tool_advanced(tool=..., arguments=...)` for advanced tools.
 
 Use these only when the live `spawn_agent` schema or the active Codex home lacks the role, so you must omit `agent_type`. Include the matching contract verbatim in `message`, along with the shared [Route A workflow](../route-a-workflow.md) rules (`workflow5` macro turns, `local_collector_v1` `env_keys` allowlist / `env_profile`, `execution_kind`, and `needs_reconciliation` discipline). Every role works under `execution_kind="native"`; only Boost without a workspace uses `coordinator_local`, owned by the coordinator itself.
 

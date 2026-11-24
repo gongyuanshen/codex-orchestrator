@@ -103,7 +103,7 @@ def test_board_post_reports_route_only_for_mentioned_bound_workers(tmp_path: Pat
 
         monkeypatch.setenv(host_features.HOST_WAKE_ENV, "auto")
         monkeypatch.setattr(host_features, "probe_features", _probe(OPENED_HOST))
-        opened = dispatcher.dispatch("board_post", {"run_id": run_id, "sender": "w1", "summary": "ready", "mentions": ["verifier"]})
+        opened = dispatcher.dispatch("board_post", {"run_id": run_id, "sender": "w1", "summary": "ready", "body_md": "@verifier"})
         assert opened["wake_route"] == "host_message_board" and "wake_hint" not in opened
     finally:
         db.close()

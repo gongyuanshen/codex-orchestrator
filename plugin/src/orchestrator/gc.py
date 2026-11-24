@@ -98,7 +98,7 @@ def _is_runtime_log_name(name: str) -> bool:
     )
 
 
-def _collect_runtime_report(settings: Settings) -> dict[str, int]:
+def _collect_runtime_report(settings: Settings) -> dict[str, Any]:
     db_path = settings.db_path
     state_db_bytes = sum(
         _file_size_no_follow(candidate)
@@ -110,6 +110,9 @@ def _collect_runtime_report(settings: Settings) -> dict[str, int]:
         )
     )
 
+    unaccounted = []
+    known = {"logs", settings.results_dir.name, *_RECEIPT_SUBDIRS,
+             *(db_path.name + suffix for suffix in ("", "-wal", "-shm", "-journal"))}
     logs_bytes = 0
     data_dir = settings.data_dir
     if data_dir.is_dir() and not _is_reparse_or_symlink(data_dir):
@@ -121,6 +124,8 @@ def _collect_runtime_report(settings: Settings) -> dict[str, int]:
                     try:
                         if entry.is_file(follow_symlinks=False) and _is_runtime_log_name(entry.name):
                             logs_bytes += int(entry.stat(follow_symlinks=False).st_size)
+                        elif entry.name not in known:
+                            unaccounted.append({"name": entry.name, "bytes": _dir_size_bytes(Path(entry.path))})
                     except OSError:
                         continue
         except OSError:
@@ -152,8 +157,11 @@ def _collect_runtime_report(settings: Settings) -> dict[str, int]:
         for subdir in _RECEIPT_SUBDIRS
     )
 
-    runtime_total = state_db_bytes + logs_bytes + results_bytes + receipts_bytes
+    unaccounted_bytes = sum(item["bytes"] for item in unaccounted)
+    runtime_total = state_db_bytes + logs_bytes + results_bytes + receipts_bytes + unaccounted_bytes
     return {
+        "unaccounted_items": sorted(unaccounted, key=lambda item: item["name"]),
+        "unaccounted_bytes": unaccounted_bytes,
         "state_db_bytes": int(state_db_bytes),
         "logs_bytes": int(logs_bytes),
         "results_bytes": int(results_bytes),
@@ -214,7 +222,9 @@ def collect_storage_report(
                 reason = str(discard["reason"])
             else:
                 category = "dirty_review"
-                if run_status not in {"completed", "archived"}:
+                if discard is not None:
+                    reason = discard["reason"]
+                elif run_status not in {"completed", "archived"}:
                     reason = (
                         f"Run status is {run_status!r} (must be 'completed' or 'archived'); "
                         f"{safety['reason']}"

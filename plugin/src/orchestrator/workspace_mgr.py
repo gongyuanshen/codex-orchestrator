@@ -2673,12 +2673,13 @@ class WorkspaceManager:
                 "worker_status_update(status='stopped') before discarding",
             )
 
-        if not exists:
+        try:
             if self._uses_git_worktree(ws):
-                try:
-                    self._check_worktree_branch_tip(self.workspace_source_root(ws), ws["branch_name"], ws["base_commit"])
-                except (WorkspaceCleanupGuardError, WorkspaceError, OSError) as exc:
-                    return verdict(False, f"Worktree branch moved beyond its base: {exc}")
+                self._worktree_cleanup_preflight(self.workspace_source_root(ws), ws_path, ws["branch_name"], ws["base_commit"])
+        except (WorkspaceError, WorkspaceCleanupGuardError, OSError, subprocess.CalledProcessError) as exc:
+            return verdict(False, f"Worktree cleanup preflight: {exc}")
+
+        if not exists:
             return verdict(True, "Directory already absent; only the record remains",
                            added_count=0, modified_count=0, deleted_count=0)
 

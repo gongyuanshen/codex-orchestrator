@@ -199,3 +199,9 @@ def test_dispatch_result_delivery_error_preserves_recovery_identity(tmp_path, mo
     assert error["recovery"]["arguments"] == {
         "run_id": run_id, "sender": "coordinator", "message_key": prepared["message_key"],
     }
+
+def test_recover_dispatch_key_inside_options():
+    from orchestrator.mcp_shim import _dispatch_recovery
+    result = _dispatch_recovery({"run_id": "run-1", "options": {"key": "ticket-1"}}, "unknown")
+    assert result["recovery"] == {"tool": "inbox_get", "arguments": {
+        "run_id": "run-1", "sender": "coordinator", "message_key": "ticket-1"}}

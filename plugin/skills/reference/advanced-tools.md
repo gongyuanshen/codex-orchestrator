@@ -10,6 +10,9 @@ To keep the fixed per-session schema cost low, MCP `tools/list` advertises only 
 | `workspace_create`, `workspace_cleanup` | Primitives behind `workflow_prepare_dispatch(create_workspace=True)` and `workflow_closeout_run` |
 | `workspace_discard` | Remove a never-merged workspace of a failed/archived/completed run that is identical to its baseline (`dry_run=True` only checks); refuses any change, unresolved native action or still-working author |
 | `worker_status_update` | Blocker or non-step status notices |
+| `worker_register`, `workflow_step_save`, `workflow_step_advance` | Manual author setup, step revision, rework, handoff or explicit reverify |
+| `workflow_review`, `worker_heartbeat`, `inbox_ack` | Challenger findings, explicit long-running heartbeat, manual inbox receipts |
+| `run_update` | Rename, fail or archive a run |
 | `board_channel_list`, `session_bind` | Channel inspection; manual hook binding |
 
 - **Describe**: `tool_advanced(tool="<name>")` returns its `inputSchema`.

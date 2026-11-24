@@ -127,7 +127,7 @@ def test_stage_timings_are_deterministic_from_the_log():
         {'summary': 'impl: core: dispatched', 'created_at': 110.0},
         {'summary': 'impl: core: implementing', 'created_at': 115.0},
         {'summary': 'impl: core: candidate_review', 'created_at': 175.0},
-        {'summary': 'impl: core: saved', 'created_at': 176.0},          # later revision save: ignored
+        {'summary': 'impl: core: saved', 'created_at': 176.0},          # revised contract returns to planning
         {'summary': 'impl: core: candidate_review', 'created_at': 180.0},
         {'summary': 'impl: core: ready_to_merge', 'created_at': 235.0},
         {'summary': 'impl: core: integrated_review', 'created_at': 240.0},
@@ -139,11 +139,92 @@ def test_stage_timings_are_deterministic_from_the_log():
     ]
     result = stage_timings(steps, log)
     first, second = result['steps']
-    assert first['stages_sec'] == {'dispatch': 15.0, 'author': 60.0, 'candidate_review': 60.0,
+    assert first['stages_sec'] == {'dispatch': 19.0, 'author': 60.0, 'candidate_review': 56.0,
                                    'merge': 5.0, 'integrated_review': 10.0}
     assert first['done_at'] == 250.0 and first['current_stage'] is None
     assert second['stages_sec'] == {'dispatch': 10.0}
     assert second['current_stage'] == 'dispatch' and second['current_since'] == 130.0
-    assert result['totals_sec']['dispatch'] == 25.0
+    assert result['totals_sec']['dispatch'] == 29.0
     assert result['logged_span_sec'] == 150.0
     assert stage_timings(steps, log) == result
+
+def test_stale_before_integration_requires_real_review(flow):
+    db, s, run, root, _ = flow
+    step = _solo_candidate_pass(flow)
+    (root / 'source.txt').write_text('format changed')
+    step = advance(s, step, 'begin_integrated_review')
+    assert step['state'] == 'integrated_review' and 'integrated_reuse' not in step['checkpoint']
+    with pytest.raises(WorkflowConflictError, match='No current integrated'):
+        advance(s, step, 'complete')
+    step = verify(s, step, 'integrated')
+    assert advance(s, step, 'complete')['state'] == 'done'
+
+
+@pytest.mark.parametrize('explicit', [True, False])
+def test_reverify_invalidates_reuse_and_previous_explicit_receipts(flow, explicit):
+    db, s, run, *_ = flow
+    step = advance(s, _solo_candidate_pass(flow), 'begin_integrated_review')
+    if explicit:
+        step = verify(s, step, 'integrated')
+        old = s.summary(run['id'])['verifications'][-1]
+    step = advance(s, advance(s, step, 'complete'), 'reverify')
+    assert 'integrated_reuse' not in step['checkpoint']
+    assert s.recorded_integrated_gate(step, step['checkpoint']) is None
+    if explicit:
+        with pytest.raises(WorkflowConflictError, match='fresh integrated capture'):
+            s.record(step['id'], old['artifact_id'], step['verifier'], 'PASS', old['criteria_results'], [], 'try-old-receipt')
+    with pytest.raises(WorkflowConflictError, match='No current integrated'):
+        advance(s, step, 'complete')
+    step = verify(s, step, 'integrated')
+    assert s.recorded_integrated_gate(step, step['checkpoint']) == 'verified'
+    assert advance(s, step, 'complete')['state'] == 'done'
+
+
+def test_real_stop_response_round_trip(flow):
+    from orchestrator.hook_runner import evaluate_rpc_hook_response_for_stop
+    from orchestrator.rpc_handlers import RpcDispatcher
+    db, s, run, *_ = flow
+    rpc = RpcDispatcher(db, BoardService(db), s.workspaces)
+    def hook():
+        return rpc._session_run_hook_result({}, {'project_root': str(flow[3])}, run, check_stop=True)
+    step = _solo_candidate_pass(flow)
+    assert 'begin_integrated_review' in hook()['stop_reason']
+    step = advance(s, step, 'begin_integrated_review')
+    assert '复用' in hook()['stop_reason']
+    step = verify(s, step, 'integrated')
+    assert '集成验收已通过' in hook()['stop_reason']
+    advance(s, step, 'complete')
+    res = hook()
+    assert res['progress_classification'] == 'completed' and evaluate_rpc_hook_response_for_stop(res)[0]
+    assert not evaluate_rpc_hook_response_for_stop(dict(res, awaiting_closeout=False))[0]
+
+
+@pytest.mark.parametrize('stale', [False, True])
+def test_solo_closeout_checks_candidate_before_mutation(flow, stale):
+    from orchestrator.rpc_handlers import RpcDispatcher
+    db, s, run, root, _ = flow
+    step = _solo_candidate_pass(flow)
+    rpc = RpcDispatcher(db, BoardService(db), s.workspaces)
+    if stale:
+        (root / 'source.txt').write_text('changed')
+        with pytest.raises(WorkflowConflictError, match='request_verify'):
+            rpc.dispatch('workflow_closeout_run', {'run_id': run['id']})
+        assert s.get_step(step['id'])['state'] == 'ready_to_merge'
+    else:
+        rpc.dispatch('workflow_closeout_run', {'run_id': run['id']})
+        assert db.get_run(run['id'])['status'] == 'completed'
+        assert _integrated_records(db, step['id']) == []
+
+def test_open_findings_and_idle_observation_do_not_hide_real_gate_owner(flow):
+    import time
+    from orchestrator.watchdog import classify_run
+    db, s, run, *_ = flow
+    step = advance(s, _solo_candidate_pass(flow), 'begin_integrated_review')
+    advance(s, step, 'observe', observation=dict(agent_id=step['verifier_agent_id'], state='idle',
+            observed_at=time.time(), evidence='idle after recording PASS'))
+    status = classify_run(db, run['id'])
+    assert status['classification'] == 'normal_wait' and not status['alert_required']
+    assert any(g.get('gate') == 'reused' for g in status['potential_candidates'])
+    step = verify(s, step, 'integrated')
+    assert s.recorded_integrated_gate(step, {**step['checkpoint'], 'findings': [{'status': 'open'}]}) is None
+    assert s.recorded_integrated_gate(dict(step, verifier_agent_id='other'), step['checkpoint']) is None

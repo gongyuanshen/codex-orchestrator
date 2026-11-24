@@ -50,8 +50,8 @@ def stage_timings(steps: list[dict], transitions: list[dict]) -> dict:
         if not sep or key not in by_key:
             continue
         if state == 'saved':
-            # Only the creating save marks the start of planning; later saves are revisions.
-            if not by_key[key]:
+            # Saving a repair contract preserves rework; other revisions reset to planned.
+            if not by_key[key] or by_key[key][-1][1] not in {'planned', 'rework'}:
                 by_key[key].append((float(row['created_at']), 'planned'))
         elif state in STAGE_OF_STATE or state == 'done':
             by_key[key].append((float(row['created_at']), state))
@@ -120,6 +120,10 @@ ENV_PROFILES: dict[str, tuple[str, ...]] = {
 
 class WorkflowConflictError(ValueError):
     """The persisted revision, approved artifact or required gate is not current."""
+
+
+class StaleVerificationEvidence(WorkflowConflictError):
+    """The recorded evidence or approved tree no longer matches the captured bytes."""
 
 
 _SQL = '''
@@ -933,7 +937,13 @@ class WorkflowService:
                     checkpoint['owner_last_dispatch_at'] = time.time()
                 return self._set(step, 'implementing', checkpoint, step['attempt'] + 1)
             if action == 'begin_integrated_review' and state == 'ready_to_merge' and not step['workspace_id']:
-                candidate = self._valid_verification(step, 'candidate')
+                try:
+                    candidate = self._valid_verification(step, 'candidate')
+                except StaleVerificationEvidence:
+                    if run['workflow_version'] != 5:
+                        raise
+                    checkpoint.pop('integrated_reuse', None)
+                    return self._set(step, 'integrated_review', checkpoint)
                 if run['workflow_version'] == 5:
                     reuse = self._integrated_reuse_basis(step, candidate)
                     if reuse is not None:
@@ -947,8 +957,10 @@ class WorkflowService:
                     checkpoint['completion_at'] = time.time()
                 return self._set(step, 'handoff' if step['handoff_required'] else 'done', checkpoint)
             if action == 'reverify' and state == 'done':
-                # A later intentional merge can stale an earlier milestone's content gate.
-                return self._set(step, 'integrated_review')
+                checkpoint.pop('integrated_reuse', None)
+                # A fresh capture is required even when an earlier integrated PASS is byte-identical.
+                checkpoint['integrated_generation'] = checkpoint.get('integrated_generation', 0) + 1
+                return self._set(step, 'integrated_review', checkpoint)
             if action == 'handoff' and state == 'handoff':
                 if run['workflow_version'] in {2, 3, 4, 5}:
                     if (not isinstance(recipient_agent_id, str) or not recipient_agent_id.strip()
@@ -1081,6 +1093,8 @@ class WorkflowService:
                 descriptor['verification_manifest'] = manifest
                 descriptor['verification_manifest_path'] = str(manifest_path.resolve())
                 descriptor['verification_manifest_digest'] = digest(manifest)
+            if scope == 'integrated' and step['checkpoint'].get('integrated_generation'):
+                descriptor['integrated_generation'] = step['checkpoint']['integrated_generation']
             descriptor['required_paths'] = required
             descriptor['workspace_id'] = step['workspace_id'] if scope == 'candidate' else None
             if scope == 'integrated' and step['workspace_id']:
@@ -1112,6 +1126,8 @@ class WorkflowService:
             return False
         current['workspace_id'] = descriptor['workspace_id']
         current['required_paths'] = descriptor['required_paths']
+        if 'integrated_generation' in descriptor:
+            current['integrated_generation'] = descriptor['integrated_generation']
         if 'merge_proof_digest' in descriptor:
             current['merge_proof_digest'] = descriptor['merge_proof_digest']
         for key in ('verification_manifest', 'verification_manifest_path', 'verification_manifest_digest'):
@@ -1212,6 +1228,8 @@ class WorkflowService:
             if (artifact['step_id'] != step_id or artifact['packet_version'] != step['packet_version']
                     or artifact['attempt'] != step['attempt'] or artifact['contract_revision'] != step['contract_revision']):
                 raise WorkflowConflictError('Verification artifact belongs to another delivery')
+            if artifact['scope'] == 'integrated' and artifact['descriptor'].get('integrated_generation') != step['checkpoint'].get('integrated_generation'):
+                raise WorkflowConflictError('Reverify requires a fresh integrated capture')
             required_state = 'candidate_review' if artifact['scope'] == 'candidate' else 'integrated_review'
             if step['state'] != required_state:
                 raise WorkflowConflictError(f'Verification is not allowed from {step["state"]}')
@@ -1301,6 +1319,27 @@ class WorkflowService:
             raise NotFoundError(f'Verification not found: {identity}')
         return _decode(row)
 
+    def recorded_integrated_gate(self, step: dict, checkpoint: dict) -> str | None:
+        """Cheap scheduling hint, not acceptance: complete always rehashes live evidence."""
+        if any(f['status'] == 'open' for f in checkpoint.get('findings', [])):
+            return None
+        with self.db.read_connection() as conn:
+            row = conn.execute('''SELECT v.verdict,v.verifier_agent_id,a.contract_revision,
+                json_extract(a.descriptor_json,'$.integrated_generation') AS generation
+                FROM verification_records v JOIN workflow_artifacts a ON a.id=v.artifact_id
+                WHERE v.step_id=? AND a.scope='integrated' AND v.packet_version=? AND v.attempt=?
+                ORDER BY v.created_at DESC,v.rowid DESC LIMIT 1''',
+                (step['id'], step['packet_version'], step['attempt'])).fetchone()
+        if row:
+            if (row['verdict'] == 'PASS' and row['generation'] == checkpoint.get('integrated_generation')
+                    and all(row[k] == step[k] for k in ('verifier_agent_id', 'contract_revision'))):
+                return 'verified'
+            return None
+        reuse = checkpoint.get('integrated_reuse')
+        if reuse and all(reuse[k] == step[k] for k in ('attempt', 'packet_version', 'contract_revision', 'verifier_agent_id')):
+            return 'reused'
+        return None
+
     def _valid_verification(self, step: dict, scope: str) -> dict:
         self._packet(step)
         self._bindings(step)
@@ -1308,7 +1347,7 @@ class WorkflowService:
             raise WorkflowConflictError('Unresolved challenger findings block acceptance')
         with self.db.read_connection() as conn:
             rows = conn.execute('''SELECT v.* FROM verification_records v JOIN workflow_artifacts a ON a.id=v.artifact_id
-              WHERE v.step_id=? AND a.scope=? ORDER BY v.created_at DESC''', (step['id'], scope)).fetchall()
+              WHERE v.step_id=? AND a.scope=? ORDER BY v.created_at DESC,v.rowid DESC''', (step['id'], scope)).fetchall()
         for row in rows:
             v = _decode(row)
             if v['packet_version'] != step['packet_version'] or v['attempt'] != step['attempt']:
@@ -1316,6 +1355,8 @@ class WorkflowService:
             if v['verdict'] != 'PASS' or v['verifier_agent_id'] != step['verifier_agent_id']:
                 raise WorkflowConflictError('The current independent verification is not PASS')
             artifact = self._artifact(v['artifact_id'])
+            if scope == 'integrated' and artifact['descriptor'].get('integrated_generation') != step['checkpoint'].get('integrated_generation'):
+                raise WorkflowConflictError('No current integrated independent PASS after reverify')
             if artifact['contract_revision'] != step['contract_revision']:
                 raise WorkflowConflictError('The workflow contract changed after verification')
             if not self._covers(self._required_capture_scope(step, scope), artifact['descriptor']['paths']):
@@ -1323,7 +1364,7 @@ class WorkflowService:
             if {x['criterion'] for x in v['criteria_results']} != set(step['criteria']):
                 raise WorkflowConflictError('The verified criteria do not match the current contract')
             if not evidence_current(v['evidence_manifest']) or not self._artifact_current(artifact):
-                raise WorkflowConflictError('Approved artifact or evidence is stale')
+                raise StaleVerificationEvidence('Approved artifact or evidence is stale')
             if self.db.get_run(step['run_id'])['workflow_version'] in {3, 4, 5}:
                 receipts = [item['path'] for item in v['evidence_manifest'] if item.get('kind') == 'verification_receipt']
                 try:

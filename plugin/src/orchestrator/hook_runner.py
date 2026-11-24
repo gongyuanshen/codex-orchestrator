@@ -433,9 +433,8 @@ def evaluate_rpc_hook_response_for_stop(
         prog_cls = prog_cls.get("classification")
     if prog_cls is not None:
         cls_str = str(prog_cls)
-        if cls_str in _RPC_STOP_HARD_VETO_STATUSES or (
-            cls_str and cls_str not in {"ready", "normal_wait"}
-        ):
+        closeout = cls_str == "completed" and run_status == "active" and rpc_result.get("awaiting_closeout") is True
+        if not closeout and (cls_str in _RPC_STOP_HARD_VETO_STATUSES or cls_str and cls_str not in {"ready", "normal_wait"}):
             return (False, "")
 
     blocked_key = str(rpc_result.get("blocked_key") or "")

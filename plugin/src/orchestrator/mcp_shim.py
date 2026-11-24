@@ -585,10 +585,14 @@ def _classify_rpc_invalidation(
 
 
 def _dispatch_recovery(arguments: dict[str, Any], outcome: str) -> dict[str, Any]:
+    if arguments.get("dispatch_action") == "accept_local":
+        return {"dispatch_outcome": outcome, "dispatch_context": {"run_id": arguments.get("run_id"), "step_key": arguments.get("step_key")},
+                "recovery_instructions": "Inspect board_status for this step_key before continuing; do not replay accept_local."}
     raw_run_id = arguments.get("run_id")
     run_id = raw_run_id.strip() if isinstance(raw_run_id, str) else ""
     sender = str(arguments.get("sender") or "coordinator").strip()
-    raw_key = arguments.get("message_key") or arguments.get("key")
+    options = arguments.get("options")
+    raw_key = arguments.get("message_key") or arguments.get("key") or (options.get("key") if isinstance(options, dict) else None)
     key = raw_key.strip() if isinstance(raw_key, str) else ""
     instructions = "Do not invoke the native action or repeat workflow_prepare_dispatch before reconciliation."
     result: dict[str, Any] = {"dispatch_outcome": outcome}
